@@ -1,0 +1,370 @@
+{
+  "$comment": "PROTOCOL FREEZE FIXTURE. Recorded from the pre-extraction daemon. While one machine runs extracted code and the other runs the personal repo, these bytes may not change. A failure here is not a stale fixture -- it means the extracted code would break a running fleet mid-upgrade. Identities are synthetic; see tests/freeze/README.md.",
+  "recordedFrom": "sukarfleet main @ pre-extraction",
+  "fixedTimestampMs": 1700000000000,
+  "identity": {
+    "machine": "alpha",
+    "publicKeyJwk": {
+      "crv": "P-256",
+      "ext": true,
+      "key_ops": [
+        "verify"
+      ],
+      "kty": "EC",
+      "x": "eLJTku0oi_dvifHju1sN-u5vLaJuJEouVGpNDRy_hAo",
+      "y": "PsEiLnFAmAL-a05gnV_P3cQn6Uso-vBjG9BxgTvb5h0"
+    },
+    "privateKeyJwk": {
+      "crv": "P-256",
+      "d": "ep9XL0SvOQ5FU7q9k8LW4Bam3InspGlpSI8FxZB6Qlw",
+      "ext": true,
+      "key_ops": [
+        "sign"
+      ],
+      "kty": "EC",
+      "x": "eLJTku0oi_dvifHju1sN-u5vLaJuJEouVGpNDRy_hAo",
+      "y": "PsEiLnFAmAL-a05gnV_P3cQn6Uso-vBjG9BxgTvb5h0"
+    }
+  },
+  "canonicalJson": [
+    {
+      "name": "key-order-ascii",
+      "note": "codepoint order, uppercase before lowercase",
+      "input": {
+        "b": 1,
+        "a": 2,
+        "A": 3,
+        "_": 4
+      },
+      "expected": "{\"A\":3,\"_\":4,\"a\":2,\"b\":1}"
+    },
+    {
+      "name": "key-order-nested",
+      "note": "sorting applies at every depth",
+      "input": {
+        "z": {
+          "y": 1,
+          "x": 2
+        },
+        "a": [
+          3,
+          1,
+          2
+        ]
+      },
+      "expected": "{\"a\":[3,1,2],\"z\":{\"x\":2,\"y\":1}}"
+    },
+    {
+      "name": "key-order-surrogate-pair",
+      "note": "THE dangerous case: codepointCompare uses Array.from (code points). A naive charCodeAt implementation compares UTF-16 units and orders U+1F600 (surrogate D83D) BEFORE U+FFFD, which is the opposite of code-point order. Any reimplementation that gets this wrong produces different signing bytes for any object with an astral-plane key.",
+      "input": {
+        "😀": "emoji",
+        "�": "replacement",
+        "a": "ascii"
+      },
+      "expected": "{\"a\":\"ascii\",\"�\":\"replacement\",\"😀\":\"emoji\"}"
+    },
+    {
+      "name": "key-order-latin1",
+      "note": "e-acute (U+00E9) sorts after z (U+007A)",
+      "input": {
+        "é": 1,
+        "z": 2
+      },
+      "expected": "{\"z\":2,\"é\":1}"
+    },
+    {
+      "name": "undefined-dropped",
+      "note": "object properties with undefined are omitted",
+      "input": {
+        "a": 1,
+        "c": 3
+      },
+      "expected": "{\"a\":1,\"c\":3}"
+    },
+    {
+      "name": "undefined-in-array",
+      "note": "array elements that are undefined encode as null",
+      "input": [
+        1,
+        null,
+        3
+      ],
+      "expected": "[1,null,3]"
+    },
+    {
+      "name": "null-preserved",
+      "note": "null is a value, not an omission",
+      "input": {
+        "a": null
+      },
+      "expected": "{\"a\":null}"
+    },
+    {
+      "name": "arrays-keep-order",
+      "note": "arrays are NOT sorted",
+      "input": [
+        "c",
+        "a",
+        "b"
+      ],
+      "expected": "[\"c\",\"a\",\"b\"]"
+    },
+    {
+      "name": "empty-containers",
+      "note": "",
+      "input": {
+        "o": {},
+        "a": []
+      },
+      "expected": "{\"a\":[],\"o\":{}}"
+    },
+    {
+      "name": "numbers",
+      "note": "integers, negatives, floats, exponents",
+      "input": {
+        "i": 42,
+        "n": -7,
+        "f": 1.5,
+        "e": 1e+21,
+        "z": 0
+      },
+      "expected": "{\"e\":1e+21,\"f\":1.5,\"i\":42,\"n\":-7,\"z\":0}"
+    },
+    {
+      "name": "negative-zero",
+      "note": "JSON.stringify(-0) is \"0\"",
+      "input": {
+        "z": 0
+      },
+      "expected": "{\"z\":0}"
+    },
+    {
+      "name": "string-escapes",
+      "note": "quotes, backslash, newline, tab, control chars",
+      "input": {
+        "s": "a\"b\\c\nd\te\u0001f"
+      },
+      "expected": "{\"s\":\"a\\\"b\\\\c\\nd\\te\\u0001f\"}"
+    },
+    {
+      "name": "unicode-values",
+      "note": "non-ASCII values are not escaped by JSON.stringify",
+      "input": {
+        "s": "héllo 😀"
+      },
+      "expected": "{\"s\":\"héllo 😀\"}"
+    },
+    {
+      "name": "booleans",
+      "note": "",
+      "input": {
+        "t": true,
+        "f": false
+      },
+      "expected": "{\"f\":false,\"t\":true}"
+    },
+    {
+      "name": "deep-nesting",
+      "note": "",
+      "input": {
+        "a": {
+          "b": {
+            "c": {
+              "d": [
+                1,
+                {
+                  "e": 2
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "{\"a\":{\"b\":{\"c\":{\"d\":[1,{\"e\":2}]}}}}"
+    },
+    {
+      "name": "reject-nan",
+      "note": "non-finite numbers are rejected, never encoded",
+      "input": {
+        "n": {
+          "$nonFinite": "NaN"
+        }
+      },
+      "throws": true,
+      "expected": "THROWS: canonicalJson: non-finite number"
+    },
+    {
+      "name": "reject-infinity",
+      "note": "",
+      "input": {
+        "n": {
+          "$nonFinite": "Infinity"
+        }
+      },
+      "throws": true,
+      "expected": "THROWS: canonicalJson: non-finite number"
+    }
+  ],
+  "gossip": {
+    "note": "sig is over canonicalJson({v,machine,tsMs,seq,payload}) -- sigB64 excluded",
+    "unsigned": {
+      "v": 1,
+      "machine": "alpha",
+      "tsMs": 1700000000000,
+      "seq": 7,
+      "payload": {
+        "repos": {
+          "workspace": {
+            "lastSyncOkMs": 1699999999000,
+            "lastCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "syncError": null
+          }
+        },
+        "githubPushOkMs": {
+          "workspace": null
+        },
+        "clockMs": 1700000000000,
+        "flags": [
+          "clock-vetted"
+        ]
+      }
+    },
+    "signingInput": "{\"machine\":\"alpha\",\"payload\":{\"clockMs\":1700000000000,\"flags\":[\"clock-vetted\"],\"githubPushOkMs\":{\"workspace\":null},\"repos\":{\"workspace\":{\"lastCommit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"lastSyncOkMs\":1699999999000,\"syncError\":null}}},\"seq\":7,\"tsMs\":1700000000000,\"v\":1}",
+    "envelope": {
+      "v": 1,
+      "machine": "alpha",
+      "tsMs": 1700000000000,
+      "seq": 7,
+      "payload": {
+        "repos": {
+          "workspace": {
+            "lastSyncOkMs": 1699999999000,
+            "lastCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "syncError": null
+          }
+        },
+        "githubPushOkMs": {
+          "workspace": null
+        },
+        "clockMs": 1700000000000,
+        "flags": [
+          "clock-vetted"
+        ]
+      },
+      "sigB64": "eOZjc1DFNB/FjGxEjq4km75loK1J0X6dDEqEPi2HsvzcHfSxpCgFYio7PmalDip/iswC5WViCbbvQDwEOaPnPA=="
+    },
+    "verifiesAtRecordTime": true
+  },
+  "authHeader": {
+    "note": "value \"<machine>;<tsMs>;<sigB64>\"; sig over method \\n pathWithQuery \\n tsMs \\n machine",
+    "method": "POST",
+    "pathWithQuery": "/git/workspace/git-upload-pack?service=git-upload-pack",
+    "machine": "alpha",
+    "tsMs": 1700000000000,
+    "signingString": "POST\n/git/workspace/git-upload-pack?service=git-upload-pack\n1700000000000\nalpha",
+    "headerValue": "alpha;1700000000000;ps0lLFmUELgmxFhFm9sMMlC7emwI1rVbdnuqUjM6FqmoMZoLDgnkNaewEUS+W6SAmpORuv11CL4UJeqY9jDEhg==",
+    "windowMs": 120000
+  },
+  "routes": {
+    "note": "route surface is part of the frozen contract",
+    "pinned": [
+      "POST /gossip",
+      "GET /status",
+      "GET /health",
+      "/git/*",
+      "POST /pair/hello"
+    ]
+  },
+  "pairing": {
+    "bundle": {
+      "v": 1,
+      "machine": "alpha",
+      "role": "anchor",
+      "meshIp": "192.0.2.1",
+      "nodePort": 7710,
+      "publicKeyJwk": {
+        "crv": "P-256",
+        "ext": true,
+        "key_ops": [
+          "verify"
+        ],
+        "kty": "EC",
+        "x": "eLJTku0oi_dvifHju1sN-u5vLaJuJEouVGpNDRy_hAo",
+        "y": "PsEiLnFAmAL-a05gnV_P3cQn6Uso-vBjG9BxgTvb5h0"
+      },
+      "sshUser": "fleet",
+      "sshPublicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAA",
+      "sshHostKeys": [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBBBBBBBBBB"
+      ]
+    },
+    "bundleCanonical": "{\"machine\":\"alpha\",\"meshIp\":\"192.0.2.1\",\"nodePort\":7710,\"publicKeyJwk\":{\"crv\":\"P-256\",\"ext\":true,\"key_ops\":[\"verify\"],\"kty\":\"EC\",\"x\":\"eLJTku0oi_dvifHju1sN-u5vLaJuJEouVGpNDRy_hAo\",\"y\":\"PsEiLnFAmAL-a05gnV_P3cQn6Uso-vBjG9BxgTvb5h0\"},\"role\":\"anchor\",\"sshHostKeys\":[\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBBBBBBBBBB\"],\"sshPublicKey\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAA\",\"sshUser\":\"fleet\",\"v\":1}",
+    "helloRequestMacInput": "req|{\"from\":{\"machine\":\"alpha\",\"meshIp\":\"192.0.2.1\",\"nodePort\":7710,\"publicKeyJwk\":{\"crv\":\"P-256\",\"ext\":true,\"key_ops\":[\"verify\"],\"kty\":\"EC\",\"x\":\"eLJTku0oi_dvifHju1sN-u5vLaJuJEouVGpNDRy_hAo\",\"y\":\"PsEiLnFAmAL-a05gnV_P3cQn6Uso-vBjG9BxgTvb5h0\"},\"role\":\"anchor\",\"sshHostKeys\":[\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBBBBBBBBBB\"],\"sshPublicKey\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAA\",\"sshUser\":\"fleet\",\"v\":1},\"tsMs\":1700000000000,\"v\":1}",
+    "helloResponseMacInput": "res|{\"from\":{\"machine\":\"alpha\",\"meshIp\":\"192.0.2.1\",\"nodePort\":7710,\"publicKeyJwk\":{\"crv\":\"P-256\",\"ext\":true,\"key_ops\":[\"verify\"],\"kty\":\"EC\",\"x\":\"eLJTku0oi_dvifHju1sN-u5vLaJuJEouVGpNDRy_hAo\",\"y\":\"PsEiLnFAmAL-a05gnV_P3cQn6Uso-vBjG9BxgTvb5h0\"},\"role\":\"anchor\",\"sshHostKeys\":[\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBBBBBBBBBB\"],\"sshPublicKey\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAA\",\"sshUser\":\"fleet\",\"v\":1},\"reqSha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"tsMs\":1700000000000,\"v\":1}"
+  },
+  "execLocal": {
+    "note": "base64(canonicalJson(ExecLocalRequest)) over SSH_ORIGINAL_COMMAND",
+    "request": {
+      "v": 1,
+      "runId": "run-0123456789abcdef",
+      "originMachine": "alpha",
+      "argv": [
+        "systemctl",
+        "restart",
+        "example.service"
+      ],
+      "reason": "freeze fixture vector",
+      "timeoutSec": 120
+    },
+    "requestCanonical": "{\"argv\":[\"systemctl\",\"restart\",\"example.service\"],\"originMachine\":\"alpha\",\"reason\":\"freeze fixture vector\",\"runId\":\"run-0123456789abcdef\",\"timeoutSec\":120,\"v\":1}",
+    "requestB64": "eyJhcmd2IjpbInN5c3RlbWN0bCIsInJlc3RhcnQiLCJleGFtcGxlLnNlcnZpY2UiXSwib3JpZ2luTWFjaGluZSI6ImFscGhhIiwicmVhc29uIjoiZnJlZXplIGZpeHR1cmUgdmVjdG9yIiwicnVuSWQiOiJydW4tMDEyMzQ1Njc4OWFiY2RlZiIsInRpbWVvdXRTZWMiOjEyMCwidiI6MX0=",
+    "response": {
+      "v": 1,
+      "exitCode": 0,
+      "stdout": "ok\n",
+      "stderr": "",
+      "truncated": false,
+      "durationMs": 1234
+    },
+    "responseCanonical": "{\"durationMs\":1234,\"exitCode\":0,\"stderr\":\"\",\"stdout\":\"ok\\n\",\"truncated\":false,\"v\":1}"
+  },
+  "endpointFile": {
+    "note": "NOT named in the original frozen list, added here: it is signed and cross-verified by the peer exactly like a gossip envelope. Currently inert between machines (fleetRepoPath has no origin remote), which is why it was easy to miss.",
+    "unsigned": {
+      "v": 1,
+      "machine": "alpha",
+      "wanIp": "198.51.100.7",
+      "lanIp": "192.0.2.10",
+      "meshIp": "192.0.2.1",
+      "ports": {
+        "udp": 11010,
+        "tcp": 44310
+      },
+      "tsMs": 1700000000000
+    },
+    "canonical": "{\"lanIp\":\"192.0.2.10\",\"machine\":\"alpha\",\"meshIp\":\"192.0.2.1\",\"ports\":{\"tcp\":44310,\"udp\":11010},\"tsMs\":1700000000000,\"v\":1,\"wanIp\":\"198.51.100.7\"}",
+    "sigB64": "rnPf0AlckWkcxe1nJEi9C3Yjml4q1/U5WEkRnCpfQ9BI5HMbUJpBDsazrZlgKmUuVR0Gl9A1USfl51aVndOQsQ=="
+  },
+  "auditEntry": {
+    "note": "hash-chained log entry; signed over canonicalJson of every field but sigB64",
+    "unsigned": {
+      "v": 1,
+      "machine": "alpha",
+      "seq": 42,
+      "tsMs": 1700000000000,
+      "kind": "admin-run-completed",
+      "detail": {
+        "runId": "run-0123456789abcdef",
+        "argv": [
+          "id"
+        ],
+        "exitCode": 0,
+        "stdoutBytes": 3,
+        "stderrBytes": 0
+      }
+    },
+    "canonical": "{\"detail\":{\"argv\":[\"id\"],\"exitCode\":0,\"runId\":\"run-0123456789abcdef\",\"stderrBytes\":0,\"stdoutBytes\":3},\"kind\":\"admin-run-completed\",\"machine\":\"alpha\",\"seq\":42,\"tsMs\":1700000000000,\"v\":1}",
+    "sigB64": "D5sbueH2Grtt3lltaoefsKANqPmZdTv3oydv4fuschqjLvBwnIB6dgHxX3YywjIvMEj7ruGyqBg033vbIPYLHg=="
+  }
+}
