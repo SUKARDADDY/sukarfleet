@@ -1,0 +1,21 @@
+[Unit]
+Description=EasyTier mesh transport (sukarfleet)
+Documentation=https://github.com/EasyTier/EasyTier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/easytier/easytier-core -c /etc/easytier/fleet.toml -r 127.0.0.1:15888
+Restart=always
+RestartSec=2
+
+# Hardening. Kept loose enough not to break TUN device creation / net admin.
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/etc/easytier /var/log
+NoNewPrivileges=no
+DeviceAllow=/dev/net/tun rw
+
+[Install]
+WantedBy=multi-user.target

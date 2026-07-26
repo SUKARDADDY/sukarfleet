@@ -1,0 +1,37 @@
+[Unit]
+Description=sukarfleet node
+# The root easytier-fleet.service is a separate SYSTEM unit; a user unit
+# cannot depend on it (After=/Requires= across the user/system boundary do
+# not order reliably), so we only order after generic network readiness and
+# let the node's own transport watchdog handle a not-yet-up mesh.
+After=network.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+# WatchdogSec MUST equal cfg.intervals.watchdogSec in the node's config.json
+# (default 120, see src/config.ts). node.ts derives its WATCHDOG=1 ping
+# cadence (watchdogSec/3) and its gossip/sync loop-freshness windows from
+# that same config value (src/node.ts). install/setup-user.sh currently
+# templates only the repo path into this unit, NOT this value -- if you
+# change cfg.intervals.watchdogSec, you must also edit this line to match
+# and run `systemctl --user daemon-reload`, or the two timeouts will drift
+# (e.g. a widened freshness window with systemd still hard-killing at the
+# old, shorter WatchdogSec).
+WatchdogSec=120
+# On watchdog timeout, deliver SIGTERM (not the SIGABRT default) to the bun
+# main process only; child processes (git fetch helpers) get SIGKILL via
+# KillMode=mixed. Neither signal produces a core dump, so apport stops raising
+# "git-remote-http crashed" / "bun crashed" dialogs for what is really our own
+# watchdog firing. node.ts handles SIGTERM with a graceful shutdown (the event
+# loop stays live even when a sync await is stuck), and systemd still
+# escalates to SIGKILL after TimeoutStopSec if that handler never exits.
+WatchdogSignal=SIGTERM
+KillMode=mixed
+WorkingDirectory=__SUKARFLEET_REPO__
+ExecStart=%h/.bun/bin/bun run src/node.ts
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
