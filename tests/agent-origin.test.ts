@@ -171,6 +171,50 @@ describe('upgrading an existing deployment does not silently change behaviour', 
     expect(cfg.admin.agentOrigin).toBe('allow');
   });
 
+  // THE test that matters, and the one that was missing. The original suite exercised
+  // persistLegacyMigration directly and passed while the daemon never called it -- so the value
+  // the daemon would actually have run on was the fail-closed default, silently refusing
+  // agent-origin runs on a fleet where they had always worked. A unit test of a function nothing
+  // calls proves nothing about behaviour.
+  test('loadConfig ALONE preserves allow -- no persistence step required', async () => {
+    const dir = tmp();
+    const p = join(dir, 'config.json');
+    writeFileSync(
+      p,
+      JSON.stringify({
+        machine: 'alpha',
+        exec: { enabled: true, auditRepo: 'workspace' },
+        admin: { enabled: true, sshUser: 'fleetuser' },
+      }),
+    );
+    // Deliberately NOT calling persistLegacyMigration first.
+    const cfg = await loadConfig(p);
+    expect(cfg.admin.agentOrigin).toBe('allow');
+    expect(cfg.admin.auditRepo).toBe('workspace');
+  });
+
+  test('loadConfig alone still fails closed when there is no legacy block', async () => {
+    const dir = tmp();
+    const p = join(dir, 'config.json');
+    writeFileSync(p, JSON.stringify({ machine: 'alpha', admin: { enabled: true } }));
+    expect((await loadConfig(p)).admin.agentOrigin).toBe('refuse');
+  });
+
+  test('an explicit refuse on a legacy config is honoured, not overridden to allow', async () => {
+    const dir = tmp();
+    const p = join(dir, 'config.json');
+    writeFileSync(
+      p,
+      JSON.stringify({
+        machine: 'alpha',
+        exec: { enabled: true },
+        admin: { enabled: true, agentOrigin: 'refuse' },
+      }),
+    );
+    // Preserving behaviour must never mean overriding a choice the operator already made.
+    expect((await loadConfig(p)).admin.agentOrigin).toBe('refuse');
+  });
+
   test('a fresh config (no legacy block) keeps the fail-closed default', async () => {
     const dir = tmp();
     const p = join(dir, 'config.json');

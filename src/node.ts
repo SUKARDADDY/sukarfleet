@@ -16,7 +16,7 @@ import type {
   PeerView,
   UiState,
 } from './types';
-import { expandHome, loadConfig, patchConfig, stateDir } from './config';
+import { expandHome, loadConfig, patchConfig, persistLegacyMigration, stateDir } from './config';
 import { atomicWrite, log, nowMs, run, sdNotify, readJsonFile } from './util';
 
 import { buildAuthHeader, loadOrCreateMachineKey, writeSecretFile } from './keys';
@@ -203,6 +203,11 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 async function main(): Promise<void> {
   const cfg: FleetConfig = await loadConfig();
+  // Write the legacy-exec migration into config.json so the migrated values are VISIBLE in the
+  // file rather than re-derived on every boot. Best effort by construction: mergeDefaults already
+  // applied the same answer in memory, which is what this process runs on, so a failed write costs
+  // a repeated log line and nothing else.
+  await persistLegacyMigration();
   const key = await loadOrCreateMachineKey(cfg.machine);
   const enrolledPeers = new Set(cfg.peers.filter((p) => p.publicKeyJwk !== null).map((p) => p.name));
   for (const p of cfg.peers) {

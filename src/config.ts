@@ -125,6 +125,7 @@ let legacyExecWarned = false;
 export function migrateLegacyExecBlock(raw: Record<string, unknown>, base: FleetConfig): {
   mcpPort: number;
   auditRepo: string | null | undefined;
+  agentOrigin: 'refuse' | 'allow' | undefined;
   legacyFound: boolean;
 } {
   const legacy = isPlainObject(raw.exec) ? raw.exec : undefined;
@@ -136,6 +137,19 @@ export function migrateLegacyExecBlock(raw: Record<string, unknown>, base: Fleet
   let auditRepo = rawAdmin && 'auditRepo' in rawAdmin ? (rawAdmin.auditRepo as string | null) : undefined;
   if (auditRepo === undefined && legacy && 'auditRepo' in legacy) auditRepo = legacy.auditRepo as string | null;
 
+  // A config carrying the legacy exec block predates the agent-origin switch, and on that
+  // deployment an agent COULD already drive the admin lane. Defaulting it to 'refuse' here would
+  // silently start refusing agent-origin runs the moment the daemon restarts -- a behaviour change
+  // nobody asked for, delivered during a cutover, which is the worst possible moment.
+  //
+  // This is computed IN MEMORY rather than only on the persistence path, because the in-memory
+  // value is what the daemon actually runs on. persistLegacyMigration writes the same answer into
+  // the file so it is visible rather than implied, but the daemon must behave correctly even if
+  // that write never happens.
+  const rawAgentOrigin = rawAdmin && 'agentOrigin' in rawAdmin ? rawAdmin.agentOrigin : undefined;
+  const agentOrigin: 'refuse' | 'allow' | undefined =
+    rawAgentOrigin === undefined && legacy !== undefined ? 'allow' : undefined;
+
   const legacyFound = legacy !== undefined;
   if (legacyFound && !legacyExecWarned) {
     legacyExecWarned = true;
@@ -145,7 +159,7 @@ export function migrateLegacyExecBlock(raw: Record<string, unknown>, base: Fleet
     });
   }
 
-  return { mcpPort: mcpPort ?? base.mcpPort, auditRepo, legacyFound };
+  return { mcpPort: mcpPort ?? base.mcpPort, auditRepo, agentOrigin, legacyFound };
 }
 
 function mergeDefaults(raw: Record<string, unknown>, base: FleetConfig): FleetConfig {
@@ -160,6 +174,7 @@ function mergeDefaults(raw: Record<string, unknown>, base: FleetConfig): FleetCo
   // default it omits and there is no nested object to merge separately.
   const admin = isPlainObject(raw.admin) ? { ...base.admin, ...raw.admin } : base.admin;
   if (migrated.auditRepo !== undefined) admin.auditRepo = migrated.auditRepo;
+  if (migrated.agentOrigin !== undefined) admin.agentOrigin = migrated.agentOrigin;
 
   return {
     ...base,
