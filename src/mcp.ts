@@ -111,6 +111,11 @@ export const ADMIN_REFUSAL_ADVICE: Record<AdminRefusalReason, (target: string, l
   'bad-argv': () =>
     'That command could not be turned into arguments. Pass argv as an array of separate tokens, with no shell quoting.',
   'rate-limited': (t) => `Too many admin runs against ${t} in the last minute. Wait, then try again.`,
+  'agent-origin-refused': (_t, l) =>
+    `${l} does not let an agent drive the admin lane. This is a separate switch from the lane itself: ` +
+    'turning the lane on grants the operator remote admin, and letting an agent use it is an explicit ' +
+    'second step. A human can run this from the console; or set admin.agentOrigin to "allow" on ' +
+    `${l} if you intend agents to have root on paired machines unattended.`,
   'refused-argv': (t) =>
     `${t} refused this command: it touches the credential store or the sealing tool. The refusal is recorded ` +
     'in the audit log.',

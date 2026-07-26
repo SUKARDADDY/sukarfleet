@@ -81,6 +81,9 @@ export function defaultConfig(machine: string): FleetConfig {
       authorizedKeysPath: '~/.ssh/authorized_keys',
       secretsDir: join(configDir(), 'secrets'),
       auditRepo: null,
+      // Fail closed for anyone installing this fresh. An existing deployment being migrated keeps
+      // its current behaviour explicitly -- see persistLegacyMigration.
+      agentOrigin: 'refuse',
       credentialMode: 'stored-password',
       allowPlaintextFallback: false,
       connectTimeoutSec: 8,
@@ -293,6 +296,9 @@ function validateAdmin(raw: unknown): void {
   if (admin.auditRepo !== undefined && admin.auditRepo !== null && typeof admin.auditRepo !== 'string') {
     fail('admin.auditRepo must be null or a repo name');
   }
+  if (admin.agentOrigin !== 'refuse' && admin.agentOrigin !== 'allow') {
+    fail(`admin.agentOrigin must be "refuse" or "allow", got ${JSON.stringify(admin.agentOrigin)}`);
+  }
   if (admin.credentialMode !== 'stored-password' && admin.credentialMode !== 'nopasswd') {
     fail(`admin.credentialMode must be "stored-password" or "nopasswd", got ${JSON.stringify(admin.credentialMode)}`);
   }
@@ -403,7 +409,12 @@ export async function persistLegacyMigration(path?: string): Promise<boolean> {
     const rawAdmin = isPlainObject(raw.admin) ? raw.admin : undefined;
     const needsMcpPort = raw.mcpPort === undefined && typeof legacy.mcpPort === 'number';
     const needsAuditRepo = (!rawAdmin || !('auditRepo' in rawAdmin)) && 'auditRepo' in legacy;
-    if (!needsMcpPort && !needsAuditRepo) return false;
+    // A config carrying the legacy exec block predates the agent-origin switch, and on that
+    // deployment an agent COULD already drive the lane. Defaulting it to 'refuse' would silently
+    // break working automation during a cutover, so the existing behaviour is preserved -- but
+    // written into the file explicitly, and logged, rather than left implied.
+    const needsAgentOrigin = !rawAdmin || !('agentOrigin' in rawAdmin);
+    if (!needsMcpPort && !needsAuditRepo && !needsAgentOrigin) return false;
 
     await patchConfig((r) => {
       const l = isPlainObject(r.exec) ? r.exec : {};
@@ -413,12 +424,23 @@ export async function persistLegacyMigration(path?: string): Promise<boolean> {
         a.auditRepo = l.auditRepo;
         r.admin = a;
       }
+      if (needsAgentOrigin) {
+        const a = isPlainObject(r.admin) ? r.admin : {};
+        a.agentOrigin = 'allow';
+        r.admin = a;
+      }
     }, configPath);
 
     log('info', 'config: migrated legacy exec fields into their new locations', {
       mcpPort: needsMcpPort,
       auditRepo: needsAuditRepo,
+      agentOrigin: needsAgentOrigin,
     });
+    if (needsAgentOrigin) {
+      log('warn', 'config: admin.agentOrigin was written as "allow" to preserve this deployment\'s existing behaviour', {
+        hint: 'an agent can drive the admin lane on this machine. Set admin.agentOrigin to "refuse" to require a human.',
+      });
+    }
     return true;
   } catch (err) {
     log('warn', 'config: could not persist legacy exec migration (running on the in-memory value)', {

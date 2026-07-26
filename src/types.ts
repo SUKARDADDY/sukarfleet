@@ -170,6 +170,19 @@ export interface AdminConfig {
   // This lives on the admin lane because the entries it carries are admin-run records. It was
   // previously nested in the exec block; config.ts migrates the old location on load.
   auditRepo?: string | null;
+  // Who may DRIVE the lane, as opposed to whether the lane exists at all (`enabled`). These are
+  // two different risks and conflating them is what makes the security story hard to tell:
+  // turning the lane on grants the OPERATOR remote admin; letting the AGENT drive it is this
+  // second, explicit switch.
+  //
+  //   'refuse'  agent-origin runs are refused. Status stays readable, so an agent can still see
+  //             and explain the lane's state. The human drives the GUI.   [product default]
+  //   'allow'   any origin may drive the lane.
+  //
+  // A third mode, 'confirm' -- park the run and require an operator click in the GUI within N
+  // seconds -- is the intended upgrade. It is deliberately NOT in this union yet: an enum value
+  // that silently behaves like something else is worse than an absent feature. See SECURITY.md.
+  agentOrigin: 'refuse' | 'allow';
   // 'nopasswd' is offered as the structural alternative (a hand-written narrow sudoers rule, no
   // reusable human credential) but is NEVER auto-installed by any installer in this repo.
   credentialMode: 'stored-password' | 'nopasswd';
@@ -203,6 +216,7 @@ export type AdminRefusalReason =
   | 'refused-argv'
   | 'timeout'
   | 'hostkey-mismatch'
+  | 'agent-origin-refused'
   | 'not-configured';
 
 export interface AdminRunRequest {
