@@ -1,0 +1,7 @@
+node_modules/
+*.log
+
+# Live-fleet capture used by the local cutover check. Contains real machine
+# names, mesh addresses and public keys, so it must never reach the public repo
+# (see tests/freeze/README.md). The committed golden files are synthetic.
+tests/freeze/live-capture.json
