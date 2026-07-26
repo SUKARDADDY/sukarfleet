@@ -40,7 +40,8 @@ const FORBIDDEN: { pattern: RegExp; what: string }[] = [
   // .local and the reserved example domains are synthetic by definition; anything else that looks
   // like an address is assumed to belong to a person.
   {
-    pattern: /[a-zA-Z0-9._%+-]+@(?!example\.(com|org|net)\b)(?![a-zA-Z0-9.-]*\.local\b)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/,
+    pattern:
+      /[a-zA-Z0-9._%+-]+@(?![a-zA-Z0-9.-]*\b(?:example\.(?:com|org|net)|\.?(?:test|invalid|localhost|local))\b)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/,
     what: 'a real email address',
   },
   { pattern: /\btrycloudflare\.com\b|\bcfargotunnel\.com\b/, what: 'a real tunnel hostname' },

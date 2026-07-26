@@ -1,0 +1,231 @@
+/* sukarfleet console. No web fonts, no external assets: the page must render with the
+   machine fully offline. Both colour schemes are first-class -- an operator reading an
+   alarm at 3am gets the same contrast either way. */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #f6f6f4;
+  --panel: #ffffff;
+  --panel-2: #f0f0ee;
+  --ink: #16181c;
+  --ink-2: #52565e;
+  --line: #d6d7d3;
+  --accent: #2c5fa8;
+  --accent-ink: #ffffff;
+  --ok: #1f6f43;
+  --warn: #8a5a00;
+  --bad: #a32222;
+  --focus: #0b57d0;
+
+  --radius: 6px;
+  --mono: ui-monospace, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", "DejaVu Sans", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --panel: #1c1f24;
+    --panel-2: #23272e;
+    --ink: #e9ebee;
+    --ink-2: #a4abb6;
+    --line: #343a43;
+    --accent: #7ea6e8;
+    --accent-ink: #10131a;
+    --ok: #5fc98c;
+    --warn: #e0b357;
+    --bad: #ef8a8a;
+    --focus: #9cc0ff;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 var(--sans);
+}
+
+h1, h2, h3, h4 { line-height: 1.2; margin: 0; font-weight: 600; }
+h2 { font-size: 1.35rem; margin-bottom: .25rem; }
+h3 { font-size: 1.02rem; }
+h4 { font-size: .85rem; color: var(--ink-2); text-transform: uppercase; letter-spacing: .04em; margin-top: 1rem; }
+p { margin: .5rem 0; }
+code, pre, .mono { font-family: var(--mono); font-size: .88em; }
+a { color: var(--accent); }
+
+/* Visually hidden, still announced. Deliberately not position:absolute: these labels sit in table
+   headers inside a scrolling .tablewrap, and with no positioned ancestor an absolute box escapes
+   that container and gives the whole page a horizontal scrollbar on a narrow window. */
+.sr { display: inline-block; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+.skiplink {
+  position: absolute; left: -999px; top: 0; z-index: 10;
+  background: var(--panel); padding: .5rem .75rem; border: 1px solid var(--line);
+}
+.skiplink:focus { left: .5rem; top: .5rem; }
+
+/* ── header ─────────────────────────────────────────────────────────── */
+/* The machine name is the largest thing on the page on purpose: a port-forwarded tab
+   looks identical to a local one, and acting on the wrong machine is the failure this
+   whole console is shaped to prevent. */
+.top {
+  display: flex; flex-wrap: wrap; gap: 1rem 2rem; align-items: flex-end;
+  justify-content: space-between;
+  padding: 1.1rem 1.25rem .9rem;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.eyebrow { margin: 0; font-size: .74rem; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-2); }
+#self-machine { font-size: clamp(1.7rem, 5vw, 2.6rem); letter-spacing: -.02em; word-break: break-all; }
+.subline { margin: .15rem 0 0; color: var(--ink-2); font-size: .88rem; font-family: var(--mono); }
+.conn { text-align: right; }
+.connline { margin: 0; font-weight: 600; }
+.hint { color: var(--ink-2); font-size: .86rem; }
+.lede { color: var(--ink-2); max-width: 62ch; }
+
+.dot { display: inline-block; width: .62em; height: .62em; border-radius: 50%; background: var(--ink-2); vertical-align: baseline; }
+.dot-ok { background: var(--ok); }
+.dot-warn { background: var(--warn); }
+.dot-bad { background: var(--bad); }
+.dot-idle { background: var(--ink-2); }
+
+/* ── nav ────────────────────────────────────────────────────────────── */
+.tabs {
+  display: flex; gap: .25rem; flex-wrap: wrap;
+  padding: 0 1.25rem; background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.tabs a {
+  padding: .6rem .9rem; text-decoration: none; color: var(--ink-2);
+  border-bottom: 3px solid transparent; font-weight: 600;
+}
+.tabs a:hover { color: var(--ink); }
+.tabs a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--accent); }
+
+.banner, .flash {
+  margin: 0; padding: .6rem 1.25rem;
+  border-bottom: 1px solid var(--line); background: var(--panel-2);
+}
+.flash-bad { color: var(--bad); font-weight: 600; }
+.flash-ok { color: var(--ok); }
+
+main { max-width: 78rem; margin: 0 auto; padding: 1.25rem; outline: none; }
+.screen[hidden] { display: none; }
+
+/* ── cards ──────────────────────────────────────────────────────────── */
+.card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 1rem 1.1rem; margin: 1rem 0;
+}
+.card > h3 { margin-bottom: .35rem; }
+.step {
+  display: inline-grid; place-items: center; width: 1.5rem; height: 1.5rem; margin-right: .45rem;
+  border-radius: 50%; background: var(--panel-2); border: 1px solid var(--line);
+  font-size: .8rem; vertical-align: .05em;
+}
+.step-done { background: var(--ok); color: var(--accent-ink); border-color: transparent; }
+
+.statusline { font-weight: 600; }
+
+.plainlist { margin: .5rem 0; padding-left: 1.1rem; max-width: 84ch; }
+.plainlist li { margin: .4rem 0; }
+
+/* ── forms ──────────────────────────────────────────────────────────── */
+.field { display: flex; flex-direction: column; gap: .25rem; margin: .6rem 0; }
+.field label { font-size: .84rem; font-weight: 600; color: var(--ink-2); }
+.field.narrow input { max-width: 10rem; }
+.stack { margin: 0; }
+.grid2, .grid3 { display: grid; gap: .4rem 1rem; margin: 0; }
+@media (min-width: 46rem) {
+  .grid2 { grid-template-columns: 1fr 1fr; }
+  .grid3 { grid-template-columns: 2fr 2fr 1fr; }
+  .span2 { grid-column: span 2; }
+  .span3 { grid-column: span 3; }
+}
+
+input, select, button, textarea { font: inherit; color: inherit; }
+input[type="text"], input[type="password"], input[type="number"], select {
+  background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: .45rem .55rem; min-width: 0;
+}
+input[readonly] { color: var(--ink-2); }
+input:disabled, select:disabled, button:disabled { opacity: .55; cursor: not-allowed; }
+
+.actions { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-top: .7rem; }
+
+button, .button {
+  display: inline-block; padding: .45rem .85rem; border-radius: var(--radius);
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--ink);
+  text-decoration: none; cursor: pointer; font-weight: 600;
+}
+button:hover, .button:hover { border-color: var(--ink-2); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+button.danger { color: var(--bad); }
+button.quiet { background: none; border-color: transparent; color: var(--ink-2); font-weight: 400; text-decoration: underline; }
+/* A destructive row action stays quiet in a table but must not read as a neutral one. */
+button.quiet.danger { color: var(--bad); }
+
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+/* The label wraps on a narrow window, so the box aligns to the first line rather than to the
+   middle of a two-line sentence. */
+.switch { display: inline-flex; align-items: flex-start; gap: .5rem; font-weight: 600; max-width: 72ch; }
+.switch input { width: 1.05rem; height: 1.05rem; flex: none; margin-top: .18rem; accent-color: var(--accent); }
+
+.result { font-size: .88rem; color: var(--ink-2); }
+.result-ok { color: var(--ok); }
+.result-bad { color: var(--bad); }
+
+.warn {
+  border: 1px solid var(--bad); border-radius: var(--radius);
+  padding: .6rem .8rem; margin: .8rem 0; background: var(--panel-2);
+}
+.warn p:first-child { margin-top: 0; font-weight: 600; color: var(--bad); }
+
+.parsed { min-height: 1.4rem; margin: .1rem 0 .4rem; display: flex; flex-wrap: wrap; gap: .3rem; align-items: center; }
+.parsed .lbl { font-size: .78rem; color: var(--ink-2); text-transform: uppercase; letter-spacing: .05em; }
+.tok {
+  font-family: var(--mono); font-size: .82rem; padding: .1rem .35rem;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
+}
+.parsed .bad { color: var(--bad); }
+
+/* ── pairing code ───────────────────────────────────────────────────── */
+.code-display {
+  font-family: var(--mono); font-size: clamp(1.8rem, 7vw, 3rem); font-weight: 700;
+  letter-spacing: .12em; margin: .4rem 0; word-break: break-all;
+}
+
+/* ── data ───────────────────────────────────────────────────────────── */
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: .2rem .9rem; margin: .5rem 0 0; }
+.kv dt { color: var(--ink-2); font-size: .86rem; }
+.kv dd { margin: 0; font-family: var(--mono); font-size: .86rem; word-break: break-all; }
+
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; min-width: 34rem; }
+th, td { text-align: left; padding: .4rem .55rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-2); }
+td { font-size: .88rem; }
+td.mono, td .mono { font-family: var(--mono); }
+tbody tr:last-child td { border-bottom: none; }
+.empty { color: var(--ink-2); font-style: italic; }
+
+.out {
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: .6rem .7rem; margin: .3rem 0 0; max-height: 24rem; overflow: auto;
+  white-space: pre-wrap; word-break: break-word;
+}
+.cmd { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); padding: .5rem .65rem; overflow-x: auto; }
+
+details > summary { cursor: pointer; list-style: revert; }
+details > summary > h3 { display: inline; }
+
+.foot { color: var(--ink-2); font-size: .8rem; text-align: center; padding: 1.5rem 1.25rem 2.5rem; }
+
+/* An operator tool has no decorative motion; what little there is goes away on request. */
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
