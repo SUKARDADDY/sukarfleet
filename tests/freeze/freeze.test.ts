@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { canonicalJson } from '../../src/util';
+import { _authMessageForRepo } from '../../src/gitserve';
 
 const GOLDEN_PATH = join(import.meta.dir, 'golden.json');
 const goldenRaw = readFileSync(GOLDEN_PATH, 'utf8');
@@ -187,7 +188,9 @@ describe('envelope bytes are unchanged', () => {
 // 4. The auth header.
 // ---------------------------------------------------------------------------
 
-describe('x-fleet-auth is unchanged', () => {
+// NOTE: this per-request binding is what /gossip and /status use. /git/* deliberately does NOT --
+// see the session-auth block below.
+describe('x-fleet-auth (per-request binding) is unchanged', () => {
   test('signing string is method \\n pathWithQuery \\n tsMs \\n machine', () => {
     const h = golden.authHeader;
     expect(`${h.method}\n${h.pathWithQuery}\n${h.tsMs}\n${h.machine}`).toBe(h.signingString);
@@ -207,7 +210,56 @@ describe('x-fleet-auth is unchanged', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. The route surface.
+// 5. /git/* session auth -- the route that carries ALL sync traffic.
+//
+// This is deliberately NOT the per-request method+path binding the other routes use, and the
+// difference is easy to freeze wrongly. A `git fetch` makes at least two requests (GET
+// .../info/refs?service=..., then POST .../git-upload-pack) using a SINGLE static header supplied
+// once via `-c http.extraHeader=...`; git cannot vary it per request. So gitserve binds to a
+// repo-scoped SESSION: the method token is the constant "GIT" and the signed path is the repo
+// prefix with no leaf segment and no query string.
+//
+// Why this matters more than the other entries here: /git/* carries 100% of sync traffic, and a
+// failed fetch is logged as a warning and the cycle continues. Break this and sync stops moving
+// data with nothing in the logs that looks like an error -- during exactly the canary window the
+// freeze exists to protect.
+//
+// Asserted against the implementation's own exported message builder rather than a hand-written
+// string, so a fixture that drifts from the code cannot stay green.
+// ---------------------------------------------------------------------------
+
+describe('/git/* session auth is unchanged', () => {
+  test('method token is the constant GIT, never the HTTP verb', () => {
+    expect(_authMessageForRepo('workspace', '1700000000000', 'alpha').split('\n')[0]).toBe('GIT');
+  });
+
+  test('the signed path is the repo prefix -- no leaf segment, no query string', () => {
+    const path = _authMessageForRepo('workspace', '1700000000000', 'alpha').split('\n')[1]!;
+    expect(path).toBe('/git/workspace');
+    expect(path).not.toContain('?');
+    expect(path).not.toContain('info/refs');
+    expect(path).not.toContain('git-upload-pack');
+  });
+
+  test('full message shape is "GIT \\n /git/<repo> \\n tsMs \\n machine"', () => {
+    expect(_authMessageForRepo('workspace', '1700000000000', 'alpha')).toBe(
+      'GIT\n/git/workspace\n1700000000000\nalpha',
+    );
+  });
+
+  test('one repo\'s session token cannot vouch for another repo', () => {
+    expect(_authMessageForRepo('memory', '1700000000000', 'alpha')).not.toBe(
+      _authMessageForRepo('workspace', '1700000000000', 'alpha'),
+    );
+  });
+
+  test('the timestamp is carried verbatim, not reformatted', () => {
+    expect(_authMessageForRepo('workspace', '1699999999999', 'alpha')).toContain('\n1699999999999\n');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. The route surface.
 // ---------------------------------------------------------------------------
 
 describe('route surface is unchanged', () => {
@@ -223,7 +275,7 @@ describe('route surface is unchanged', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6. The golden file itself.
+// 7. The golden file itself.
 //
 // Pinned by digest so it cannot be quietly regenerated to make a failing test pass. Updating this
 // digest is a deliberate act that shows up in review as exactly what it is.
