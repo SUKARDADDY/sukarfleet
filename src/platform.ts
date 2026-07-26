@@ -308,6 +308,8 @@ export function platformReport(platform: PlatformId = currentPlatform()): Platfo
     seams: [
       { name: 'service-manager', support: serviceManagerFor(platform).support },
       { name: 'notification', support: notificationBackendFor(platform).support },
+      { name: 'credential-store', support: credentialBackendFor(platform).support },
+      { name: 'store-privacy-probe', support: storePrivacyProbeFor(platform).support },
     ],
   };
 }
@@ -320,4 +322,261 @@ export function logPlatformReport(platform: PlatformId = currentPlatform()): voi
     platform: rep.platform,
     seams: experimental.map((s) => `${s.name}=${s.support}`).join(','),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Credential store
+//
+// The seam supplies ARGV ONLY. It never sees, returns, or handles a plaintext password: secrets.ts
+// keeps ownership of the pipe, and plaintext continues to exist on exactly one stack frame there.
+// That is deliberate -- a seam that took the password as a parameter would spread the one invariant
+// this codebase most needs to keep local across three platform implementations.
+//
+// Every backend below is a stdin -> stdout filter, so the credential is never an argv element and
+// never appears in `ps`.
+//
+// Scope vocabulary is shared across platforms and is persisted in the credential metadata:
+//   'tpm2'  sealed to the machine's TPM. Strongest; in practice needs privileges the daemon
+//           does not have, and is tried first only so a better-provisioned machine wins for free.
+//   'user'  sealed to this user on this host, inert if copied elsewhere. What actually seals on
+//           every platform today: systemd-creds --user, the macOS login Keychain, DPAPI CurrentUser.
+//
+// What 'user' buys, stated exactly, because SECURITY.md has to repeat it: a credential that leaks
+// through a synced repo, a backup or a copied directory is useless to the reader. What it does NOT
+// buy: protection from another process running as this same user, which can simply ask the OS to
+// decrypt it.
+// ---------------------------------------------------------------------------
+
+export type SealScope = 'tpm2' | 'user';
+
+export interface CredentialBackend {
+  readonly platform: PlatformId;
+  readonly support: SupportLevel;
+  // Strongest first. sealAvailable() walks these and keeps the first that survives a live round
+  // trip -- never a capability query.
+  readonly scopes: readonly SealScope[];
+  sealArgv(scope: SealScope, name: string): string[];
+  unsealArgv(scope: SealScope, name: string): string[];
+}
+
+const linuxCredentialBackend: CredentialBackend = {
+  platform: 'linux',
+  support: 'supported',
+  scopes: ['tpm2', 'user'],
+  // --user must be passed to BOTH encrypt and decrypt: a blob sealed in user scope is not readable
+  // by a system-scope decrypt and vice versa.
+  sealArgv: (scope, name) => [
+    'systemd-creds',
+    'encrypt',
+    ...(scope === 'tpm2' ? ['--with-key=tpm2'] : ['--user']),
+    `--name=${name}`,
+    '-',
+    '-',
+  ],
+  unsealArgv: (scope, name) => [
+    'systemd-creds',
+    'decrypt',
+    ...(scope === 'tpm2' ? [] : ['--user']),
+    `--name=${name}`,
+    '-',
+    '-',
+  ],
+};
+
+// `security ... -w` with no value reads the password from stdin when stdin is a pipe, which is what
+// keeps it off argv. Only the login keychain is used: it is unlocked with the user's session and
+// needs no separate prompt in the daemon's context.
+const macosCredentialBackend: CredentialBackend = {
+  platform: 'macos',
+  support: 'experimental',
+  scopes: ['user'],
+  sealArgv: (_scope, name) => [
+    'security',
+    'add-generic-password',
+    '-U',
+    '-a',
+    name,
+    '-s',
+    name,
+    '-w',
+  ],
+  unsealArgv: (_scope, name) => ['security', 'find-generic-password', '-a', name, '-s', name, '-w'],
+};
+
+// DPAPI at CurrentUser scope. ConvertFrom-SecureString produces a blob only this user on this host
+// can reverse; the plaintext arrives on stdin and leaves on stdout, never through argv.
+const windowsCredentialBackend: CredentialBackend = {
+  platform: 'windows',
+  support: 'experimental',
+  scopes: ['user'],
+  sealArgv: () => [
+    'powershell',
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    '$in=[Console]::In.ReadToEnd(); ConvertFrom-SecureString -SecureString (ConvertTo-SecureString -String $in -AsPlainText -Force)',
+  ],
+  unsealArgv: () => [
+    'powershell',
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    '$in=[Console]::In.ReadToEnd(); $s=ConvertTo-SecureString -String $in; ' +
+      '[Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))',
+  ],
+};
+
+const unsupportedCredentialBackend: CredentialBackend = {
+  platform: 'unknown',
+  support: 'unsupported',
+  scopes: [],
+  sealArgv: () => {
+    throw new Error(`no credential store implementation for platform "${process.platform}"`);
+  },
+  unsealArgv: () => {
+    throw new Error(`no credential store implementation for platform "${process.platform}"`);
+  },
+};
+
+export function credentialBackendFor(platform: PlatformId = currentPlatform()): CredentialBackend {
+  switch (platform) {
+    case 'linux':
+      return linuxCredentialBackend;
+    case 'macos':
+      return macosCredentialBackend;
+    case 'windows':
+      return windowsCredentialBackend;
+    default:
+      return unsupportedCredentialBackend;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Store privacy probe
+//
+// A 0700 reading from stat() is meaningless on a filesystem that ignores chmod or synthesises a
+// fixed mode from mount options. Asking "is this mode 0700?" on such a filesystem is precisely the
+// confidently-wrong answer this module exists to avoid.
+//
+// Linux can consult the mount table. Everywhere else the honest answer comes from a real
+// write-then-stat round trip: create a file at 0600, read its mode back, and believe the result.
+// ---------------------------------------------------------------------------
+
+// Filesystems that either ignore chmod outright or synthesise a fixed mode from mount options.
+const MODE_BLIND_FSTYPES = new Set([
+  'fuseblk',
+  'ntfs',
+  'ntfs3',
+  'vfat',
+  'msdos',
+  'exfat',
+  'iso9660',
+  'cifs',
+  'smb3',
+  'smbfs',
+]);
+
+export interface StorePrivacyProbe {
+  readonly platform: PlatformId;
+  readonly support: SupportLevel;
+  // Whether `dir` sits on a filesystem that actually enforces permission bits. Fails CLOSED: an
+  // answer that cannot be established is `false`, never an optimistic `true`.
+  enforcesMode(dir: string): Promise<SeamResult>;
+}
+
+// mountinfo escapes space/tab/newline/backslash in the mount point as octal.
+function unescapeMountField(s: string): string {
+  return s.replace(/\\([0-7]{3})/g, (_m, oct: string) => String.fromCharCode(parseInt(oct, 8)));
+}
+
+// Filesystem type backing `target`, by longest matching mount point in /proc/self/mountinfo.
+export async function mountFsType(target: string, mountinfoPath = '/proc/self/mountinfo'): Promise<string | null> {
+  // node:fs, not Bun.file: procfs reports st_size 0 and Bun.file().text() honours it, so the whole
+  // table reads back as an empty string.
+  const { readFile } = await import('node:fs/promises');
+  let text: string;
+  try {
+    text = await readFile(mountinfoPath, 'utf8');
+  } catch {
+    return null;
+  }
+  let best: { length: number; fsType: string } | null = null;
+  for (const line of text.split('\n')) {
+    const sep = line.indexOf(' - ');
+    if (sep < 0) continue;
+    const mountPoint = unescapeMountField(line.slice(0, sep).split(' ')[4] ?? '');
+    const fsType = line.slice(sep + 3).split(' ')[0] ?? '';
+    if (!mountPoint || !fsType) continue;
+    const prefix = mountPoint.endsWith('/') ? mountPoint : `${mountPoint}/`;
+    if (target !== mountPoint && !target.startsWith(prefix)) continue;
+    if (best === null || mountPoint.length > best.length) best = { length: mountPoint.length, fsType };
+  }
+  return best?.fsType ?? null;
+}
+
+// The write-then-stat round trip, used wherever a mount table is not available. This is the
+// general form of the rule: do the thing and look at what happened.
+export async function writeThenStatProbe(dir: string): Promise<SeamResult> {
+  const { mkdir, writeFile, stat, unlink } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { randomBytes } = await import('node:crypto');
+  const probe = join(dir, `.mode-probe-${randomBytes(8).toString('hex')}`);
+  try {
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await writeFile(probe, 'probe', { mode: 0o600 });
+    const st = await stat(probe);
+    const mode = st.mode & 0o777;
+    if (mode !== 0o600) {
+      return {
+        ok: false,
+        detail: `wrote a file at 0600 and it read back as 0${mode.toString(8)} -- this filesystem does not enforce permission bits`,
+      };
+    }
+    return { ok: true, detail: 'a file written at 0600 read back as 0600' };
+  } catch (err) {
+    return { ok: false, detail: `could not run a write-then-stat probe in ${dir}: ${String(err)}` };
+  } finally {
+    await unlink(probe).catch(() => {});
+  }
+}
+
+const linuxPrivacyProbe: StorePrivacyProbe = {
+  platform: 'linux',
+  support: 'supported',
+  async enforcesMode(dir) {
+    const fsType = await mountFsType(dir);
+    if (fsType === null) {
+      // Unknown filesystem: fall back to the round trip rather than guessing.
+      return writeThenStatProbe(dir);
+    }
+    if (MODE_BLIND_FSTYPES.has(fsType)) {
+      return {
+        ok: false,
+        detail: `the credential store sits on ${fsType}, which does not enforce permission bits, so its 0700 mode proves nothing`,
+      };
+    }
+    return { ok: true, detail: `filesystem ${fsType} enforces permission bits` };
+  },
+};
+
+const roundTripPrivacyProbe = (platform: PlatformId, support: SupportLevel): StorePrivacyProbe => ({
+  platform,
+  support,
+  enforcesMode: (dir) => writeThenStatProbe(dir),
+});
+
+export function storePrivacyProbeFor(platform: PlatformId = currentPlatform()): StorePrivacyProbe {
+  switch (platform) {
+    case 'linux':
+      return linuxPrivacyProbe;
+    case 'macos':
+      return roundTripPrivacyProbe('macos', 'experimental');
+    case 'windows':
+      // NTFS carries ACLs rather than POSIX mode bits, so the round trip is expected to report
+      // that mode is not enforced. That is an honest answer, and the admin lane refuses on it
+      // rather than storing a credential it cannot claim is private.
+      return roundTripPrivacyProbe('windows', 'experimental');
+    default:
+      return roundTripPrivacyProbe('unknown', 'unsupported');
+  }
 }

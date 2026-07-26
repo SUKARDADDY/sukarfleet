@@ -136,6 +136,11 @@ describe('support levels are honest', () => {
 
   test('the report names every seam on this platform', () => {
     const rep = platformReport(currentPlatform());
-    expect(rep.seams.map((s) => s.name).sort()).toEqual(['notification', 'service-manager']);
+    expect(rep.seams.map((s) => s.name).sort()).toEqual([
+      'credential-store',
+      'notification',
+      'service-manager',
+      'store-privacy-probe',
+    ]);
   });
 });
