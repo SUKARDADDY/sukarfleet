@@ -399,3 +399,37 @@ test('auto-commit skips ignored paths instead of failing the cycle', async () =>
   // Nothing left staged: the cycle actually converged.
   expect((await git(dirA, ['status', '--porcelain', '--untracked-files=no'])).stdout.trim()).toBe('');
 });
+
+test('auto-commit survives a staged rename and a staged delete', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({
+    'foo.txt': 'base\n',
+    'gone.txt': 'bye\n',
+    'kept.txt': 'kept\n',
+  });
+
+  // Both name a path that exists in neither the worktree nor the index: `git mv` reports the
+  // rename source, `git rm` the staged deletion. Either one used to fail `git add -A -- <paths>`
+  // with exit 128 and wedge every subsequent cycle for the whole repo.
+  await git(dirA, ['mv', 'foo.txt', 'moved.txt']);
+  await git(dirA, ['rm', '-q', 'gone.txt']);
+  await writeFile(join(dirA, 'kept.txt'), 'edited\n');
+  await writeFile(join(dirA, 'fresh.txt'), 'new\n');
+
+  await syncA.syncOnce(repoA);
+
+  expect(recA.stats.at(-1)?.syncError).toBeNull();
+
+  const head = await git(dirA, ['show', '--stat', '--format=%s', 'HEAD']);
+  expect(head.stdout).toContain('sync: alpha');
+
+  const tracked = (await git(dirA, ['ls-tree', '-r', '--name-only', 'HEAD'])).stdout.split('\n');
+  // The rename landed on both ends, the delete landed, and unrelated work rode along.
+  expect(tracked).toContain('moved.txt');
+  expect(tracked).not.toContain('foo.txt');
+  expect(tracked).not.toContain('gone.txt');
+  expect(tracked).toContain('fresh.txt');
+  expect(await readFile(join(dirA, 'kept.txt'), 'utf8')).toBe('edited\n');
+
+  // Nothing left staged: the cycle actually converged.
+  expect((await git(dirA, ['status', '--porcelain', '--untracked-files=no'])).stdout.trim()).toBe('');
+});
