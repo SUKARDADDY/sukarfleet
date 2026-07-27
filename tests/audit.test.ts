@@ -17,7 +17,9 @@ import {
   AuditLog,
   crossCheckAuditLog,
   flushLocalToUnion,
+  loadForkBaseline,
   regenerateUnionLog,
+  writeForkBaseline,
 } from '../src/audit';
 
 let keyDir: string;
@@ -111,6 +113,35 @@ describe('AuditLog.append / readAll', () => {
       await rm(laptopState, { recursive: true, force: true });
     }
   });
+
+  // Two AuditLog instances over ONE state dir model the real deployment: the daemon holds one for
+  // its whole lifetime while cli.ts's SSH forced command builds another in a short-lived process
+  // every time this machine is an admin-run target. The counter used to be cached in memory, so
+  // the daemon re-minted a seq the forced command had already taken and the pair surfaced as a
+  // same-(machine,seq) fork -- the signature of a stolen key. 33 of them reached the live fleet.
+  test('a second process minting in between does not make the first re-use a seq (audit-seq-fork)', async () => {
+    const key = await freshKey('alpha');
+    const daemon = new AuditLog('alpha', key);
+    const forcedCommand = new AuditLog('alpha', key);
+
+    const a = await daemon.append('admin-run-requested', { runId: 'r1' });
+    const b = await forcedCommand.append('admin-run-completed', { runId: 'r1' });
+    const c = await daemon.append('admin-run-requested', { runId: 'r2' });
+
+    expect([a.seq, b.seq, c.seq]).toEqual([1, 2, 3]);
+    const seqs = (await daemon.readAll()).map((e) => e.seq);
+    expect(new Set(seqs).size).toBe(seqs.length);
+  });
+
+  test('concurrent mints across instances are all distinct and contiguous', async () => {
+    const key = await freshKey('alpha');
+    const logs = [new AuditLog('alpha', key), new AuditLog('alpha', key), new AuditLog('alpha', key)];
+    const minted = await Promise.all(
+      Array.from({ length: 12 }, (_, i) => logs[i % logs.length]!.append('probe', { i })),
+    );
+    const seqs = minted.map((e) => e.seq).sort((x, y) => x - y);
+    expect(seqs).toEqual(Array.from({ length: 12 }, (_, i) => i + 1));
+  });
 });
 
 describe('regenerateUnionLog: canonical regenerator', () => {
@@ -168,6 +199,42 @@ describe('regenerateUnionLog: canonical regenerator', () => {
     const again = await regenerateUnionLog(path);
     expect(again.changed).toBe(false);
     expect(again.entries.map((e) => canonicalJson(e))).toEqual(res.entries.map((e) => canonicalJson(e)));
+
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  // Entries are signed over their seq, so a fork already written can never be renumbered away:
+  // the historical ones are permanent. Without a baseline the warning fires forever and stops
+  // being read, which is exactly how a real forked key would slip past.
+  test('an accepted fork stops warning; a new variant under the same key alarms again (audit-fork-baseline)', async () => {
+    const key = await freshKey('beta');
+    const forkA = await makeEntry('beta', key, 1, AUDIT_KIND_JOB_EXECUTED, { jobId: 'job-a', originMachine: 'alpha' });
+    const forkB = await makeEntry('beta', key, 1, AUDIT_KIND_JOB_EXECUTED, { jobId: 'job-b', originMachine: 'alpha' });
+
+    const dir = await mkdtemp(join(tmpdir(), 'sukarfleet-audit-baseline-'));
+    const path = join(dir, 'audit-log.jsonl');
+    await Bun.write(path, [canonicalJson(forkA), canonicalJson(forkB)].join('\n') + '\n');
+
+    const before = await regenerateUnionLog(path);
+    expect(before.conflictingForks).toBe(1);
+    expect(before.unacceptedForks).toBe(1);
+
+    await writeForkBaseline(before.forks.map((f) => f.fingerprint));
+    expect((await loadForkBaseline()).size).toBe(1);
+
+    const after = await regenerateUnionLog(path);
+    // Still reported as a fork -- accepting it does not erase it, only silences the alarm.
+    expect(after.conflictingForks).toBe(1);
+    expect(after.unacceptedForks).toBe(0);
+    expect(after.entries).toHaveLength(2);
+
+    // A THIRD line under the accepted key changes the variant set, so the fingerprint no longer
+    // matches and it is a fresh, unaccepted fork.
+    const forkC = await makeEntry('beta', key, 1, AUDIT_KIND_JOB_EXECUTED, { jobId: 'job-c', originMachine: 'alpha' });
+    await Bun.write(path, (await Bun.file(path).text()) + canonicalJson(forkC) + '\n');
+    const third = await regenerateUnionLog(path);
+    expect(third.conflictingForks).toBe(1);
+    expect(third.unacceptedForks).toBe(1);
 
     await rm(dir, { recursive: true, force: true });
   });

@@ -32,8 +32,10 @@
 // is what turns whatever raw soup that produces back into a canonical file.
 
 import { join } from 'node:path';
+import { open, rm, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import type { AuditEntry, MachineKey } from './types';
-import { atomicWrite, canonicalJson, log, nowMs } from './util';
+import { atomicWrite, canonicalJson, ensureDir, log, nowMs, sleep } from './util';
 import { stateDir } from './config';
 import { signAuditEntry, verifyAuditEntry } from './trust';
 
@@ -88,6 +90,68 @@ function localLogPath(): string {
 
 function seqPath(): string {
   return join(stateDir(), 'audit-seq.json');
+}
+
+function seqLockPath(): string {
+  return join(stateDir(), 'audit-seq.lock');
+}
+
+async function readSeqFile(): Promise<number> {
+  const file = Bun.file(seqPath());
+  if (!(await file.exists())) return 0;
+  try {
+    const data = JSON.parse(await file.text()) as { seq?: unknown };
+    return Number.isInteger(data.seq) && (data.seq as number) >= 0 ? (data.seq as number) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+const SEQ_LOCK_WAIT_MS = 5_000;
+const SEQ_LOCK_STALE_MS = 30_000;
+
+// A lock FILE, not an in-process mutex: the two writers are separate processes (daemon and SSH
+// forced command), so an in-memory guard cannot see the other side. O_EXCL create is the
+// primitive both agree on without a dependency.
+//
+// A lock older than SEQ_LOCK_STALE_MS is treated as a crashed holder and broken. That is the
+// deliberate trade: a killed process must never permanently wedge minting, because a run this
+// machine cannot record is a run it does not perform (cli.ts) -- an audit lane that deadlocks
+// takes the admin lane down with it.
+async function withSeqLock<T>(fn: () => Promise<T>): Promise<T> {
+  const lock = seqLockPath();
+  await ensureDir(stateDir());
+  const deadline = nowMs() + SEQ_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      const fh = await open(lock, 'wx');
+      await fh.close();
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      let brokeStale = false;
+      try {
+        const st = await stat(lock);
+        if (nowMs() - st.mtimeMs > SEQ_LOCK_STALE_MS) {
+          await rm(lock, { force: true });
+          brokeStale = true;
+        }
+      } catch {
+        // Vanished between EEXIST and stat: the holder just released it, so retry immediately.
+        continue;
+      }
+      if (brokeStale) continue;
+      if (nowMs() > deadline) {
+        throw new Error(`audit: timed out waiting for the seq lock at ${lock}`);
+      }
+      await sleep(20);
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await rm(lock, { force: true });
+  }
 }
 
 // C-locale/codepoint order, never locale-dependent -- this is the sort that feeds the
@@ -163,11 +227,14 @@ async function appendLineAtomic(path: string, canonicalLine: string): Promise<vo
   await atomicWrite(path, existing + sep + canonicalLine + '\n');
 }
 
-// Local, per-machine append-only audit log. One instance per running daemon process (like
-// Gossip/Health); `machine`/`key` bind every minted entry to this machine's identity and
-// signing key.
+// Local, per-machine append-only audit log. `machine`/`key` bind every minted entry to this
+// machine's identity and signing key.
+//
+// NOT one instance per machine: cli.ts's defaultExecLocalAdmin (the SSH forced command) builds
+// its own AuditLog in a short-lived PROCESS every time this machine is the target of an admin
+// run, while the daemon holds one for its whole lifetime. Both mint from the same state dir, so
+// seq minting has to be safe across processes -- see nextSeq.
 export class AuditLog {
-  private seqLoaded = false;
   private seqValue = 0;
 
   constructor(
@@ -175,27 +242,21 @@ export class AuditLog {
     private readonly key: MachineKey,
   ) {}
 
-  private async loadSeq(): Promise<void> {
-    if (this.seqLoaded) return;
-    const file = Bun.file(seqPath());
-    if (await file.exists()) {
-      try {
-        const data = JSON.parse(await file.text()) as { seq?: unknown };
-        this.seqValue = Number.isInteger(data.seq) && (data.seq as number) >= 0 ? (data.seq as number) : 0;
-      } catch {
-        this.seqValue = 0;
-      }
-    } else {
-      this.seqValue = 0;
-    }
-    this.seqLoaded = true;
-  }
-
+  // Re-reads the counter under an exclusive lock on EVERY mint. Caching it in memory was a
+  // lost update: the daemon kept a stale value while the forced-command process advanced the
+  // file, then re-minted a seq that was already taken. The two entries reached the union file
+  // sharing one (machine, seq) -- indistinguishable from a stolen key signing a second entry,
+  // which is precisely the condition regenerateUnionLog exists to alarm on. 33 such pairs
+  // accumulated on the live fleet before anyone read the journal.
   private async nextSeq(): Promise<number> {
-    await this.loadSeq();
-    this.seqValue += 1;
-    await atomicWrite(seqPath(), canonicalJson({ seq: this.seqValue }));
-    return this.seqValue;
+    return await withSeqLock(async () => {
+      // The in-memory value is a floor, never the source of truth: it only defends against a
+      // counter file truncated or rolled back underneath a running process.
+      const next = Math.max(await readSeqFile(), this.seqValue) + 1;
+      await atomicWrite(seqPath(), canonicalJson({ seq: next }));
+      this.seqValue = next;
+      return next;
+    });
   }
 
   // Mints the next per-machine seq, signs, and durably appends a new AuditEntry. `tsMsArg` is an
@@ -223,6 +284,45 @@ export class AuditLog {
   }
 }
 
+function forkBaselinePath(): string {
+  return join(stateDir(), 'audit-fork-baseline.json');
+}
+
+// Identifies the SET of distinct lines under one (machine, seq). Accepting a fork accepts
+// exactly the variants present when the baseline was taken: if a THIRD line later joins that
+// key, the fingerprint changes and it alarms again. Keyed by content, not by position, so it
+// survives regeneration and says nothing about line order.
+function forkFingerprint(key: string, variantBytes: string[]): string {
+  const h = createHash('sha256');
+  h.update(key);
+  for (const bytes of [...variantBytes].sort()) {
+    h.update('\0');
+    h.update(bytes);
+  }
+  return h.digest('hex');
+}
+
+// Forks this machine has been told are known-benign. MACHINE-LOCAL on purpose, never a synced
+// path: an attacker who can write the shared repo can plant forked lines, and must not also be
+// able to ship the file that declares them acceptable.
+export async function loadForkBaseline(): Promise<Set<string>> {
+  const file = Bun.file(forkBaselinePath());
+  if (!(await file.exists())) return new Set();
+  try {
+    const data = JSON.parse(await file.text()) as { fingerprints?: unknown };
+    if (!Array.isArray(data.fingerprints)) return new Set();
+    return new Set(data.fingerprints.filter((f): f is string => typeof f === 'string'));
+  } catch {
+    // An unreadable baseline accepts NOTHING. Failing open would silence the alarm exactly when
+    // the file guarding it has been corrupted.
+    return new Set();
+  }
+}
+
+export async function writeForkBaseline(fingerprints: readonly string[]): Promise<void> {
+  await atomicWrite(forkBaselinePath(), canonicalJson({ v: 1, fingerprints: [...fingerprints].sort() }));
+}
+
 export interface RegenerateResult {
   entries: AuditEntry[]; // final canonical entries, sorted by (machine, seq)
   changed: boolean; // whether the on-disk bytes were rewritten
@@ -236,6 +336,16 @@ export interface RegenerateResult {
   // regenerator stays a pure, byte-deterministic function of the line *set*, but a fork is
   // surfaced here (and via a `seq-fork` crossCheckAuditLog flag) rather than silently resolved.
   conflictingForks: number;
+  // Every fork found, with the fingerprint the baseline matches on. Callers that want to accept
+  // the current state (audit-baseline.ts) write exactly these.
+  forks: ForkRecord[];
+  // Forks NOT in this machine's baseline -- the count that actually warns.
+  unacceptedForks: number;
+}
+
+export interface ForkRecord {
+  key: string; // "<machine> <seq>"
+  fingerprint: string;
 }
 
 // The canonical regenerator (house pattern #10-equivalent for the audit unionPath, mirroring
@@ -272,14 +382,15 @@ export async function regenerateUnionLog(path: string): Promise<RegenerateResult
   // erasing one side made the tamper invisible in the very artifact meant to record it.
   const kept: { entry: AuditEntry; bytes: string }[] = [];
   let duplicates = 0;
-  let conflictingForks = 0;
-  for (const [, list] of groups) {
+  const forks: ForkRecord[] = [];
+  for (const [key, list] of groups) {
     const distinct = new Map<string, { entry: AuditEntry; bytes: string }>();
     for (const x of list) if (!distinct.has(x.bytes)) distinct.set(x.bytes, x);
     duplicates += list.length - distinct.size;
-    if (distinct.size > 1) conflictingForks++;
+    if (distinct.size > 1) forks.push({ key, fingerprint: forkFingerprint(key, [...distinct.keys()]) });
     for (const x of distinct.values()) kept.push(x);
   }
+  const conflictingForks = forks.length;
 
   const sorted = kept.sort((a, b) => {
     const mc = codepointCompare(a.entry.machine, b.entry.machine);
@@ -297,10 +408,17 @@ export async function regenerateUnionLog(path: string): Promise<RegenerateResult
   if (malformed > 0) {
     log('warn', 'audit: regenerator dropped malformed line(s)', { path, malformed });
   }
-  if (conflictingForks > 0) {
+  // Only forks this machine has NOT accepted are worth waking someone for. A permanently-firing
+  // alarm is a disabled alarm: the live fleet carried 33 benign forks (a since-fixed seq-minting
+  // race, see nextSeq) and they drowned the signal that a genuinely forked key would raise.
+  const accepted = await loadForkBaseline();
+  const unacceptedForks = forks.filter((f) => !accepted.has(f.fingerprint));
+  if (unacceptedForks.length > 0) {
     log('warn', 'audit: regenerator found conflicting same-(machine,seq) entries (possible key compromise/fork)', {
       path,
-      conflictingForks,
+      conflictingForks: unacceptedForks.length,
+      acceptedForks: conflictingForks - unacceptedForks.length,
+      keys: unacceptedForks.map((f) => f.key).slice(0, 10),
     });
   }
 
@@ -310,6 +428,8 @@ export async function regenerateUnionLog(path: string): Promise<RegenerateResult
     droppedDuplicates: duplicates,
     droppedMalformed: malformed,
     conflictingForks,
+    forks,
+    unacceptedForks: unacceptedForks.length,
   };
 }
 
