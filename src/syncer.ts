@@ -161,9 +161,14 @@ export class Syncer {
     await this.sleep(this.debounceMs);
 
     const stable: string[] = [];
+    const absent: string[] = [];
     for (const p of paths) {
       const after = await statSig(join(repoPath, p));
-      if (after === before.get(p)) stable.push(p);
+      if (after !== before.get(p)) continue;
+      stable.push(p);
+      // Not on disk. Harmless on its own (an unstaged delete is still an index entry), but
+      // it is the precondition for the unmatchable-pathspec case dropVanished handles.
+      if (after === 'MISSING') absent.push(p);
     }
     if (stable.length === 0) return false;
 
@@ -174,7 +179,7 @@ export class Syncer {
     // rather than -f them: -f would commit exactly the secret the ignore rule exists to keep
     // out. Anything already staged for a dropped path stays in the index and is still
     // committed below, since the commit takes no pathspec.
-    const addable = await this.dropIgnored(repoPath, stable);
+    const addable = await this.dropIgnored(repoPath, await this.dropVanished(repoPath, stable, absent));
     if (addable.length > 0) {
       await this.gitOk(repoPath, ['add', '-A', '--', ...addable]);
     }
@@ -468,6 +473,38 @@ export class Syncer {
     return paths.filter((p) => !ignored.has(p));
   }
 
+  // Subset of `paths` that still resolves to something: `git add -A -- <paths>` exits 128 the
+  // moment ONE named path matches neither the worktree nor the index, and that aborts the whole
+  // repo's cycle. Two everyday commands produce such a path — `git mv` (status names both ends
+  // of the rename, and the old end is gone from disk AND from the index) and `git rm` (staged
+  // delete, likewise gone from both). An *unstaged* delete is not affected: the path is still an
+  // index entry, so the pathspec resolves. Dropping these loses nothing, because their change is
+  // already staged and the commit below takes no pathspec.
+  //
+  // `absent` is the already-computed subset that is missing from disk, so the common case costs
+  // no git call at all: a path present on disk can never be the unmatchable one.
+  private async dropVanished(repoPath: string, paths: string[], absent: string[]): Promise<string[]> {
+    if (absent.length === 0) return paths;
+    // -z keeps paths with newlines intact. ls-files reports the subset still in the index;
+    // a pathspec matching nothing is not an error here, unlike in `add`.
+    const r = await run(['git', 'ls-files', '-z', '--', ...absent], {
+      cwd: repoPath,
+      timeoutMs: this.gitTimeoutMs,
+    });
+    this.deps.onStep?.();
+    if (r.code !== 0) {
+      throw new Error(`git ls-files failed (code ${r.code}): ${r.stderr.trim()}`);
+    }
+    const inIndex = new Set(r.stdout.split('\0').filter(Boolean));
+    const vanished = new Set(absent.filter((p) => !inIndex.has(p)));
+    if (vanished.size === 0) return paths;
+    log('info', 'skipping vanished paths in auto-commit', {
+      repo: repoPath,
+      paths: [...vanished].slice(0, 10),
+    });
+    return paths.filter((p) => !vanished.has(p));
+  }
+
   private isoNow(): string {
     return new Date(this.now()).toISOString();
   }
@@ -498,6 +535,8 @@ async function statSig(abs: string): Promise<string> {
 }
 
 // Parse `git status --porcelain -z` into the set of worktree paths (both ends of renames).
+// The rename source is reported even though it no longer exists in the worktree or the index;
+// dropVanished filters it out before `git add` sees it.
 function parsePorcelainZ(out: string): string[] {
   const fields = out.split('\0');
   const paths = new Set<string>();
