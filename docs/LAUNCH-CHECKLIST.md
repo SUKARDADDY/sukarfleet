@@ -17,7 +17,7 @@ pass.
 | 7 | **Agent-origin admin is refused by default.** Enabling the lane grants the operator remote admin and nothing more. Verified by an agent-origin call being refused on a freshly enabled lane. | **done** — enforced, audited, and tested |
 | 8 | **`SECURITY.md` published** with the real threat model, including the same-user limitation and the no-full-disk-encryption caveat stated plainly. | **done** |
 | 9 | **Licences in place** — AGPL-3.0 daemon, MIT edges, DCO documented — from the first commit, not retrofitted. | **done** — first commit in the repository |
-| 10 | **Adversarial self-review passed** over trust, keys, exec and sync, with surviving findings fixed. | not started |
+| 10 | **Adversarial self-review passed** over trust, keys, exec and sync, with surviving findings fixed. | **run 2026-08-04, partly fixed** — five independent hostile passes (trust/pairing, keys/signatures, admin lane, sync/transport, threat-model fidelity). The documentation-honesty findings are fixed and the personal-data guard is repaired. Structural findings remain: the audit log's verification is unwired, and the pairing secret's entropy budget needs revisiting. Neither is settled by a doc edit, and the second changes the handshake, so it waits for the freeze. Item stays red until they land. |
 | 11 | **No personal data in the public repo** — no machine names, mesh addresses, hostnames or network layout. Checked by grep, not by memory. | **done** — enforced by `tests/no-personal-data.test.ts` in CI |
 
 ## Notes on the ones most likely to be red
