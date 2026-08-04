@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* sukarfleet console. No web fonts, no external assets: the page must render with the
    machine fully offline. Both colour schemes are first-class -- an operator reading an
    alarm at 3am gets the same contrast either way. */

@@ -70,8 +70,17 @@ different risks.
 
 | `admin.agentOrigin` | Behaviour |
 |---|---|
-| `refuse` *(default)* | Agent-origin runs are refused and audited. Status stays readable. A human drives the GUI. |
+| `refuse` *(default)* | Runs arriving over the MCP tool are refused and audited. Status stays readable. A human drives the GUI. |
 | `allow` | Any origin may drive the lane. |
+
+**What "agent origin" actually means, because the word promises more than the mechanism
+delivers.** The origin label is chosen by *which local endpoint the request arrived on*, not by
+any authentication. The MCP server stamps its callers `agent`; the GUI's own JSON API stamps its
+callers `operator`, and that API is guarded by loopback, Host-pinning and cross-site checks — none
+of which a non-browser process on your machine has to satisfy. So `refuse` stops your agent from
+using the *tool built for it*; it does not stop a program running as you from posting to the GUI
+endpoint and being labelled an operator. That is a mistake-preventer, in the same family as the
+command patterns below, and it is bounded by the same-user limitation at the end of this file.
 
 With `allow`, the honest sentence is: **an agent can become root on every paired machine,
 unattended.** That may be exactly what you want on a machine you own and control. It should be a
@@ -95,8 +104,22 @@ refusal. Do not mistake this for sandboxing: an authorized origin has root.
 
 ### What is recorded
 
-Every admin call, refusal and pairing is appended to a hash-chained, signed audit log, replicated
-to every machine. Two content rules are enforced by convention and by review:
+Every admin call, refusal and pairing is appended to a signed audit log, replicated to every
+machine. Each entry is signed individually and carries a per-machine monotonic sequence number.
+
+**Two things it is not, stated plainly, because earlier versions of this file claimed otherwise:**
+
+- **The entries are not chained.** There is no `prevHash` linking one entry to the last. Sequence
+  numbers make an interior deletion visible as a gap, but **truncating the newest entries of a
+  machine's run leaves no evidence at all**, and ordering is not authenticated.
+- **Nothing verifies those signatures on a live path today.** The verifier exists and is tested,
+  but the daemon's own read, flush and regenerate paths accept any well-formed line. A party with
+  write access to the replicated file can therefore add entries attributed to any machine, or
+  delete them, and no running code objects. Until that is wired, treat the audit log as a
+  faithful record of what *your own* machines did in the absence of an attacker — not as evidence
+  that would survive one.
+
+Two content rules are enforced by convention and by review:
 
 1. The **full argv** is recorded. A truncated argv makes the log useless as forensics.
 2. **Command output is never recorded** — only byte counts. The audit file reaches every machine
@@ -111,6 +134,17 @@ to every machine. Two content rules are enforced by convention and by review:
   secrets, those secrets reach every machine in the fleet, and any remote you have configured. This
   software has no opinion about your file contents.
 - The daemon runs unprivileged and never needs root to sync.
+- **A `postMerge` hook turns sync into remote code execution, by design and worth saying out
+  loud.** The hook's argv comes from your own config and no peer can rewrite it. But the argv
+  commonly *names a script that lives inside the synced tree* — a regenerator, a `chezmoi apply`
+  over a dotfiles source — and the tree is exactly what a peer can write. A paired machine that
+  commits a modified script gets it executed as your user, on every machine, after the next clean
+  merge. No conflict is needed. This follows from flat peer trust, but the amplification is worth
+  a decision: keep hook targets outside the directories you sync, or accept that pairing a machine
+  grants it code execution on the rest of the fleet.
+- **Newest-wins is decided by the git author timestamp, which the author controls.** A peer that
+  stamps a future date wins every non-union conflict. The losing side is preserved under
+  `.sync-conflicts/`, so this demotes content rather than destroying it.
 
 ## Known limitations
 
@@ -125,7 +159,16 @@ to every machine. Two content rules are enforced by convention and by review:
   requests, because a web page in a browser on your machine can reach `127.0.0.1`. If you run
   untrusted local code, it can reach these surfaces.
 - **Clock skew matters.** Signed requests carry a timestamp with a 120-second window. A badly wrong
-  clock breaks sync rather than weakening it.
+  clock breaks sync rather than weakening it. A paired peer that reports a wildly wrong clock can
+  push a small fleet's median past the threshold and stall its own peers' syncing.
+- **Request signatures do not cover the request body,** and there is no replay cache inside the
+  120-second window. On the read-only git routes this grants a replayer nothing the captured
+  header already granted.
+- **The audit log is signed but unverified and unchained.** See "What is recorded" above; it is
+  the largest gap between what this document used to claim and what the code does.
+- **WAN address discovery calls third parties.** Endpoint publication asks `api.ipify.org` and
+  `icanhazip.com` for this machine's public address. That module is inert unless you configure a
+  fleet-repo remote, but the calls are outbound traffic you did not explicitly ask for.
 
 ## Cryptography
 

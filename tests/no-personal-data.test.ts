@@ -35,7 +35,7 @@ const FORBIDDEN: { pattern: RegExp; what: string }[] = [
   { pattern: /\/Dev_Drive\b/, what: "a real machine's mount point" },
   { pattern: /\bpop-os\b/i, what: 'a real hostname' },
   { pattern: /\bsukarlaptop\b/i, what: 'a real machine name' },
-  { pattern: /\bGODFATHER\b/, what: 'a real machine name' },
+  { pattern: /\bGODFATHER\b/i, what: 'a real machine name' },
   { pattern: /\bsukardaddy\b/i, what: 'a real username' },
   // .local and the reserved example domains are synthetic by definition; anything else that looks
   // like an address is assumed to belong to a person.
@@ -45,6 +45,15 @@ const FORBIDDEN: { pattern: RegExp; what: string }[] = [
     what: 'a real email address',
   },
   { pattern: /\btrycloudflare\.com\b|\bcfargotunnel\.com\b/, what: 'a real tunnel hostname' },
+  // A quoted hostname on a registrable domain. Fixtures belong on the reserved example domains;
+  // anything else is somebody's real infrastructure, and a custom-domain tunnel host matches none
+  // of the patterns above. The allowlist is the third-party services the daemon genuinely calls --
+  // it is deliberately short, so a new real domain has to be argued for rather than absorbed.
+  {
+    pattern:
+      /['"`](?:https?:\/\/)?(?![^'"`]*(?:example\.(?:com|org|net)|ipify\.org|icanhazip\.com)['"`])(?:[a-z0-9][a-z0-9-]*\.)+(?:com|org|net|io|dev|app|cloud|me|info|biz|il|uk|de|us)['"`]/i,
+    what: 'a real hostname on a registrable domain',
+  },
 ];
 
 function walk(dir: string, out: string[] = []): string[] {

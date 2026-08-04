@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // sukarfleet console. Vanilla ES module, no build step, no dependency, no network asset.
 //
 // Two rules carry the whole file:

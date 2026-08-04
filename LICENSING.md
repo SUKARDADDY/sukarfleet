@@ -5,8 +5,8 @@ network service, not the language or the directory depth.
 
 | Path | Licence | Why |
 |------|---------|-----|
-| `src/**` (the daemon) | **AGPL-3.0-or-later** | The daemon is the service. AGPL's section 13 is the point: a modified daemon offered to others over a network has to offer its source back. |
-| `sdk/**`, `mcp/**`, `clients/**` | **MIT** | The edges are things other people embed. A copyleft edge would make the daemon unadoptable by the agents and tools it exists to serve. |
+| `src/**` (the daemon), `ui/**`, `scripts/**`, `install/**`, `systemd/**` | **AGPL-3.0-or-later** | The daemon is the service, and everything here ships with it. AGPL's section 13 is the point: a modified daemon offered to others over a network has to offer its source back. |
+| `sdk/**`, `mcp/**`, `clients/**` | **MIT** *(reserved — no such files yet)* | The edges are things other people embed. A copyleft edge would make the daemon unadoptable by the agents and tools it exists to serve. **Today the repository ships no MIT-licensed file:** the MCP server is part of the daemon and is AGPL like the rest of `src/**`. This row is the rule for edges when they are extracted, not a description of the current tree. |
 | `tests/**` | Follows the code under test | A test is not separately distributable. |
 | `LICENSES/**`, docs, fixtures | No licence claim beyond the repo default (AGPL-3.0-or-later) | |
 
