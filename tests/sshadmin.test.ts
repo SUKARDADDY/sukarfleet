@@ -255,18 +255,18 @@ describe('buildSshArgv', () => {
   });
 
   test('adds exactly one ProxyCommand option for the Cloudflare fallback', () => {
-    const cfg = withPeer(cfgFor('beta'), { sshFallbackHost: 'ssh.example.invalid' });
+    const cfg = withPeer(cfgFor('beta'), { sshFallbackHost: 'ssh.example.com' });
     const mesh = buildSshArgv(cfg, cfg.peers[0]!, 'P', false);
     const cf = buildSshArgv(cfg, cfg.peers[0]!, 'P', true);
     expect(cf.length).toBe(mesh.length + 2);
-    expect(cf).toContain('ProxyCommand=cloudflared access ssh --hostname ssh.example.invalid');
+    expect(cf).toContain('ProxyCommand=cloudflared access ssh --hostname ssh.example.com');
     expect(cf.filter((t) => t.startsWith('ProxyCommand=')).length).toBe(1);
   });
 
   test('peer overrides win over the admin defaults', () => {
-    const cfg = withPeer(cfgFor('beta'), { sshHost: 'alpha.mesh', sshPort: 2222 });
+    const cfg = withPeer(cfgFor('beta'), { sshHost: 'anchor.example.com', sshPort: 2222 });
     const argv = buildSshArgv(cfg, cfg.peers[0]!, 'P', false);
-    expect(argv[argv.length - 2]).toBe('alpha.mesh');
+    expect(argv[argv.length - 2]).toBe('anchor.example.com');
     expect(argv[argv.indexOf('-p') + 1]).toBe('2222');
   });
 });
@@ -396,7 +396,7 @@ describe('classifySshOutcome', () => {
       'ssh: connect to host 192.0.2.1 port 22: Connection refused',
       'ssh: connect to host 192.0.2.1 port 22: No route to host',
       'ssh: connect to host 192.0.2.1 port 22: Connection timed out',
-      'ssh: Could not resolve hostname alpha.mesh: Name or service not known',
+      'ssh: Could not resolve hostname anchor.example.com: Name or service not known',
       'sukarfleet@192.0.2.1: Permission denied (publickey).',
     ];
     for (const stderr of preSession) {
@@ -432,7 +432,7 @@ describe('classifySshOutcome', () => {
 
 describe('transport fallback', () => {
   test('falls back to Cloudflare only after a connect-level failure', async () => {
-    const cfg = withPeer(cfgFor('beta'), { sshFallbackHost: 'ssh.example.invalid' });
+    const cfg = withPeer(cfgFor('beta'), { sshFallbackHost: 'ssh.example.com' });
     const h = harness(cfg, [
       { code: 255, stdout: '', stderr: 'ssh: connect to host 192.0.2.1 port 22: No route to host' },
       { code: 0, stdout: envelope({ stdout: 'served over cf\n' }) },
@@ -446,7 +446,7 @@ describe('transport fallback', () => {
   });
 
   test('NEVER retries a command that actually executed', async () => {
-    const cfg = withPeer(cfgFor('beta'), { sshFallbackHost: 'ssh.example.invalid' });
+    const cfg = withPeer(cfgFor('beta'), { sshFallbackHost: 'ssh.example.com' });
     // Exit 255 is ambiguous by code alone -- but the target answered, so the command ran.
     const h = harness(cfg, [{ code: 255, stdout: envelope({ exitCode: 255, stdout: 'partial\n' }) }]);
     const res = await h.admin.runAdmin(request());
@@ -456,7 +456,7 @@ describe('transport fallback', () => {
   });
 
   test('a non-255 failure is never retried', async () => {
-    const cfg = withPeer(cfgFor('beta'), { sshFallbackHost: 'ssh.example.invalid' });
+    const cfg = withPeer(cfgFor('beta'), { sshFallbackHost: 'ssh.example.com' });
     const h = harness(cfg, [{ code: 1, stdout: envelope({ exitCode: 1, stdout: '', stderr: 'boom\n' }) }]);
     const res = await h.admin.runAdmin(request());
     expect(h.calls.length).toBe(1);
@@ -465,7 +465,7 @@ describe('transport fallback', () => {
   });
 
   test('a host key mismatch refuses and does not touch the fallback', async () => {
-    const cfg = withPeer(cfgFor('beta'), { sshFallbackHost: 'ssh.example.invalid' });
+    const cfg = withPeer(cfgFor('beta'), { sshFallbackHost: 'ssh.example.com' });
     await pinHostToken(cfg, '192.0.2.1', 'alpha');
     const h = harness(cfg, [
       { code: 255, stdout: '', stderr: '@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\nHost key verification failed.' },
@@ -479,7 +479,7 @@ describe('transport fallback', () => {
   // A 255 the origin cannot prove is a failed CONNECT must not buy a second execution, even with
   // a fallback host configured and even though ssh said nothing on stdout.
   test('a mid-session death never re-dials over the Cloudflare fallback', async () => {
-    const cfg = withPeer(cfgFor('beta'), { sshFallbackHost: 'ssh.example.invalid' });
+    const cfg = withPeer(cfgFor('beta'), { sshFallbackHost: 'ssh.example.com' });
     const h = harness(cfg, [{ code: 255, stdout: '', stderr: 'Timeout, server 192.0.2.1 not responding.' }]);
     const res = await h.admin.runAdmin(request());
     expect(h.calls.length).toBe(1);
@@ -1352,7 +1352,7 @@ describe('inbound door (admin.acceptIncoming)', () => {
     const admin = new SshAdmin({ cfg, auditAppend: async () => ({}) as AuditEntry, peerView: () => null, now });
     const path = cfg.admin.authorizedKeysPath;
     // A personal key that must survive both directions -- this file is the operator's own.
-    const personal = 'ssh-ed25519 AAAAPERSONALKEY fleet@beta';
+    const personal = 'ssh-ed25519 AAAAPERSONALKEY user@host';
     await writeFile(path, `${personal}\n`, 'utf8');
 
     await admin.openInboundDoor();

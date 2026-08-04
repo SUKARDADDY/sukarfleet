@@ -897,7 +897,10 @@ async function main(): Promise<void> {
     if (req.method === 'POST' && url.pathname === '/gossip') {
       let envelope: GossipEnvelope;
       try {
-        envelope = (await req.json()) as GossipEnvelope;
+        // Capped like every other body-accepting route. This one faces the mesh and its signature
+        // is checked only after the body is in hand, so an unpaired member that can reach the port
+        // could otherwise make us allocate first and reject afterwards.
+        envelope = (await readCappedJson(req)) as GossipEnvelope;
       } catch {
         return new Response('bad json', { status: 400 });
       }

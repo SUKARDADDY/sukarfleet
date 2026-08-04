@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # sukarfleet quickstart: everything a machine needs that does NOT require root.
 # Idempotent by construction — safe to re-run on every update, and that is the
 # intended upgrade path (`quickstart.sh --restart`).

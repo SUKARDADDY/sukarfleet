@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # The one step that needs root.
 #
 # It does exactly two things, both narrow enough to read in full before you run them:

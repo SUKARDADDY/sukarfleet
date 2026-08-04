@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # fleet-guard: prove both machines are synced and working, and repair them when they are not.
 #
 # Run after EVERY extraction phase. The extraction touches the daemon that keeps this fleet's
@@ -53,7 +54,7 @@ for a in "$@"; do
   case "$a" in
     --repair) DO_REPAIR=1 ;;
     --quick)  QUICK=1 ;;
-    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,15p' "$0"; exit 0 ;;
     *) echo "unknown argument: $a" >&2; exit 2 ;;
   esac
 done
