@@ -38,6 +38,16 @@ if [ -z "$MARKER" ]; then
   MARKER="${_first_repo:-$HOME}/.fleet-guard-probe"
 fi
 
+# The peer's checkout path: machines may lay out their checkouts differently, so ask the peer's
+# own service manager where its daemon runs from rather than assuming our layout mirrors theirs.
+# FLEET_PEER_REPO overrides; the local path is only a last resort for peers with no unit installed.
+PEER_REPO="${FLEET_PEER_REPO:-}"
+if [ -z "$PEER_REPO" ]; then
+  PEER_REPO="$(ssh "${SSH_OPTS[@]}" "$PEER_IP" \
+    'systemctl --user show sukarfleet.service -p WorkingDirectory --value' 2>/dev/null | tr -d '[:space:]')"
+fi
+[ -n "$PEER_REPO" ] || PEER_REPO="$REPO"
+
 DO_REPAIR=0; QUICK=0
 for a in "$@"; do
   case "$a" in
@@ -150,7 +160,7 @@ else
   grep -A6 "^Alarms:" <<<"$local_status" | sed 's/^/        /'
 fi
 
-peer_status=$(ssh "${SSH_OPTS[@]}" "$PEER_IP" 'cd ~/AI_Agent/OS/Projects/sukarfleet && timeout 30 ~/.bun/bin/bun run src/cli.ts status' 2>/dev/null)
+peer_status=$(ssh "${SSH_OPTS[@]}" "$PEER_IP" "cd '$PEER_REPO' && timeout 30 ~/.bun/bin/bun run src/cli.ts status" 2>/dev/null)
 if grep -q "No active alarms" <<<"$peer_status"; then
   ok "$PEER_NAME: no alarms"
 else
@@ -166,10 +176,9 @@ else
   bad "local -> $PEER_NAME admin run failed"
 fi
 # The reverse leg, driven from the peer. Both the peer's checkout path and this machine's name
-# are derived rather than hardcoded: SELF_NAME from the live config, PEER_REPO overridable for a
-# fleet whose machines lay their checkouts out differently.
+# are derived rather than hardcoded: SELF_NAME from the live config, PEER_REPO from the peer's
+# own systemd unit (resolved at the top of this script).
 SELF_NAME="${FLEET_SELF_NAME:-$(jq -r '.machine // empty' "$HOME/.config/sukarfleet/config.json" 2>/dev/null || true)}"
-PEER_REPO="${FLEET_PEER_REPO:-$REPO}"
 if [ -n "$SELF_NAME" ] && ssh "${SSH_OPTS[@]}" "$PEER_IP" \
      "cd '$PEER_REPO' && timeout 60 ~/.bun/bin/bun run src/cli.ts admin run '$SELF_NAME' --reason 'fleet-guard' -- true" \
      >/dev/null 2>&1; then

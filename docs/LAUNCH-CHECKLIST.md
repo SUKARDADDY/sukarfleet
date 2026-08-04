@@ -11,8 +11,8 @@ pass.
 | 1 | **Clean-box install under 5 minutes.** A machine that has never seen this reaches a running daemon and an open GUI, timed, from one command. | not yet measured |
 | 2 | **Two machines pair with no terminal.** Code shown on one, typed on the other, mutual trust established, GUI only. | implemented, not timed on a clean box |
 | 3 | **The wedge demonstrates.** An agent on machine B recalls something written on machine A, in under 30 seconds of screen time. | runs daily; not recorded |
-| 4 | **Configurable synced directories work** for a directory that is not the workspace. | implemented; needs the real proof in item 9 |
-| 5 | **14 consecutive days on the extracted code** with no rollback. | not started — begins at cutover |
+| 4 | **Configurable synced directories work** for a directory that is not the workspace. | **done** — field-proven at cutover: the dotfiles and agent-memory directories survived as ordinary configured entries, no special-casing |
+| 5 | **14 consecutive days on the extracted code** with no rollback. | **running** — both machines cut over; soak started 2026-08-04, day 14 falls on 2026-08-18 |
 | 6 | **Experimental platforms fail honestly.** On a platform with no working credential backend, the admin lane refuses with a clear message and sync is unaffected. Verified by forcing the failure. | seams implemented and unit-tested; not yet forced on real non-Linux hardware |
 | 7 | **Agent-origin admin is refused by default.** Enabling the lane grants the operator remote admin and nothing more. Verified by an agent-origin call being refused on a freshly enabled lane. | **done** — enforced, audited, and tested |
 | 8 | **`SECURITY.md` published** with the real threat model, including the same-user limitation and the no-full-disk-encryption caveat stated plainly. | **done** |
