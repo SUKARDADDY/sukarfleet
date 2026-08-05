@@ -107,17 +107,19 @@ refusal. Do not mistake this for sandboxing: an authorized origin has root.
 Every admin call, refusal and pairing is appended to a signed audit log, replicated to every
 machine. Each entry is signed individually and carries a per-machine monotonic sequence number.
 
-**Two things it is not, stated plainly, because earlier versions of this file claimed otherwise:**
+**What checking happens, and what it cannot see:**
 
+- **Signatures are verified on every sync tick.** The daemon cross-checks the replicated file it
+  just regenerated: an entry whose signature does not verify against the signer's enrolled key, or
+  that claims a machine with no enrolled key at all, raises a fault the same way a sync error does.
+  Two signed entries claiming one sequence number, and gaps in a machine's sequence, are reported
+  too. The check reads and never repairs — deleting a bad line would propagate that deletion to
+  every machine, and a tampered log that is loudly flagged is worth more than a quietly fixed one.
 - **The entries are not chained.** There is no `prevHash` linking one entry to the last. Sequence
   numbers make an interior deletion visible as a gap, but **truncating the newest entries of a
-  machine's run leaves no evidence at all**, and ordering is not authenticated.
-- **Nothing verifies those signatures on a live path today.** The verifier exists and is tested,
-  but the daemon's own read, flush and regenerate paths accept any well-formed line. A party with
-  write access to the replicated file can therefore add entries attributed to any machine, or
-  delete them, and no running code objects. Until that is wired, treat the audit log as a
-  faithful record of what *your own* machines did in the absence of an attacker — not as evidence
-  that would survive one.
+  machine's run leaves no evidence at all**, and ordering is not authenticated. This is the real
+  remaining limit: verification proves each surviving entry is genuine, not that you are looking at
+  all of them.
 
 Two content rules are enforced by convention and by review:
 
@@ -164,8 +166,8 @@ Two content rules are enforced by convention and by review:
 - **Request signatures do not cover the request body,** and there is no replay cache inside the
   120-second window. On the read-only git routes this grants a replayer nothing the captured
   header already granted.
-- **The audit log is signed but unverified and unchained.** See "What is recorded" above; it is
-  the largest gap between what this document used to claim and what the code does.
+- **The audit log is verified but unchained.** Each surviving entry is proven genuine; a machine
+  truncating its own most recent entries leaves nothing to detect. See "What is recorded" above.
 - **WAN address discovery calls third parties.** Endpoint publication asks `api.ipify.org` and
   `icanhazip.com` for this machine's public address. That module is inert unless you configure a
   fleet-repo remote, but the calls are outbound traffic you did not explicitly ask for.
