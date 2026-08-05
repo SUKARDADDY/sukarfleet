@@ -486,6 +486,24 @@ export interface CrossCheckOptions {
   // Fallback TTL (seconds) for a job-issued entry whose detail.ttlSec is missing/invalid.
   // Callers normally pass cfg.exec.thresholds.jobTtlSec (pinned default 3600).
   defaultTtlSec?: number;
+  // Fork fingerprints this machine has already been told are benign -- loadForkBaseline(). Without
+  // this, the reader re-raises every historical fork on every pass: the live fleet carried 33 from
+  // a since-fixed seq-minting race (see nextSeq), and an alarm that always fires is an alarm
+  // nobody reads. Matched exactly the way regenerateUnionLog matches them, so "accepted" means the
+  // same thing on both paths -- and a fork that gains a THIRD variant changes fingerprint and
+  // alarms again, which is the property that makes accepting one safe.
+  acceptedForkFingerprints?: ReadonlySet<string>;
+  // Caller-owned cache of canonical-bytes digests already known to verify. READ AND UPDATED IN
+  // PLACE. Entries are immutable once signed, so a digest that verified once verifies forever;
+  // anything whose bytes differ is a different entry and gets checked. Without it every pass
+  // re-verifies the whole log (~0.12ms/entry -- fine at 243 entries, over a second at ten
+  // thousand, and this file only grows). Failures are never cached: a bad entry is re-flagged
+  // every pass until it is gone.
+  verifiedDigests?: Set<string>;
+}
+
+function entryDigest(canonicalBytes: string): string {
+  return createHash('sha256').update(canonicalBytes).digest('hex');
 }
 
 // Bidirectional issuance<->execution cross-check reader over an already-assembled entry set
@@ -529,6 +547,11 @@ export async function crossCheckAuditLog(entries: AuditEntry[], opts: CrossCheck
   // detail can itself produce a mismatched execution-unissued/issuance-silent flag, which is
   // useful corroborating signal, not noise) -- they remain in `trustedForMatching`, matching the
   // pre-existing behavior for known-but-tampered entries.
+  // Canonical bytes are needed twice (verification cache key, and same-seq fork comparison), and
+  // canonicalJson is not free -- encode each entry once.
+  const bytesOf = new Map<AuditEntry, string>();
+  for (const entry of entries) bytesOf.set(entry, canonicalJson(entry));
+
   const trustedForMatching = new Set<AuditEntry>();
   for (const entry of entries) {
     const pub = opts.publicKeyJwkByMachine[entry.machine];
@@ -541,8 +564,15 @@ export async function crossCheckAuditLog(entries: AuditEntry[], opts: CrossCheck
       });
       continue;
     }
+    const digest = entryDigest(bytesOf.get(entry)!);
+    if (opts.verifiedDigests?.has(digest)) {
+      trustedForMatching.add(entry);
+      continue;
+    }
     const ok = await verifyAuditEntry(entry, pub);
-    if (!ok) {
+    if (ok) {
+      opts.verifiedDigests?.add(digest);
+    } else {
       flags.push({
         kind: 'signature-invalid',
         machine: entry.machine,
@@ -569,8 +599,10 @@ export async function crossCheckAuditLog(entries: AuditEntry[], opts: CrossCheck
     }
 
     for (const [seq, group] of bySeq) {
-      const distinctBytes = new Set(group.map((e) => canonicalJson(e)));
+      const distinctBytes = new Set(group.map((e) => bytesOf.get(e) ?? canonicalJson(e)));
       if (distinctBytes.size > 1) {
+        const key = `${machine} ${seq}`;
+        if (opts.acceptedForkFingerprints?.has(forkFingerprint(key, [...distinctBytes]))) continue;
         flags.push({
           kind: 'seq-fork',
           machine,

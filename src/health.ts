@@ -23,7 +23,8 @@ export type FaultClass =
   | 'admin-credential-stale'
   | 'admin-hostkey-mismatch'
   | 'admin-peer-unreachable'
-  | 'admin-lane-unconfigured';
+  | 'admin-lane-unconfigured'
+  | 'audit-integrity';
 
 export interface HealthSelf {
   repos: Record<string, { lastSyncOkMs: number | null; lastCommit: string | null; syncError: string | null }>;
@@ -40,6 +41,16 @@ export interface HealthSelf {
     hostkeyMismatch: string[]; // peer machines whose pinned host key stopped matching
     unreachablePeers: string[]; // paired peers the lane could not reach this cycle
     configured: boolean; // ssh key + known_hosts present
+  };
+  // Result of the last audit-log cross-check. Absent means the check did not run this tick (the
+  // union file is not opted into unionPaths, or the flush failed) -- which raises nothing, the
+  // same way an absent `admin` raises no admin faults. Counts only: a fault message reaches a
+  // desktop notification, and an audit detail can carry an argv.
+  auditIntegrity?: {
+    invalidSignatures: number; // entries whose signature did not verify against the enrolled key
+    unverifiableSigners: number; // entries claiming a machine with no enrolled key
+    unacceptedForks: number; // same-seq conflicts not in this machine's fork baseline
+    seqGaps: number; // missing entries in some machine's sequence
   };
 }
 
@@ -146,6 +157,8 @@ function titleFor(faultClass: FaultClass): string {
       return 'sukarfleet: admin peer unreachable';
     case 'admin-lane-unconfigured':
       return 'sukarfleet: admin lane unconfigured';
+    case 'audit-integrity':
+      return 'sukarfleet: audit log integrity';
   }
 }
 
@@ -268,6 +281,46 @@ function computeActiveFaults(cfg: FleetConfig, self: HealthSelf, peers: PeerView
         faultClass: 'admin-lane-unconfigured',
         urgency: 'normal',
         message: 'admin lane enabled but not configured (missing ssh key or known_hosts)',
+      });
+    }
+  }
+
+  // Audit-log integrity. A signature that does not verify is the one condition here that means
+  // somebody edited the replicated log: the entries are signed by the machine that minted them,
+  // so a bad signature is not drift, it is a rewrite. Separate keys per condition, so a real
+  // forgery is not hidden behind an already-firing gap alarm.
+  const audit = self.auditIntegrity;
+  if (audit) {
+    if (audit.invalidSignatures > 0) {
+      faults.push({
+        key: 'audit-integrity:signature',
+        faultClass: 'audit-integrity',
+        urgency: 'critical',
+        message: `${audit.invalidSignatures} audit entr${audit.invalidSignatures === 1 ? 'y' : 'ies'} failed signature verification — the replicated log has been edited`,
+      });
+    }
+    if (audit.unacceptedForks > 0) {
+      faults.push({
+        key: 'audit-integrity:fork',
+        faultClass: 'audit-integrity',
+        urgency: 'critical',
+        message: `${audit.unacceptedForks} audit seq fork(s) not in this machine's baseline — two signed entries claim one sequence number`,
+      });
+    }
+    if (audit.unverifiableSigners > 0) {
+      faults.push({
+        key: 'audit-integrity:signer',
+        faultClass: 'audit-integrity',
+        urgency: 'normal',
+        message: `${audit.unverifiableSigners} audit entr${audit.unverifiableSigners === 1 ? 'y' : 'ies'} from a machine with no enrolled key`,
+      });
+    }
+    if (audit.seqGaps > 0) {
+      faults.push({
+        key: 'audit-integrity:gap',
+        faultClass: 'audit-integrity',
+        urgency: 'normal',
+        message: `${audit.seqGaps} gap(s) in an audit sequence — entries are missing from the log`,
       });
     }
   }

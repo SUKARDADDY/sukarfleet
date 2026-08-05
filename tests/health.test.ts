@@ -85,6 +85,54 @@ describe('formatDuration', () => {
   });
 });
 
+describe('Health.evaluate: audit integrity', () => {
+  const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+
+  test('an absent verdict raises nothing (the check did not run)', async () => {
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(healthyCfg({}), notifier);
+    await health.evaluate(t0, healthySelf(), []);
+    expect(calls.filter((c) => c.title.includes('audit'))).toHaveLength(0);
+  });
+
+  test('a clean verdict raises nothing', async () => {
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(healthyCfg({}), notifier);
+    const self = healthySelf();
+    self.auditIntegrity = { invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0 };
+    await health.evaluate(t0, self, []);
+    expect(calls.filter((c) => c.title.includes('audit'))).toHaveLength(0);
+  });
+
+  test('a bad signature is critical — somebody edited the replicated log', async () => {
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(healthyCfg({}), notifier);
+    const self = healthySelf();
+    self.auditIntegrity = { invalidSignatures: 2, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0 };
+    await health.evaluate(t0, self, []);
+    const audit = calls.filter((c) => c.title.includes('audit'));
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.urgency).toBe('critical');
+    expect(audit[0]!.body).toContain('2 audit entries failed signature verification');
+  });
+
+  test('signature and gap faults latch separately, so a forgery is not hidden behind a gap', async () => {
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(healthyCfg({}), notifier);
+    const self = healthySelf();
+    self.auditIntegrity = { invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 1 };
+    await health.evaluate(t0, self, []);
+    expect(calls.filter((c) => c.title.includes('audit'))).toHaveLength(1);
+
+    // A real forgery now appears while the gap fault is still latched: it must still notify.
+    self.auditIntegrity = { invalidSignatures: 1, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 1 };
+    await health.evaluate(t0 + 1000, self, []);
+    const audit = calls.filter((c) => c.title.includes('audit'));
+    expect(audit).toHaveLength(2);
+    expect(audit[1]!.urgency).toBe('critical');
+  });
+});
+
 describe('Health.evaluate', () => {
   test('fault latches on first detection and re-raises on schedule, not before', async () => {
     const cfg = healthyCfg({ alarmRepeatMin: 10 });
