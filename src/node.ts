@@ -39,6 +39,9 @@ import {
   AUDIT_KIND_ADMIN_RUN_COMPLETED,
   AUDIT_KIND_ADMIN_RUN_REFUSED,
   flushLocalToUnion,
+  crossCheckAuditLog,
+  loadForkBaseline,
+  type CrossCheckFlagKind,
 } from './audit';
 import { startMcpServer, type McpDeps, type McpServerHandle } from './mcp';
 import { readCappedBody, DEFAULT_MAX_BODY_BYTES, BODY_READ_TIMEOUT_MS } from './http';
@@ -1027,6 +1030,56 @@ async function main(): Promise<void> {
   // the first add/add conflict and that repo's sync loop wedges forever. Refusing to flush costs
   // only the git-shared copy of the audit log (the authoritative one still accumulates in
   // stateDir()); flushing into an unprepared repo costs the whole sync lane.
+  // Verdict of the last audit cross-check, fed to health.ts. `undefined` until the first check
+  // runs -- an absent verdict raises nothing, exactly like an absent `admin` block.
+  let auditIntegrity: HealthSelf['auditIntegrity'];
+  // Digests of entries already known to verify. Entries are immutable once signed, so this only
+  // ever saves work; anything whose bytes differ is a different entry and gets checked. Lives for
+  // the daemon's lifetime, so a restart re-verifies the whole log from scratch.
+  const auditVerifiedDigests = new Set<string>();
+
+  // The signers this machine will accept audit entries from: itself, plus every peer that has
+  // completed enrolment. A machine absent here has its entries flagged `unverifiable-signer`
+  // rather than trusted -- crossCheckAuditLog fails closed, and so does this.
+  function auditSignerKeys(): Record<string, JsonWebKey> {
+    const keys: Record<string, JsonWebKey> = { [cfg.machine]: key.publicKeyJwk };
+    for (const peer of cfg.peers) if (peer.publicKeyJwk) keys[peer.name] = peer.publicKeyJwk;
+    return keys;
+  }
+
+  // Verifies every signature in the regenerated union file and reports what is wrong with it.
+  //
+  // Reads only -- it never rewrites, quarantines or drops a line. That is deliberate: the union
+  // file is git-synced, so deleting a line here would propagate the deletion to every machine, and
+  // a tampered log that is loudly flagged is worth more than a quietly repaired one. Equally, it
+  // must never throw: wedging the sync loop over a bad audit line would turn a forensics problem
+  // into an outage.
+  async function crossCheckFlushedEntries(entries: AuditEntry[]): Promise<HealthSelf['auditIntegrity']> {
+    const report = await crossCheckAuditLog(entries, {
+      nowMs: nowMs(),
+      publicKeyJwkByMachine: auditSignerKeys(),
+      acceptedForkFingerprints: await loadForkBaseline(),
+      verifiedDigests: auditVerifiedDigests,
+    });
+    const count = (kind: CrossCheckFlagKind): number => report.flags.filter((f) => f.kind === kind).length;
+    const verdict = {
+      invalidSignatures: count('signature-invalid'),
+      unverifiableSigners: count('unverifiable-signer'),
+      unacceptedForks: count('seq-fork'),
+      seqGaps: count('seq-gap'),
+    };
+    if (report.flags.length > 0) {
+      log('error', 'audit: cross-check found problems in the replicated log', {
+        ...verdict,
+        // Details name machines, seqs and kinds -- never an argv, which an audit detail can carry.
+        examples: report.flags.slice(0, 5).map((f) => `${f.kind}: ${f.detail}`),
+      });
+    } else {
+      log('debug', 'audit: cross-check clean', { entries: entries.length, cached: auditVerifiedDigests.size });
+    }
+    return verdict;
+  }
+
   let auditRepoWarned = false;
   function resolveAuditRepo(): RepoConfig | null {
     const name = cfg.admin.auditRepo;
@@ -1088,7 +1141,10 @@ async function main(): Promise<void> {
           repo: auditRepo.name,
           entries: flushResult.entries.length,
         });
+        auditIntegrity = await crossCheckFlushedEntries(flushResult.entries);
       } catch (err) {
+        // Deliberately does NOT clear auditIntegrity: a flush that failed this cycle is a reason to
+        // keep showing the last verdict, not to silently retract a forgery alarm.
         log('error', 'audit: flush/cross-check failed', { repo: auditRepo.name, error: String(err) });
       }
     }
@@ -1179,6 +1235,7 @@ async function main(): Promise<void> {
         transportWedged: transport.wedged(now),
         anchorReachable: transport.anchorReachable(),
         admin: adminSelf,
+        auditIntegrity,
       },
       // A peer with no enrolled public key cannot gossip verifiably yet —
       // "pending enrollment", not "offline". Alarming on it would nag the

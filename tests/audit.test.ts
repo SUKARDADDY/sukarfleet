@@ -357,6 +357,96 @@ describe('flushLocalToUnion', () => {
   });
 });
 
+// The two options the daemon's sync-tick cross-check depends on. Without the first it would
+// re-raise every historical fork on every tick (the live fleet carried 33); without the second it
+// would re-verify the whole log every tick forever.
+describe('crossCheckAuditLog: baseline-accepted forks and the verification cache', () => {
+  // Builds a real fork (two validly-signed entries claiming one seq) and returns the fingerprint
+  // the way production gets it: from the regenerator, which is what audit-baseline.ts writes.
+  async function forkedPair(): Promise<{ entries: AuditEntry[]; fingerprint: string; key: MachineKey }> {
+    const key = await freshKey('alpha');
+    const a = await makeEntry('alpha', key, 7, AUDIT_KIND_JOB_ISSUED, { jobId: 'j1', targetMachine: 'beta' });
+    const b = await makeEntry('alpha', key, 7, AUDIT_KIND_JOB_ISSUED, { jobId: 'j2', targetMachine: 'beta' });
+    const dir = await mkdtemp(join(tmpdir(), 'sukarfleet-fork-'));
+    const path = join(dir, 'union.jsonl');
+    await Bun.write(path, `${canonicalJson(a)}\n${canonicalJson(b)}\n`);
+    const result = await regenerateUnionLog(path);
+    await rm(dir, { recursive: true, force: true });
+    expect(result.forks).toHaveLength(1);
+    return { entries: [a, b], fingerprint: result.forks[0]!.fingerprint, key };
+  }
+
+  test('a fork is flagged when no baseline is supplied', async () => {
+    const { entries, key } = await forkedPair();
+    const report = await crossCheckAuditLog(entries, {
+      nowMs: entries[0]!.tsMs,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+    });
+    expect(report.flags.filter((f) => f.kind === 'seq-fork')).toHaveLength(1);
+  });
+
+  test('the same fork is silent once its fingerprint is in the accepted set', async () => {
+    const { entries, fingerprint, key } = await forkedPair();
+    const report = await crossCheckAuditLog(entries, {
+      nowMs: entries[0]!.tsMs,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+      acceptedForkFingerprints: new Set([fingerprint]),
+    });
+    expect(report.flags.filter((f) => f.kind === 'seq-fork')).toHaveLength(0);
+  });
+
+  test('accepting a fork does not accept a THIRD variant appearing later', async () => {
+    const { entries, fingerprint, key } = await forkedPair();
+    // The whole reason accepting a fork is safe: the fingerprint covers the SET of variants, so a
+    // new line under the same seq changes it and the alarm returns.
+    const third = await makeEntry('alpha', key, 7, AUDIT_KIND_JOB_ISSUED, { jobId: 'j3', targetMachine: 'beta' });
+    const report = await crossCheckAuditLog([...entries, third], {
+      nowMs: entries[0]!.tsMs,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+      acceptedForkFingerprints: new Set([fingerprint]),
+    });
+    expect(report.flags.filter((f) => f.kind === 'seq-fork')).toHaveLength(1);
+  });
+
+  test('a clean pass fills the cache, and a cached digest is not re-verified', async () => {
+    const key = await freshKey('alpha');
+    const entry = await makeEntry('alpha', key, 1, AUDIT_KIND_JOB_ISSUED, { jobId: 'j1', targetMachine: 'beta' });
+    const cache = new Set<string>();
+    const first = await crossCheckAuditLog([entry], {
+      nowMs: entry.tsMs,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+      verifiedDigests: cache,
+    });
+    expect(first.flags).toHaveLength(0);
+    expect(cache.size).toBe(1);
+
+    // Proves the cache is actually consulted rather than merely populated: the SAME bytes are now
+    // presented with a key that cannot verify them. Un-cached, this is signature-invalid.
+    const otherKey = await freshKey('gamma');
+    const second = await crossCheckAuditLog([entry], {
+      nowMs: entry.tsMs,
+      publicKeyJwkByMachine: { alpha: otherKey.publicKeyJwk },
+      verifiedDigests: cache,
+    });
+    expect(second.flags.filter((f) => f.kind === 'signature-invalid')).toHaveLength(0);
+  });
+
+  test('a failed verification is never cached, so it is re-flagged every pass', async () => {
+    const key = await freshKey('alpha');
+    const entry = await makeEntry('alpha', key, 1, AUDIT_KIND_JOB_ISSUED, { jobId: 'j1', targetMachine: 'beta' });
+    const tampered: AuditEntry = { ...entry, detail: { jobId: 'j1', targetMachine: 'attacker' } };
+    const cache = new Set<string>();
+    const opts = { nowMs: entry.tsMs, publicKeyJwkByMachine: { alpha: key.publicKeyJwk }, verifiedDigests: cache };
+
+    const first = await crossCheckAuditLog([tampered], opts);
+    const second = await crossCheckAuditLog([tampered], opts);
+
+    expect(first.flags.filter((f) => f.kind === 'signature-invalid')).toHaveLength(1);
+    expect(second.flags.filter((f) => f.kind === 'signature-invalid')).toHaveLength(1);
+    expect(cache.size).toBe(0);
+  });
+});
+
 describe('crossCheckAuditLog', () => {
   test('flags a tampered entry (detail changed after signing)', async () => {
     const key = await freshKey('alpha');
