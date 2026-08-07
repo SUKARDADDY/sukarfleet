@@ -120,6 +120,23 @@ describe('the new locations are authoritative', () => {
   });
 });
 
+describe('notifications.os (P5): default true, explicit false round-trips', () => {
+  test('a config with no notifications key defaults os to true', async () => {
+    const cfg = await loadConfig(writeConfig({ machine: 'alpha' }));
+    expect(cfg.notifications.os).toBe(true);
+  });
+
+  test('an explicit notifications.os:false round-trips through loadConfig', async () => {
+    const cfg = await loadConfig(writeConfig({ machine: 'alpha', notifications: { os: false } }));
+    expect(cfg.notifications.os).toBe(false);
+  });
+
+  test('a real deployed-shape config (no notifications block) still defaults to true', async () => {
+    const cfg = await loadConfig(writeConfig(deployedShape()));
+    expect(cfg.notifications.os).toBe(true);
+  });
+});
+
 describe('unknown top-level blocks survive', () => {
   test('a block the running build has never heard of does not fail the load', async () => {
     const raw = deployedShape();

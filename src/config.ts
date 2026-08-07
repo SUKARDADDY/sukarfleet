@@ -54,6 +54,9 @@ export function defaultConfig(machine: string): FleetConfig {
       udpPort: null,
       tcpPort: null,
     },
+    notifications: {
+      os: true,
+    },
     fleetRepoPath: join(stateDir(), 'fleet-repo'),
     mcpPort: 7719,
     intervals: {
@@ -167,6 +170,9 @@ function mergeDefaults(raw: Record<string, unknown>, base: FleetConfig): FleetCo
   const easytier = isPlainObject(raw.easytier) ? { ...base.easytier, ...raw.easytier } : base.easytier;
   const intervals = isPlainObject(raw.intervals) ? { ...base.intervals, ...raw.intervals } : base.intervals;
   const thresholds = isPlainObject(raw.thresholds) ? { ...base.thresholds, ...raw.thresholds } : base.thresholds;
+  const notifications = isPlainObject(raw.notifications)
+    ? { ...base.notifications, ...raw.notifications }
+    : base.notifications;
 
   const migrated = migrateLegacyExecBlock(raw, base);
 
@@ -183,6 +189,7 @@ function mergeDefaults(raw: Record<string, unknown>, base: FleetConfig): FleetCo
     easytier: easytier as FleetConfig['easytier'],
     intervals: intervals as FleetConfig['intervals'],
     thresholds: thresholds as FleetConfig['thresholds'],
+    notifications: notifications as FleetConfig['notifications'],
     mcpPort: migrated.mcpPort,
     admin: admin as FleetConfig['admin'],
   } as FleetConfig;
@@ -273,6 +280,9 @@ function validate(cfg: FleetConfig): void {
       fail(`wan.${k} must be null or a port number`);
     }
   }
+
+  if (!isPlainObject(cfg.notifications)) fail('notifications must be an object');
+  if (typeof cfg.notifications.os !== 'boolean') fail('notifications.os must be a boolean');
 
   const iv = cfg.intervals as unknown;
   if (!isPlainObject(iv)) fail('intervals must be an object');

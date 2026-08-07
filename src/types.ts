@@ -48,6 +48,12 @@ export interface FleetConfig {
     udpPort: number | null;
     tcpPort: number | null;
   };
+  // Desktop notification duty. Default true (today's behaviour: the daemon notifies directly).
+  // Set os:false to hand notification duty to a client that polls the daemon's fault state itself
+  // (e.g. the tray app), so the two never double-fire. Flat, one field -- same shape as wan/easytier.
+  notifications: {
+    os: boolean;
+  };
   fleetRepoPath: string;
   // Loopback MCP port. Top-level rather than nested: the MCP surface is how an agent reaches the
   // fleet, which is the product's whole point, and it is not part of the admin lane. It previously
