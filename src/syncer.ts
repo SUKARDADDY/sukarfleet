@@ -5,8 +5,13 @@
 import { join, dirname } from 'node:path';
 import { stat } from 'node:fs/promises';
 import type { FleetConfig, RepoConfig, PresenceRepoStat, MachineKey } from './types';
-import { run, runBytes, log, atomicWrite, nowMs, sleep as utilSleep } from './util';
+import { run, runBytes, log, atomicWrite, nowMs, sleep as utilSleep, TransitionGate } from './util';
 import { buildAuthHeader } from './keys';
+
+// util.run reports its own timeout kill as exit 124, which a command may also exit with
+// legitimately; elapsed time is what actually disambiguates them. Mirrors sshadmin.ts's identical
+// constant and comment -- the two files independently need the same slack for the same reason.
+const TIMEOUT_SLACK_MS = 250;
 
 export interface SyncerDeps {
   isClockVetted: () => boolean;
@@ -33,6 +38,11 @@ export interface SyncerOptions {
   fetchTimeoutMs?: number;
   postMergeTimeoutMs?: number;
   now?: () => number;
+  // Test seam for the git subprocess (mirrors sshadmin.ts's deps.runner convention). Defaults to
+  // util.run. Only the `git()` helper below is routed through it -- postMerge argv and the raw
+  // gitShowBytes path are untouched, since the timeout-vs-real-error classification this seam
+  // exists for only applies to fetchAll/pushOrigin.
+  gitRunner?: typeof run;
 }
 
 // C-locale/codepoint order (never locale-dependent). Feeds deterministic tie-breaks.
@@ -58,6 +68,15 @@ export class Syncer {
   private readonly fetchTimeoutMs: number;
   private readonly postMergeTimeoutMs: number;
   private readonly now: () => number;
+  private readonly gitRunner: typeof run;
+  // Keyed `fetch:<repo>:<remote>`. Only a TIMED-OUT fleet-<peer> fetch is fed through this gate;
+  // origin fetches and every real (non-timeout) git error stay warn unconditionally, every cycle.
+  private readonly fetchGate = new TransitionGate();
+  // Keyed `push:<repo>`. Only the FINAL retry attempt of a push is a candidate to warn at all;
+  // among final attempts, only a timeout classification is gated (a persistently-down GitHub
+  // warns once on transition, not every sync cycle) -- a real error on the final attempt still
+  // warns unconditionally.
+  private readonly pushGate = new TransitionGate();
 
   constructor(cfg: FleetConfig, deps: SyncerDeps, opts: SyncerOptions = {}) {
     this.cfg = cfg;
@@ -69,6 +88,7 @@ export class Syncer {
     this.fetchTimeoutMs = opts.fetchTimeoutMs ?? 60000;
     this.postMergeTimeoutMs = opts.postMergeTimeoutMs ?? 120000;
     this.now = opts.now ?? nowMs;
+    this.gitRunner = opts.gitRunner ?? run;
   }
 
   // One-time cutover helper: branch sync/<machine> at HEAD and check it out.
@@ -212,15 +232,25 @@ export class Syncer {
       // Fleet remotes live on the LAN/mesh: they connect in milliseconds or
       // they are down. A dead peer must cost ~10s, not a full origin-grade
       // timeout per repo per cycle (three repos made first cycles run minutes).
-      const timeoutMs = remote.startsWith('fleet-') ? Math.min(this.fetchTimeoutMs, 10000) : this.fetchTimeoutMs;
+      const isFleet = remote.startsWith('fleet-');
+      const timeoutMs = isFleet ? Math.min(this.fetchTimeoutMs, 10000) : this.fetchTimeoutMs;
+      const startedMs = this.now();
       const r = await this.git(repo.path, args, timeoutMs);
+      const durationMs = this.now() - startedMs;
       if (r.code !== 0) {
-        log('warn', 'fetch failed; continuing', {
-          repo: repo.name,
-          remote,
-          code: r.code,
-          stderr: r.stderr.trim().slice(0, 300),
-        });
+        const timedOut = r.code === 124 && durationMs >= timeoutMs - TIMEOUT_SLACK_MS;
+        const detail = { repo: repo.name, remote, code: r.code, stderr: r.stderr.trim().slice(0, 300) };
+        if (isFleet && timedOut) {
+          // A dead peer times out every cycle by construction; log loud only on the flip.
+          // Origin fetch failures and every real (non-timeout) git error skip the gate and
+          // always warn -- those are the ones an operator needs to see every time.
+          const transition = this.fetchGate.observe(`fetch:${repo.name}:${remote}`, true);
+          log(transition === 'entered' ? 'info' : 'debug', 'fetch timed out; continuing', detail);
+        } else {
+          log('warn', 'fetch failed; continuing', detail);
+        }
+      } else if (isFleet) {
+        this.fetchGate.observe(`fetch:${repo.name}:${remote}`, false);
       }
     }
   }
@@ -378,17 +408,32 @@ export class Syncer {
     const attempts = this.pushBackoffMs.length + 1;
     for (let i = 0; i < attempts; i++) {
       if (i > 0) await this.sleep(this.pushBackoffMs[i - 1]!);
+      const startedMs = this.now();
       const r = await this.git(repo.path, ['push', 'origin', branch]);
+      const durationMs = this.now() - startedMs;
       if (r.code === 0) {
+        this.pushGate.observe(`push:${repo.name}`, false);
         this.deps.onGithubPush(repo.name, this.now());
         return;
       }
-      log('warn', 'push to origin failed', {
-        repo: repo.name,
-        attempt: i + 1,
-        code: r.code,
-        stderr: r.stderr.trim().slice(0, 300),
-      });
+      const isFinal = i === attempts - 1;
+      const detail = { repo: repo.name, attempt: i + 1, code: r.code, stderr: r.stderr.trim().slice(0, 300) };
+      if (!isFinal) {
+        // Backoff attempts 1..N-1 retry in seconds; only the exhausted final attempt is worth an
+        // operator's attention.
+        log('debug', 'push to origin failed; retrying', detail);
+        continue;
+      }
+      const timedOut = r.code === 124 && durationMs >= this.gitTimeoutMs - TIMEOUT_SLACK_MS;
+      if (timedOut) {
+        // A persistently unreachable GitHub times out on the final attempt every sync cycle;
+        // log loud only on the flip. A real error on the final attempt (auth, non-fast-forward,
+        // etc.) always warns -- that is never a "wait it out" condition.
+        const transition = this.pushGate.observe(`push:${repo.name}`, true);
+        log(transition === 'entered' ? 'warn' : 'debug', 'push to origin failed', detail);
+      } else {
+        log('warn', 'push to origin failed', detail);
+      }
     }
     this.deps.onGithubPush(repo.name, null);
   }
@@ -422,7 +467,7 @@ export class Syncer {
   }
 
   private async git(cwd: string, args: string[], timeoutMs?: number) {
-    const r = await run(['git', ...args], { cwd, timeoutMs: timeoutMs ?? this.gitTimeoutMs });
+    const r = await this.gitRunner(['git', ...args], { cwd, timeoutMs: timeoutMs ?? this.gitTimeoutMs });
     this.deps.onStep?.();
     return r;
   }
