@@ -571,6 +571,54 @@ test('fleet-* fetch real (non-timeout) error always warns, never debounced', asy
   expect(lines.filter((l) => l.msg === 'fetch timed out; continuing')).toHaveLength(0);
 });
 
+// Class E: gate hygiene. A real (non-timeout) error must clear the timeout gate, not just warn
+// unconditionally itself -- otherwise a LATER, genuinely fresh timeout outage silently opens at
+// 'still-bad'/debug because the gate is still latched from an earlier, unrelated timeout streak.
+test('fleet fetch: timeout -> real error -> timeout sequence re-enters at info, not debug', async () => {
+  const dir = join(base, 'fetch-mixed-sequence');
+  await initRepo(dir, 'alpha');
+
+  const clock = makeClock();
+  const cfg = makeConfig('alpha', [peer('beta')], dir);
+  const fleetFetchTimeoutMs = 10000; // fleet-* path is min(fetchTimeoutMs, 10000)
+  const sequence: RunResult[] = [
+    { code: 124, stdout: '', stderr: '' }, // tick 1: timeout -> entered/info
+    { code: 128, stdout: '', stderr: 'fatal: could not read from remote repository' }, // tick 2: real error -> warn, clears gate
+    { code: 124, stdout: '', stderr: '' }, // tick 3: a FRESH timeout outage
+  ];
+  let call = 0;
+  const gitRunner = (async (argv: string[], opts: RunOptions = {}): Promise<RunResult> => {
+    if (argv.includes('fetch') && argv.includes('fleet-beta')) {
+      const result = sequence[call]!;
+      call += 1;
+      if (result.code === 124) clock.advance(fleetFetchTimeoutMs);
+      return result;
+    }
+    return run(argv, opts);
+  }) as typeof run;
+  const rec = recorder();
+  const s = new Syncer(cfg, rec.deps, { ...FAST, now: clock.now, gitRunner });
+  await s.adoptRepo(dir, 'alpha');
+  await git(dir, ['remote', 'add', 'fleet-beta', 'http://127.0.0.1:1/git/r']);
+
+  const { lines, restore } = captureLogs();
+  try {
+    await s.syncOnce({ name: 'r', path: dir });
+    await s.syncOnce({ name: 'r', path: dir });
+    await s.syncOnce({ name: 'r', path: dir });
+  } finally {
+    restore();
+  }
+
+  const timedOut = lines.filter((l) => l.msg === 'fetch timed out; continuing');
+  expect(timedOut).toHaveLength(2);
+  expect(timedOut[0]!.level).toBe('info'); // tick 1: entered
+  expect(timedOut[1]!.level).toBe('info'); // tick 3: re-entered, NOT debounced to debug
+  const realError = lines.filter((l) => l.msg === 'fetch failed; continuing');
+  expect(realError).toHaveLength(1);
+  expect(realError[0]!.level).toBe('warn');
+});
+
 test('origin fetch failure always warns, even when it is timeout-shaped', async () => {
   const dir = join(base, 'fetch-origin-timeout');
   await initRepo(dir, 'alpha');
@@ -664,4 +712,116 @@ test('pushOrigin: final-attempt timeout warns once on entry, debounces to debug 
   expect(secondFinal).toHaveLength(1);
   expect(secondFinal[0]!.level).toBe('debug');
   expect(rec.pushes).toEqual([null, null]);
+});
+
+// Class E: gate hygiene, push side. A real (non-timeout) error on the final attempt already warns
+// unconditionally every cycle (untouched by the gate) -- this pins that across TWO full syncOnce
+// cycles it keeps warning both times, never debouncing the way a genuine timeout would.
+test('pushOrigin: real error on the final attempt warns on every cycle, not just the first', async () => {
+  const dir = join(base, 'push-real-error-repeat');
+  await initRepo(dir, 'alpha');
+
+  const clock = makeClock();
+  const cfg = makeConfig('alpha', [], dir);
+  const gitRunner = interceptingRunner(clock, [
+    {
+      match: (argv) => argv.includes('push'),
+      result: { code: 128, stdout: '', stderr: 'fatal: authentication failed' },
+    },
+  ]);
+  const rec = recorder();
+  const s = new Syncer(cfg, rec.deps, { ...FAST, now: clock.now, gitRunner });
+  await s.adoptRepo(dir, 'alpha');
+  await git(dir, ['remote', 'add', 'origin', 'file:///nonexistent/nope.git']);
+
+  const first = captureLogs();
+  try {
+    await s.syncOnce({ name: 'r', path: dir });
+  } finally {
+    first.restore();
+  }
+  const firstFinal = first.lines.filter((l) => l.msg === 'push to origin failed');
+  expect(firstFinal).toHaveLength(1);
+  expect(firstFinal[0]!.level).toBe('warn');
+
+  const second = captureLogs();
+  try {
+    await s.syncOnce({ name: 'r', path: dir });
+  } finally {
+    second.restore();
+  }
+  const secondFinal = second.lines.filter((l) => l.msg === 'push to origin failed');
+  expect(secondFinal).toHaveLength(1);
+  expect(secondFinal[0]!.level).toBe('warn'); // real error: warns every cycle, never debounced
+  expect(rec.pushes).toEqual([null, null]);
+});
+
+// Class E: TIMEOUT_SLACK_MS boundary. Two syncOnce cycles disambiguate the classification the same
+// way the existing 'final-attempt timeout' test does: a timeout-classified outcome warns once then
+// debounces to debug; a real-error-classified outcome warns on every cycle.
+test('pushOrigin TIMEOUT_SLACK boundary: elapsed = timeoutMs-249 still classifies as a timeout', async () => {
+  const dir = join(base, 'push-timeout-slack-in');
+  await initRepo(dir, 'alpha');
+
+  const clock = makeClock();
+  const cfg = makeConfig('alpha', [], dir);
+  const gitTimeoutMs = 60000; // Syncer's default gitTimeoutMs -- pushOrigin classifies against it
+  const gitRunner = interceptingRunner(clock, [
+    { match: (argv) => argv.includes('push'), result: { code: 124, stdout: '', stderr: '' }, advanceMs: gitTimeoutMs - 249 },
+  ]);
+  const rec = recorder();
+  const s = new Syncer(cfg, rec.deps, { ...FAST, now: clock.now, gitRunner });
+  await s.adoptRepo(dir, 'alpha');
+  await git(dir, ['remote', 'add', 'origin', 'file:///nonexistent/nope.git']);
+
+  const first = captureLogs();
+  try {
+    await s.syncOnce({ name: 'r', path: dir });
+  } finally {
+    first.restore();
+  }
+  expect(first.lines.filter((l) => l.msg === 'push to origin failed')[0]!.level).toBe('warn'); // entered
+
+  const second = captureLogs();
+  try {
+    await s.syncOnce({ name: 'r', path: dir });
+  } finally {
+    second.restore();
+  }
+  // Debounces on the second cycle -- proof it was classified as a timeout, not a real error.
+  expect(second.lines.filter((l) => l.msg === 'push to origin failed')[0]!.level).toBe('debug');
+});
+
+test('pushOrigin TIMEOUT_SLACK boundary: elapsed = timeoutMs-251 classifies as a real error, warns every cycle', async () => {
+  const dir = join(base, 'push-timeout-slack-out');
+  await initRepo(dir, 'alpha');
+
+  const clock = makeClock();
+  const cfg = makeConfig('alpha', [], dir);
+  const gitTimeoutMs = 60000;
+  const gitRunner = interceptingRunner(clock, [
+    { match: (argv) => argv.includes('push'), result: { code: 124, stdout: '', stderr: '' }, advanceMs: gitTimeoutMs - 251 },
+  ]);
+  const rec = recorder();
+  const s = new Syncer(cfg, rec.deps, { ...FAST, now: clock.now, gitRunner });
+  await s.adoptRepo(dir, 'alpha');
+  await git(dir, ['remote', 'add', 'origin', 'file:///nonexistent/nope.git']);
+
+  const first = captureLogs();
+  try {
+    await s.syncOnce({ name: 'r', path: dir });
+  } finally {
+    first.restore();
+  }
+  expect(first.lines.filter((l) => l.msg === 'push to origin failed')[0]!.level).toBe('warn');
+
+  const second = captureLogs();
+  try {
+    await s.syncOnce({ name: 'r', path: dir });
+  } finally {
+    second.restore();
+  }
+  // Still warns on the second cycle -- proof it was classified as a real error (code 124 but not
+  // "close enough" to gitTimeoutMs), never debounced through the timeout gate at all.
+  expect(second.lines.filter((l) => l.msg === 'push to origin failed')[0]!.level).toBe('warn');
 });
