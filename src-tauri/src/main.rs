@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod api;
 mod client;
 mod config;
 mod health;
@@ -49,7 +50,7 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        .invoke_handler(tauri::generate_handler![snapshot])
+        .invoke_handler(tauri::generate_handler![snapshot, api::api_call])
         .manage(shared.clone())
         .setup(move |app| {
             tray::init(app.handle())?;
@@ -128,7 +129,7 @@ async fn poll_loop(app: AppHandle, shared: Arc<Shared>) {
         notifier.tick(&app, &faults, out.suppress_notifications);
 
         let popover_open = app
-            .get_webview_window(window::POPOVER)
+            .get_webview_window(window::CONSOLE)
             .map(|w| w.is_visible().unwrap_or(false))
             .unwrap_or(false);
         let delay = if down_streak > 0 {

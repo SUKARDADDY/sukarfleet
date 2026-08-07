@@ -13,7 +13,6 @@ use tauri::{
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
-use tauri_plugin_opener::OpenerExt;
 
 pub const TRAY_ID: &str = "main";
 
@@ -123,8 +122,7 @@ fn build_menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<Wry>> {
     }
 
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&MenuItem::with_id(app, "open-window", "Open fleet window", true, None::<&str>)?)?;
-    menu.append(&MenuItem::with_id(app, "open-console", "Open web console", true, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(app, "open-window", "Open fleet console", true, None::<&str>)?)?;
     menu.append(&MenuItem::with_id(app, "copy-status", "Copy status", true, None::<&str>)?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
@@ -146,7 +144,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         "quit" => app.exit(0),
         "refresh" => shared.refresh.notify_one(),
-        "open-window" => crate::window::show_popover(app),
+        "open-window" => crate::window::show_console(app),
         "autostart" => {
             let launcher = app.autolaunch();
             let enabled = launcher.is_enabled().unwrap_or(false);
@@ -154,10 +152,6 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             if let Err(e) = res {
                 eprintln!("sukarfleet-tray: autostart toggle failed: {e}");
             }
-        }
-        "open-console" => {
-            let url = format!("{}/ui", shared.endpoint);
-            let _ = app.opener().open_url(url, None::<&str>);
         }
         "copy-status" => {
             let text = shared.summary.lock().map(|s| s.clone()).unwrap_or_default();
