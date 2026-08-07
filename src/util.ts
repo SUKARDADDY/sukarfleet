@@ -291,6 +291,18 @@ export function nowMs(): number {
   return Date.now();
 }
 
+// Suspend/resume detector's core math, shared by transport.ts's ClockSentinel and node.ts's
+// watchdogLoop (P4): the absolute divergence between monotonic-elapsed and wall-elapsed time since
+// a baseline. Ordinary elapsed time keeps the two in lockstep; a sleep, hibernate or manual clock
+// change does not, and shows up here as a large gap. Pure and baseline-injected so each caller can
+// keep its own baseline and its own idea of "too much drift" (transport.ts's SUSPEND_JUMP_MS)
+// without sharing state or a clock.
+export function clockDriftMs(baselineMonoNs: number, baselineWallMs: number, nowMonoNs: number, nowWallMs: number): number {
+  const monoElapsedMs = (nowMonoNs - baselineMonoNs) / 1e6;
+  const wallElapsedMs = nowWallMs - baselineWallMs;
+  return Math.abs(wallElapsedMs - monoElapsedMs);
+}
+
 export function b64encode(data: Uint8Array): string {
   return Buffer.from(data).toString('base64');
 }

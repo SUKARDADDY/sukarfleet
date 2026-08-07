@@ -17,13 +17,13 @@ import type {
   UiState,
 } from './types';
 import { expandHome, loadConfig, patchConfig, persistLegacyMigration, stateDir } from './config';
-import { atomicWrite, log, nowMs, run, sdNotify, readJsonFile } from './util';
+import { atomicWrite, clockDriftMs, log, nowMs, run, sdNotify, readJsonFile } from './util';
 
 import { buildAuthHeader, loadOrCreateMachineKey, writeSecretFile } from './keys';
 import { Gossip } from './gossip';
 import { Syncer } from './syncer';
 import { Health, type HealthSelf } from './health';
-import { Transport, ClockSentinel } from './transport';
+import { Transport, ClockSentinel, SUSPEND_JUMP_MS } from './transport';
 import * as endpoints from './endpoints';
 import * as derive from './derive';
 import * as gitserve from './gitserve';
@@ -205,6 +205,18 @@ export function nextAnchorDownStreak(prevStreak: number, anchorReachableNow: boo
   return anchorReachableNow === false ? prevStreak + 1 : 0;
 }
 
+// P4 watchdog suspend-awareness. Fresh marks always ping. Stale marks still ping while nowMs is
+// inside the one-shot post-resume grace window (graceUntilMs) -- granted once by watchdogLoop when
+// its own tick-to-tick clockDriftMs exceeds SUSPEND_JUMP_MS, and never renewed by a later stale
+// tick, so a real wedge that happens to span a suspend still withholds once the grace expires.
+// graceUntilMs of 0 (the pre-jump default) never satisfies nowMs < graceUntilMs, so a daemon that
+// never suspends behaves exactly as before P4. Exported so tests/node-exec.test.ts can pin every
+// boundary without a live loop.
+export function watchdogShouldPing(gossipFresh: boolean, syncFresh: boolean, nowMsVal: number, graceUntilMs: number): boolean {
+  if (gossipFresh && syncFresh) return true;
+  return nowMsVal < graceUntilMs;
+}
+
 function isLoopback(server: MinimalServer, req: Request): boolean {
   const ip = server.requestIP(req);
   if (!ip) return false; // unix socket / unknown: fail closed
@@ -275,6 +287,13 @@ async function main(): Promise<void> {
   // P3 single-pusher takeover debounce (nextAnchorDownStreak); consulted for the roamer role only,
   // stays 0 and unused on the anchor.
   let anchorDownStreak = 0;
+  // P4 watchdog suspend-awareness. watchdogLoop keeps its OWN mono/wall baseline -- deliberately
+  // separate from clockSentinel's, which only resets on a detected jump -- so it always measures
+  // drift since the immediately preceding tick, not since the last resume. graceUntilMs is 0 until
+  // a jump is first detected, so a daemon that never suspends never enters the grace branch below.
+  let watchdogPrevMonoNs = Bun.nanoseconds();
+  let watchdogPrevWallMs = nowMs();
+  let watchdogGraceUntilMs = 0;
 
   // Builds (and, if changed, publishes) this machine's signed endpoint file. Used both
   // at startup and as ClockSentinel's post-resume republish step.
@@ -1286,11 +1305,40 @@ async function main(): Promise<void> {
   const watchdogIntervalMs = Math.max(1000, (cfg.intervals.watchdogSec / 3) * 1000);
   const watchdogLoop = scheduleLoop('watchdog', watchdogIntervalMs, async () => {
     const now = nowMs();
-    const gossipFresh = isLoopFresh(now, gossipLoopOkMs, cfg.intervals.watchdogSec * 1000);
     const syncFreshWindowMs = Math.max(cfg.intervals.watchdogSec, cfg.intervals.syncSec * 2.5) * 1000;
+
+    // Suspend/resume detection local to this loop (separate from clockSentinel's -- see the
+    // baseline declarations above): a drift since the PREVIOUS tick beyond SUSPEND_JUMP_MS means
+    // something happened between ticks that wall-clock loop-freshness marks cannot tell apart from
+    // a wedge. Baseline always advances, jump or not, so this always measures since-last-tick.
+    const nowMonoNs = Bun.nanoseconds();
+    const drift = clockDriftMs(watchdogPrevMonoNs, watchdogPrevWallMs, nowMonoNs, now);
+    watchdogPrevMonoNs = nowMonoNs;
+    watchdogPrevWallMs = now;
+    if (drift > SUSPEND_JUMP_MS) {
+      // One-shot: overwritten only when a fresh jump is detected, never extended by a later tick
+      // that is merely still stale -- a real wedge spanning a suspend still withholds once this
+      // expires.
+      watchdogGraceUntilMs = now + syncFreshWindowMs;
+      log('info', 'watchdog: clock jump detected mid-tick, granting post-resume grace', {
+        driftMs: drift,
+        graceUntilMs: watchdogGraceUntilMs,
+      });
+    }
+
+    const gossipFresh = isLoopFresh(now, gossipLoopOkMs, cfg.intervals.watchdogSec * 1000);
     const syncFresh = isLoopFresh(now, syncLoopOkMs, syncFreshWindowMs);
-    if (gossipFresh && syncFresh) {
+    const fresh = gossipFresh && syncFresh;
+
+    if (watchdogShouldPing(gossipFresh, syncFresh, now, watchdogGraceUntilMs)) {
       sdNotify('WATCHDOG=1');
+      if (!fresh) {
+        log('info', 'watchdog: pinging despite stale marks (post-resume grace)', {
+          gossipFresh,
+          syncFresh,
+          graceUntilMs: watchdogGraceUntilMs,
+        });
+      }
     } else {
       log('warn', 'watchdog ping withheld -- a loop is stale or wedged', {
         gossipFresh,
