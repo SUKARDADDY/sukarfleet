@@ -3,7 +3,7 @@
 
 import { join } from 'node:path';
 import type { FleetConfig, GossipEnvelope, MachineKey, PeerConfig, PeerView, PresencePayload } from './types';
-import { atomicWrite, b64decode, b64encode, canonicalJson, log, nowMs, readJsonFile } from './util';
+import { atomicWrite, b64decode, b64encode, canonicalJson, log, nowMs, readJsonFile, TransitionGate } from './util';
 import { stateDir } from './config';
 
 type UnsignedEnvelope = Omit<GossipEnvelope, 'sigB64'>;
@@ -72,6 +72,10 @@ export class Gossip {
   private seqLoaded = false;
   private seqValue = 0;
   private lastPersistMs = 0;
+  // Keyed by peer name. broadcastOnce logs loud (info) only on the entered/recovered transitions;
+  // a peer stuck down repeats at debug instead of a warn every gossip tick. The durable signal for
+  // an operator stays the peer-offline health fault -- this only quiets the journal.
+  private readonly broadcastGate = new TransitionGate();
 
   constructor(
     private readonly cfg: FleetConfig,
@@ -132,15 +136,32 @@ export class Gossip {
             signal: controller.signal,
           });
           if (!res.ok) {
-            log('warn', 'gossip: broadcast rejected by peer', { peer: peer.name, status: res.status });
+            this.logBroadcastTransition(peer.name, true, { peer: peer.name, status: res.status });
+          } else {
+            this.logBroadcastTransition(peer.name, false, { peer: peer.name });
           }
         } catch (err) {
-          log('warn', 'gossip: broadcast to peer failed', { peer: peer.name, error: String(err) });
+          this.logBroadcastTransition(peer.name, true, { peer: peer.name, error: String(err) });
         } finally {
           clearTimeout(timer);
         }
       }),
     );
+  }
+
+  // Transition-only logging for one peer's broadcast outcome this tick. isBad=true covers both a
+  // non-OK response and a thrown/aborted fetch -- broadcastOnce feeds both through the same gate
+  // key, since either one means "this peer did not get the envelope". Only the flip logs loud:
+  // the first failure is worth an operator's attention (info), a peer still down an hour later is
+  // not (debug); the first success after failures gets its own "recovered" line, a peer that was
+  // already fine stays silent.
+  private logBroadcastTransition(peerName: string, isBad: boolean, extra: Record<string, unknown>): void {
+    const transition = this.broadcastGate.observe(peerName, isBad);
+    if (isBad) {
+      log(transition === 'entered' ? 'info' : 'debug', 'gossip: peer went offline', extra);
+    } else if (transition === 'recovered') {
+      log('info', 'gossip: peer recovered', extra);
+    }
   }
 
   async receive(envelope: GossipEnvelope, peers: PeerConfig[]): Promise<boolean> {
