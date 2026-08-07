@@ -14,6 +14,7 @@ import type {
   PresencePayload,
   PresenceRepoStat,
   PeerView,
+  UiAdminLaneView,
   UiState,
 } from './types';
 import { expandHome, loadConfig, patchConfig, persistLegacyMigration, stateDir } from './config';
@@ -288,6 +289,45 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { 'content-type': 'application/json' },
   });
+}
+
+// Class G: pulled out of buildUiState's admin object literal so the additive uiAssets field (and
+// the rest of the admin lane view) is directly testable without spinning up the daemon --
+// buildUiState itself is a closure inside main() and cannot be exercised any other way. Pure
+// projection: every input is already resolved by the caller (adminLaneConfigured(), secrets.status,
+// sshAdmin.trust()), so this does no I/O of its own.
+export interface BuildAdminLaneViewArgs {
+  cfg: FleetConfig;
+  configured: boolean;
+  credential: {
+    present: boolean;
+    stale: boolean;
+    sealed: 'tpm2' | 'user' | 'plaintext' | null;
+    setAtMs: number | null;
+  };
+  sshKeyFingerprint: string | null;
+}
+
+export function buildAdminLaneView(args: BuildAdminLaneViewArgs): UiAdminLaneView {
+  const { cfg, configured, credential, sshKeyFingerprint } = args;
+  return {
+    enabled: cfg.admin.enabled,
+    acceptIncoming: cfg.admin.acceptIncoming,
+    uiEnabled: cfg.admin.uiEnabled,
+    configured,
+    credentialPresent: credential.present,
+    credentialStale: credential.stale,
+    credentialSealed: credential.sealed,
+    credentialSetAtMs: credential.setAtMs,
+    sshUser: cfg.admin.sshUser,
+    sshKeyFingerprint,
+    runTimeoutSec: cfg.admin.runTimeoutSec,
+    maxRunTimeoutSec: cfg.admin.maxRunTimeoutSec,
+    ratePerMin: cfg.admin.ratePerMin,
+    // config.ts's mergeDefaults always fills this (default true), so the ?? is defensive only --
+    // a raw FleetConfig built by hand (e.g. in a test) without it still gets the pre-P6 meaning.
+    uiAssets: cfg.admin.uiAssets ?? true,
+  };
 }
 
 // --- Shape guards for the loopback-only CLI-facing exec routes (see fetchHandler below) --------
@@ -887,21 +927,12 @@ async function main(): Promise<void> {
         urgency: f.urgency,
         firstSeenMs: f.firstSeenMs,
       })),
-      admin: {
-        enabled: cfg.admin.enabled,
-        acceptIncoming: cfg.admin.acceptIncoming,
-        uiEnabled: cfg.admin.uiEnabled,
+      admin: buildAdminLaneView({
+        cfg,
         configured: await adminLaneConfigured(),
-        credentialPresent: credential.present,
-        credentialStale: credential.stale,
-        credentialSealed: credential.sealed,
-        credentialSetAtMs: credential.setAtMs,
-        sshUser: cfg.admin.sshUser,
+        credential,
         sshKeyFingerprint: trust?.sshKeyFingerprint || null,
-        runTimeoutSec: cfg.admin.runTimeoutSec,
-        maxRunTimeoutSec: cfg.admin.maxRunTimeoutSec,
-        ratePerMin: cfg.admin.ratePerMin,
-      },
+      }),
       setup: {
         complete: identityReady && meshSecret === 'installed' && credentialReady && paired,
         identity: identityReady,

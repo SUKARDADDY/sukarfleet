@@ -391,6 +391,10 @@ export interface UiAdminLaneView {
   runTimeoutSec: number;
   maxRunTimeoutSec: number;
   ratePerMin: number;
+  // Class G: additive so a console can tell which mode it's in. Mirrors AdminConfig.uiAssets --
+  // meaningful only while `enabled`/uiEnabled make the lane worth asking about at all, true by
+  // default (config.ts's mergeDefaults fills it, so this is never actually undefined at runtime).
+  uiAssets: boolean;
 }
 
 export type MeshSecretState = 'none' | 'pending' | 'installed';

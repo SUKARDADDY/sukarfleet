@@ -5,6 +5,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   anchorDaemonOnlineFromGossip,
+  buildAdminLaneView,
   nextAnchorDownStreak,
   nextWatchdogGrace,
   shouldPushThisTick,
@@ -13,6 +14,7 @@ import {
 } from '../src/node';
 import { clockDriftMs } from '../src/util';
 import { SUSPEND_JUMP_MS } from '../src/transport';
+import { defaultConfig } from '../src/config';
 
 describe('shouldPushThisTick (P3 single-pusher policy, Class A: gossip-keyed takeover)', () => {
   test('anchor always pushes, regardless of anchorDaemonOnline or streak', () => {
@@ -234,5 +236,61 @@ describe('nextWatchdogGrace (P4 watchdog, Class B: pure grace-window arithmetic)
   test('boundary: nowMs === prevGraceUntilMs counts as expired (window closes AT its own boundary)', () => {
     const prevGrace = 1000;
     expect(nextWatchdogGrace(prevGrace, SUSPEND_JUMP_MS + 1, prevGrace, WINDOW_MS)).toBe(prevGrace + WINDOW_MS);
+  });
+});
+
+describe('buildAdminLaneView (Class G: uiAssets exposed on UiState)', () => {
+  function credential(overrides: Partial<Parameters<typeof buildAdminLaneView>[0]['credential']> = {}) {
+    return { present: false, stale: false, sealed: null, setAtMs: null, ...overrides };
+  }
+
+  test('reflects cfg.admin.uiAssets when explicitly true', () => {
+    const cfg = defaultConfig('alpha');
+    cfg.admin.uiAssets = true;
+    const view = buildAdminLaneView({ cfg, configured: true, credential: credential(), sshKeyFingerprint: null });
+    expect(view.uiAssets).toBe(true);
+  });
+
+  test('reflects cfg.admin.uiAssets when explicitly false', () => {
+    const cfg = defaultConfig('alpha');
+    cfg.admin.uiAssets = false;
+    const view = buildAdminLaneView({ cfg, configured: true, credential: credential(), sshKeyFingerprint: null });
+    expect(view.uiAssets).toBe(false);
+  });
+
+  test('defaults to true when uiAssets is absent from cfg.admin (pre-P6 config shape)', () => {
+    const cfg = defaultConfig('alpha');
+    delete (cfg.admin as { uiAssets?: boolean }).uiAssets;
+    const view = buildAdminLaneView({ cfg, configured: true, credential: credential(), sshKeyFingerprint: null });
+    expect(view.uiAssets).toBe(true);
+  });
+
+  test('passes through the rest of the admin lane view unchanged', () => {
+    const cfg = defaultConfig('alpha');
+    cfg.admin.enabled = true;
+    cfg.admin.acceptIncoming = false;
+    cfg.admin.sshUser = 'ariel';
+    const view = buildAdminLaneView({
+      cfg,
+      configured: false,
+      credential: credential({ present: true, stale: true, sealed: 'tpm2', setAtMs: 12345 }),
+      sshKeyFingerprint: 'SHA256:abc',
+    });
+    expect(view).toEqual({
+      enabled: true,
+      acceptIncoming: false,
+      uiEnabled: cfg.admin.uiEnabled,
+      configured: false,
+      credentialPresent: true,
+      credentialStale: true,
+      credentialSealed: 'tpm2',
+      credentialSetAtMs: 12345,
+      sshUser: 'ariel',
+      sshKeyFingerprint: 'SHA256:abc',
+      runTimeoutSec: cfg.admin.runTimeoutSec,
+      maxRunTimeoutSec: cfg.admin.maxRunTimeoutSec,
+      ratePerMin: cfg.admin.ratePerMin,
+      uiAssets: true,
+    });
   });
 });
