@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Popover window capabilities (read-only surface)",
-  "windows": ["popover"],
+  "windows": ["console"],
   "permissions": [
     "core:default",
     "core:event:default",
