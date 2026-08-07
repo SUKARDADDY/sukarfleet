@@ -247,6 +247,12 @@ export class Syncer {
           const transition = this.fetchGate.observe(`fetch:${repo.name}:${remote}`, true);
           log(transition === 'entered' ? 'info' : 'debug', 'fetch timed out; continuing', detail);
         } else {
+          // Gate hygiene (Class E): a real (non-timeout) error always warns unconditionally, but
+          // for a fleet remote it must ALSO clear the timeout gate -- otherwise a LATER, genuinely
+          // fresh timeout outage silently opens at 'still-bad'/debug instead of 'entered'/info,
+          // because the gate was left latched from an earlier, unrelated timeout streak that this
+          // real error actually resolved.
+          if (isFleet) this.fetchGate.observe(`fetch:${repo.name}:${remote}`, false);
           log('warn', 'fetch failed; continuing', detail);
         }
       } else if (isFleet) {
@@ -432,6 +438,11 @@ export class Syncer {
         const transition = this.pushGate.observe(`push:${repo.name}`, true);
         log(transition === 'entered' ? 'warn' : 'debug', 'push to origin failed', detail);
       } else {
+        // Gate hygiene (Class E): warns unconditionally either way, but must ALSO clear the
+        // timeout gate here -- otherwise a LATER, genuinely fresh timeout streak silently opens at
+        // 'still-bad'/debug instead of 'entered'/warn, because the gate was left latched from an
+        // earlier, unrelated timeout streak that this real error actually resolved.
+        this.pushGate.observe(`push:${repo.name}`, false);
         log('warn', 'push to origin failed', detail);
       }
     }
