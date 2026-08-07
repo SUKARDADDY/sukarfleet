@@ -3,24 +3,79 @@
 // (the import.meta.main guard on node.ts is what makes importing it for these functions safe).
 
 import { describe, expect, test } from 'bun:test';
-import { nextAnchorDownStreak, shouldPushDerivedMain, watchdogShouldPing } from '../src/node';
+import {
+  anchorDaemonOnlineFromGossip,
+  nextAnchorDownStreak,
+  shouldPushThisTick,
+  TAKEOVER_STREAK,
+  watchdogShouldPing,
+} from '../src/node';
 import { clockDriftMs } from '../src/util';
 import { SUSPEND_JUMP_MS } from '../src/transport';
 
-describe('shouldPushDerivedMain (P3 single-pusher policy)', () => {
-  const cases: Array<{ role: 'anchor' | 'roamer'; anchorReachable: boolean | null; want: boolean }> = [
-    { role: 'anchor', anchorReachable: true, want: true },
-    { role: 'anchor', anchorReachable: false, want: true },
-    { role: 'anchor', anchorReachable: null, want: true },
-    { role: 'roamer', anchorReachable: true, want: false },
-    { role: 'roamer', anchorReachable: false, want: true },
-    { role: 'roamer', anchorReachable: null, want: false },
-  ];
-  for (const { role, anchorReachable, want } of cases) {
-    test(`role=${role} anchorReachable=${anchorReachable} -> ${want}`, () => {
-      expect(shouldPushDerivedMain(role, anchorReachable)).toBe(want);
+describe('shouldPushThisTick (P3 single-pusher policy, Class A: gossip-keyed takeover)', () => {
+  test('anchor always pushes, regardless of anchorDaemonOnline or streak', () => {
+    for (const online of [true, false, null] as const) {
+      for (const streak of [0, 1, TAKEOVER_STREAK]) {
+        expect(shouldPushThisTick('anchor', online, streak)).toBe(true);
+      }
+    }
+  });
+
+  test('roamer with no configured peers (anchorDaemonOnline=null) always pushes -- restores pre-P3 solo behavior', () => {
+    for (const streak of [0, 1, TAKEOVER_STREAK]) {
+      expect(shouldPushThisTick('roamer', null, streak)).toBe(true);
+    }
+  });
+
+  test('roamer with the anchor daemon online never pushes, regardless of streak', () => {
+    for (const streak of [0, 1, TAKEOVER_STREAK]) {
+      expect(shouldPushThisTick('roamer', true, streak)).toBe(false);
+    }
+  });
+
+  test('roamer with the anchor daemon offline pushes only once streak reaches TAKEOVER_STREAK', () => {
+    expect(shouldPushThisTick('roamer', false, 0)).toBe(false);
+    expect(shouldPushThisTick('roamer', false, 1)).toBe(false);
+    expect(shouldPushThisTick('roamer', false, TAKEOVER_STREAK - 1)).toBe(false);
+    expect(shouldPushThisTick('roamer', false, TAKEOVER_STREAK)).toBe(true);
+    expect(shouldPushThisTick('roamer', false, TAKEOVER_STREAK + 1)).toBe(true);
+  });
+
+  // Full role x online x streak table, so every combination the brief calls out is pinned in one
+  // place, not just the hand-picked cases above.
+  const cases: Array<{ role: 'anchor' | 'roamer'; online: boolean | null; streak: number; want: boolean }> = [];
+  for (const role of ['anchor', 'roamer'] as const) {
+    for (const online of [true, false, null] as const) {
+      for (const streak of [0, 1, TAKEOVER_STREAK]) {
+        let want: boolean;
+        if (role === 'anchor') want = true;
+        else if (online === null) want = true;
+        else want = online === false && streak >= TAKEOVER_STREAK;
+        cases.push({ role, online, streak, want });
+      }
+    }
+  }
+  for (const { role, online, streak, want } of cases) {
+    test(`role=${role} anchorDaemonOnline=${online} streak=${streak} -> ${want}`, () => {
+      expect(shouldPushThisTick(role, online, streak)).toBe(want);
     });
   }
+});
+
+describe('anchorDaemonOnlineFromGossip (Class A: anchor liveness from gossip, not the mesh peer table)', () => {
+  test('no configured peers -> null (nothing to distrust)', () => {
+    expect(anchorDaemonOnlineFromGossip([])).toBeNull();
+  });
+
+  test('at least one configured peer online -> true', () => {
+    expect(anchorDaemonOnlineFromGossip([{ online: false }, { online: true }])).toBe(true);
+  });
+
+  test('every configured peer offline -> false (no role marker on PeerConfig, so "all offline" is the anchor-down signal)', () => {
+    expect(anchorDaemonOnlineFromGossip([{ online: false }])).toBe(false);
+    expect(anchorDaemonOnlineFromGossip([{ online: false }, { online: false }])).toBe(false);
+  });
 });
 
 describe('nextAnchorDownStreak (P3 roamer takeover debounce)', () => {

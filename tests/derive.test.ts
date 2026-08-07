@@ -383,15 +383,27 @@ test('union path: postMerge regenerator re-runs over the unioned result', async 
 test('push:false (P3 single-pusher) updates the local ref but never touches origin', async () => {
   const dir = join(root, 'push-false');
   await buildBaseRepo(dir);
-  // Points at a path that cannot possibly exist -- proof the push leg is never even reached, not
-  // merely that it failed silently.
-  await g(dir, ['remote', 'add', 'origin', '/nonexistent/definitely-not-a-repo.git']);
+  // A REAL local bare origin, not an unreachable URL: an invalid-URL fixture cannot distinguish
+  // "push was suppressed" from "push was attempted and silently failed". Here, if the push leg
+  // ran despite push:false, this bare repo would grow a refs/heads/main; asserting it stays
+  // completely ref-less proves the leg was never reached, not merely that it errored quietly.
+  const originDir = join(root, 'push-false-origin.git');
+  await g(root, ['init', '-q', '--bare', 'push-false-origin.git']);
+  await g(dir, ['remote', 'add', 'origin', originDir]);
 
   const res = await updateMain(dir, { push: false });
   expect(res.sha).toBeTruthy();
   expect(res.pushed).toBe(false);
   expect(res.skipped).toBe('push-suppressed-non-owner');
   expect(await g(dir, ['rev-parse', 'refs/sukarfleet/derived-main'])).toBe(res.sha!);
+
+  const mainCheck = await run(['git', 'rev-parse', '--verify', '--quiet', 'refs/heads/main'], {
+    cwd: originDir,
+    env: ENV,
+  });
+  expect(mainCheck.code).not.toBe(0); // still absent -- the push leg was never even reached
+  const originRefs = (await g(originDir, ['for-each-ref', '--format=%(refname)'])).trim();
+  expect(originRefs).toBe(''); // the fresh bare repo has exactly the refs it started with: none
 });
 
 test('push:false skips a second time too, once inputs are unchanged', async () => {
