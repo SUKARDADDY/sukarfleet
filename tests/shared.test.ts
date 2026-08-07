@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { canonicalJson, atomicWrite, readJsonFile, run, nowMs, b64encode, b64decode, sleep } from '../src/util';
+import { canonicalJson, atomicWrite, readJsonFile, run, nowMs, b64encode, b64decode, sleep, TransitionGate } from '../src/util';
 import {
   loadConfig,
   defaultConfig,
@@ -162,6 +162,54 @@ describe('sleep', () => {
     const start = nowMs();
     await sleep(50);
     expect(nowMs() - start).toBeGreaterThanOrEqual(40);
+  });
+});
+
+describe('TransitionGate', () => {
+  test('an unseen key reported ok is still-ok', () => {
+    const gate = new TransitionGate();
+    expect(gate.observe('a', false)).toBe('still-ok');
+  });
+
+  test('first bad observation enters, repeats stay still-bad', () => {
+    const gate = new TransitionGate();
+    expect(gate.observe('a', true)).toBe('entered');
+    expect(gate.observe('a', true)).toBe('still-bad');
+    expect(gate.observe('a', true)).toBe('still-bad');
+  });
+
+  test('going ok after bad recovers once, then stays still-ok', () => {
+    const gate = new TransitionGate();
+    gate.observe('a', true);
+    expect(gate.observe('a', false)).toBe('recovered');
+    expect(gate.observe('a', false)).toBe('still-ok');
+  });
+
+  test('re-entering bad after a recovery reports entered again', () => {
+    const gate = new TransitionGate();
+    gate.observe('a', true);
+    gate.observe('a', false); // recovered
+    expect(gate.observe('a', true)).toBe('entered');
+  });
+
+  test('keys are independent of each other', () => {
+    const gate = new TransitionGate();
+    expect(gate.observe('a', true)).toBe('entered');
+    expect(gate.observe('b', true)).toBe('entered');
+    expect(gate.observe('a', true)).toBe('still-bad');
+    expect(gate.observe('b', false)).toBe('recovered');
+  });
+
+  test('forget() resets a key as though it were never observed', () => {
+    const gate = new TransitionGate();
+    gate.observe('a', true);
+    gate.forget('a');
+    expect(gate.observe('a', true)).toBe('entered');
+  });
+
+  test('forget() on an unknown key is a harmless no-op', () => {
+    const gate = new TransitionGate();
+    expect(() => gate.forget('nope')).not.toThrow();
   });
 });
 
