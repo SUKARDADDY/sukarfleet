@@ -6,6 +6,7 @@ mod health;
 mod model;
 mod notify;
 mod tray;
+mod window;
 
 use client::{Client, PollOutcome};
 use health::{Engine, EngineOutput, Observation, TrayState};
@@ -14,12 +15,18 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter, Manager};
 
 pub struct Shared {
     pub endpoint: String,
     pub summary: Mutex<String>,
+    pub last_model: Mutex<Option<tray::MenuModel>>,
     pub refresh: tokio::sync::Notify,
+}
+
+#[tauri::command]
+fn snapshot(state: tauri::State<'_, Arc<Shared>>) -> Option<tray::MenuModel> {
+    state.last_model.lock().ok().and_then(|m| m.clone())
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -30,13 +37,19 @@ fn main() {
     let shared = Arc::new(Shared {
         endpoint,
         summary: Mutex::new(String::new()),
+        last_model: Mutex::new(None),
         refresh: tokio::sync::Notify::new(),
     });
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .invoke_handler(tauri::generate_handler![snapshot])
         .manage(shared.clone())
         .setup(move |app| {
             tray::init(app.handle())?;
@@ -44,8 +57,17 @@ fn main() {
             tauri::async_runtime::spawn(async move { poll_loop(handle, shared).await });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running sukarfleet-tray");
+        .build(tauri::generate_context!())
+        .expect("error while building sukarfleet-tray");
+
+    app.run(|_app, event| {
+        // Tray-only app: closing the popover must not exit; only app.exit() (Quit) does.
+        if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+            if code.is_none() {
+                api.prevent_exit();
+            }
+        }
+    });
 }
 
 async fn poll_loop(app: AppHandle, shared: Arc<Shared>) {
@@ -97,12 +119,22 @@ async fn poll_loop(app: AppHandle, shared: Arc<Shared>) {
             let m2 = m.clone();
             let _ = app.run_on_main_thread(move || tray::apply(&app2, &m2));
         }
+        let _ = app.emit("state", &m);
+        if let Ok(mut lm) = shared.last_model.lock() {
+            *lm = Some(m);
+        }
 
         let faults = snap.as_ref().map(|s| s.faults()).unwrap_or_default();
         notifier.tick(&app, &faults, out.suppress_notifications);
 
+        let popover_open = app
+            .get_webview_window(window::POPOVER)
+            .map(|w| w.is_visible().unwrap_or(false))
+            .unwrap_or(false);
         let delay = if down_streak > 0 {
             Duration::from_secs(DOWN_BACKOFF_SECS[(down_streak - 1).min(DOWN_BACKOFF_SECS.len() - 1)])
+        } else if popover_open {
+            Duration::from_secs(3)
         } else {
             POLL_INTERVAL
         };

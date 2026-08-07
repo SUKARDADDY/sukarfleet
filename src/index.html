@@ -7,10 +7,17 @@
   <link rel="stylesheet" href="popover.css" />
 </head>
 <body>
-  <!-- Popover surface (M5). State arrives exclusively via Tauri events from
-       the Rust core — this page never fetches the daemon (no CORS there). -->
+  <!-- State arrives exclusively via Tauri events from the Rust core —
+       this page never fetches the daemon (no CORS there). -->
   <main id="app">
-    <p class="placeholder">sukarfleet popover — coming in M5</p>
+    <header id="header">
+      <span id="dot" class="dot unknown"></span>
+      <span id="title">sukarfleet — connecting…</span>
+    </header>
+    <section id="faults" class="panel"></section>
+    <section id="peers" class="panel"></section>
+    <section id="repos" class="panel"></section>
+    <footer id="footer">waiting for first poll…</footer>
   </main>
   <script type="module" src="popover.js"></script>
 </body>
