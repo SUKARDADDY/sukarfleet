@@ -1,0 +1,28 @@
+/* Colour tokens mirror sukarfleet ui/style.css so the two surfaces read as one product. */
+:root {
+  --ok: #1f6f43;
+  --warn: #8a5a00;
+  --bad: #a32222;
+  --fg: #1d2230;
+  --bg: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ok: #2ea36b;
+    --warn: #d79921;
+    --bad: #cc4444;
+    --fg: #e8eaf0;
+    --bg: #1d2230;
+  }
+}
+body {
+  margin: 0;
+  font: 14px/1.5 system-ui, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+.placeholder {
+  padding: 2rem;
+  text-align: center;
+  opacity: 0.6;
+}
