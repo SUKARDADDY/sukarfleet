@@ -341,7 +341,10 @@ describe('Gossip.broadcastOnce: transition-only logging', () => {
     expect(offline[1]!.level).toBe('debug');
   });
 
-  test('a non-OK response feeds the same gate as a thrown fetch', async () => {
+  // Class D: a peer that ANSWERS with non-OK is up-but-rejecting, a different failure than
+  // unreachable -- it must warn unconditionally, every tick, never debounced through the offline
+  // TransitionGate (that gate is reserved for the thrown/aborted path below).
+  test('a non-OK response warns unconditionally every tick, never debounced', async () => {
     const key = await generateMachineKey('alpha');
     const peers: PeerConfig[] = [{ name: 'beta', meshIp: '127.0.0.1', nodePort: 7710, publicKeyJwk: null }];
     const gossip = new Gossip(buildCfg('alpha', peers), key, emptyPayload);
@@ -352,6 +355,34 @@ describe('Gossip.broadcastOnce: transition-only logging', () => {
       await withFetch(rejecting, async () => {
         await gossip.broadcastOnce();
         await gossip.broadcastOnce();
+        await gossip.broadcastOnce();
+      });
+    } finally {
+      restore();
+    }
+
+    const rejected = lines.filter((l) => l.msg === 'gossip: broadcast rejected by peer');
+    expect(rejected).toHaveLength(3);
+    expect(rejected.every((l) => l.level === 'warn')).toBe(true);
+    expect(rejected.every((l) => l.status === 503)).toBe(true);
+    // Never went through the offline gate at all -- no "peer went offline"/"peer recovered" line.
+    expect(lines.filter((l) => l.msg === 'gossip: peer went offline')).toHaveLength(0);
+    expect(lines.filter((l) => l.msg === 'gossip: peer recovered')).toHaveLength(0);
+  });
+
+  test('a thrown/aborted fetch still uses the offline TransitionGate and pins the error field', async () => {
+    const key = await generateMachineKey('alpha');
+    const peers: PeerConfig[] = [{ name: 'beta', meshIp: '127.0.0.1', nodePort: 7710, publicKeyJwk: null }];
+    const gossip = new Gossip(buildCfg('alpha', peers), key, emptyPayload);
+
+    const throwing = (async () => {
+      throw new Error('ECONNREFUSED');
+    }) as unknown as typeof fetch;
+    const { lines, restore } = captureLogs();
+    try {
+      await withFetch(throwing, async () => {
+        await gossip.broadcastOnce();
+        await gossip.broadcastOnce();
       });
     } finally {
       restore();
@@ -360,8 +391,9 @@ describe('Gossip.broadcastOnce: transition-only logging', () => {
     const offline = lines.filter((l) => l.msg === 'gossip: peer went offline');
     expect(offline).toHaveLength(2);
     expect(offline[0]!.level).toBe('info');
-    expect(offline[0]!.status).toBe(503);
+    expect(offline[0]!.error).toContain('ECONNREFUSED');
     expect(offline[1]!.level).toBe('debug');
+    expect(offline[1]!.error).toContain('ECONNREFUSED');
   });
 
   test('a success after failures logs one "peer recovered" info line, then stays quiet', async () => {
