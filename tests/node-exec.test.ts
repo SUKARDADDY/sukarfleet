@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   anchorDaemonOnlineFromGossip,
   nextAnchorDownStreak,
+  nextWatchdogGrace,
   shouldPushThisTick,
   TAKEOVER_STREAK,
   watchdogShouldPing,
@@ -191,5 +192,47 @@ describe('watchdogShouldPing (P4 watchdog suspend-awareness)', () => {
   test('mixed freshness (only one loop stale) withholds outside grace, exactly like today', () => {
     expect(watchdogShouldPing(false, true, 1000, 0)).toBe(false);
     expect(watchdogShouldPing(true, false, 1000, 0)).toBe(false);
+  });
+});
+
+describe('nextWatchdogGrace (P4 watchdog, Class B: pure grace-window arithmetic)', () => {
+  const WINDOW_MS = 300_000;
+
+  test('fresh, no jump: 0 stays 0', () => {
+    expect(nextWatchdogGrace(0, 0, 1000, WINDOW_MS)).toBe(0);
+  });
+
+  test('a genuine jump with no open window grants now+windowMs', () => {
+    const now = 1000;
+    expect(nextWatchdogGrace(0, SUSPEND_JUMP_MS + 1, now, WINDOW_MS)).toBe(now + WINDOW_MS);
+  });
+
+  test('a merely-stale tick during an open window never renews it, unchanged', () => {
+    const prevGrace = 500_000;
+    // now (10_000) is well before prevGrace (500_000): the window is still open.
+    expect(nextWatchdogGrace(prevGrace, 0, 10_000, WINDOW_MS)).toBe(prevGrace);
+  });
+
+  test('a second jump DURING an already-open window is refused, not extended', () => {
+    const prevGrace = 500_000;
+    const now = 10_000; // still well inside the open window
+    expect(nextWatchdogGrace(prevGrace, SUSPEND_JUMP_MS + 1, now, WINDOW_MS)).toBe(prevGrace);
+  });
+
+  test('a jump after the previous window has expired grants a fresh one', () => {
+    const prevGrace = 5_000;
+    const now = 10_000; // past prevGrace -- the old window is closed
+    expect(nextWatchdogGrace(prevGrace, SUSPEND_JUMP_MS + 1, now, WINDOW_MS)).toBe(now + WINDOW_MS);
+  });
+
+  test('boundary: driftMs === SUSPEND_JUMP_MS exactly never grants (strictly greater-than only)', () => {
+    expect(nextWatchdogGrace(0, SUSPEND_JUMP_MS, 1000, WINDOW_MS)).toBe(0);
+    // Also true with a closed prior window, to isolate the driftMs boundary from the window check.
+    expect(nextWatchdogGrace(500, SUSPEND_JUMP_MS, 1000, WINDOW_MS)).toBe(500);
+  });
+
+  test('boundary: nowMs === prevGraceUntilMs counts as expired (window closes AT its own boundary)', () => {
+    const prevGrace = 1000;
+    expect(nextWatchdogGrace(prevGrace, SUSPEND_JUMP_MS + 1, prevGrace, WINDOW_MS)).toBe(prevGrace + WINDOW_MS);
   });
 });
