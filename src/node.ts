@@ -187,6 +187,24 @@ export function isLoopFresh(nowMsVal: number, lastOkMs: number, windowMs: number
   return nowMsVal - lastOkMs < windowMs;
 }
 
+// P3 single-pusher policy. The anchor always pushes derive's derived main to origin; a roamer only
+// takes over when it has independent evidence the anchor is down (transport.anchorReachable()
+// already debounces the underlying mesh sighting -- ANCHOR_MISS_POLLS -- and returns null on
+// startup, a safe no-takeover default). Exported so tests/node-exec.test.ts can table-test every
+// (role, anchorReachable) combination without a live Transport.
+export function shouldPushDerivedMain(role: 'anchor' | 'roamer', anchorReachable: boolean | null): boolean {
+  return role === 'anchor' || anchorReachable === false;
+}
+
+// Roamer-only debounce layered on top of shouldPushDerivedMain: the roamer only starts pushing
+// once anchorReachable() has read false for two CONSECUTIVE syncLoop ticks (one lost/racy poll
+// must not flip who pushes), and yields the instant a tick sees anything else -- true or null
+// resets the streak to zero, not just recovery. The anchor never calls this: its push decision
+// never depends on the streak. Exported so tests/node-exec.test.ts can pin the debounce boundary.
+export function nextAnchorDownStreak(prevStreak: number, anchorReachableNow: boolean | null): number {
+  return anchorReachableNow === false ? prevStreak + 1 : 0;
+}
+
 function isLoopback(server: MinimalServer, req: Request): boolean {
   const ip = server.requestIP(req);
   if (!ip) return false; // unix socket / unknown: fail closed
@@ -254,6 +272,9 @@ async function main(): Promise<void> {
   let syncLoopOkMs = nowMs();
   let lastTransportSummary: unknown = null;
   let lastTransportRestartOk: boolean | null = null;
+  // P3 single-pusher takeover debounce (nextAnchorDownStreak); consulted for the roamer role only,
+  // stays 0 and unused on the anchor.
+  let anchorDownStreak = 0;
 
   // Builds (and, if changed, publishes) this machine's signed endpoint file. Used both
   // at startup and as ClockSentinel's post-resume republish step.
@@ -1149,12 +1170,29 @@ async function main(): Promise<void> {
       }
     }
 
+    // P3 single-pusher policy: one decision per tick, reused for every repo below (the debounce
+    // counts syncLoop ticks, not per-repo calls). anchorReachable() is read once here so every
+    // repo this tick agrees, rather than each racing a fresh poll result.
+    const anchorReachableNow = transport.anchorReachable();
+    if (cfg.role === 'roamer') anchorDownStreak = nextAnchorDownStreak(anchorDownStreak, anchorReachableNow);
+    const push =
+      shouldPushDerivedMain(cfg.role, anchorReachableNow) && (cfg.role === 'anchor' || anchorDownStreak >= 2);
+
     for (const repo of cfg.repos) {
       if (!adopted.has(repo.name)) continue; // never sync on main
 
       await syncer.syncOnce(repo);
       try {
-        await derive.updateMain(repo.path);
+        const derived = await derive.updateMain(repo.path, { push });
+        // A fresh sha existed and this machine sat it out -- the durable "who pushes" signal is
+        // the absence of a force-push race, not a log line, so this stays at debug. Skipped for
+        // 'unchanged-inputs': that tick minted nothing, so there was never anything to suppress.
+        if (cfg.role === 'roamer' && derived.skipped === 'push-suppressed-non-owner') {
+          log('debug', 'derive: push suppressed this tick, anchor is the pusher', {
+            repo: repo.name,
+            sha: derived.sha,
+          });
+        }
       } catch (err) {
         log('error', 'derive.updateMain failed', { repo: repo.name, error: String(err) });
       }
