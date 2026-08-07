@@ -900,6 +900,52 @@ describe('api routes', () => {
   });
 });
 
+describe('admin.uiAssets (P6): split API vs HTML assets', () => {
+  test('missing uiAssets (undefined) behaves as enabled -- the pre-P6 shape', async () => {
+    const h = makeHarness();
+    delete (h.cfg.admin as unknown as Record<string, unknown>).uiAssets;
+    expect((await h.routes.handle(req('/ui/'), server('127.0.0.1')))!.status).toBe(200);
+    expect((await h.routes.handle(req('/api/ui/state'), server('127.0.0.1')))!.status).toBe(200);
+  });
+
+  test('uiAssets:true (explicit) behaves exactly like uiAssets absent', async () => {
+    const h = makeHarness();
+    h.cfg.admin.uiAssets = true;
+    expect((await h.routes.handle(req('/ui'), server('127.0.0.1')))!.status).toBe(200);
+    expect((await h.routes.handle(req('/api/ui/state'), server('127.0.0.1')))!.status).toBe(200);
+  });
+
+  test('uiAssets:false 404s the HTML/asset routes while the API and pairing keep working', async () => {
+    const h = makeHarness();
+    h.cfg.admin.uiAssets = false;
+    expect((await h.routes.handle(req('/ui'), server('127.0.0.1')))!.status).toBe(404);
+    expect((await h.routes.handle(req('/ui/'), server('127.0.0.1')))!.status).toBe(404);
+    expect((await h.routes.handle(req('/ui/index.html'), server('127.0.0.1')))!.status).toBe(404);
+    expect((await h.routes.handle(req('/ui/app.js'), server('127.0.0.1')))!.status).toBe(404);
+    expect((await h.routes.handle(req('/ui/style.css'), server('127.0.0.1')))!.status).toBe(404);
+
+    const api = (await h.routes.handle(req('/api/ui/state'), server('127.0.0.1')))!;
+    expect(api.status).toBe(200);
+    expect(h.calls.buildState).toBe(1);
+
+    const hello = (await h.routes.handle(
+      req('/pair/hello', { method: 'POST', body: '{}' }),
+      server('192.0.2.2'),
+    ))!;
+    expect(hello.status).toBe(200);
+    expect(h.calls.hello).toBe(1);
+  });
+
+  test('uiEnabled:false still 404s the API too, regardless of uiAssets', async () => {
+    const h = makeHarness();
+    h.cfg.admin.uiEnabled = false;
+    h.cfg.admin.uiAssets = true;
+    expect((await h.routes.handle(req('/ui/'), server('127.0.0.1')))!.status).toBe(404);
+    expect((await h.routes.handle(req('/api/ui/state'), server('127.0.0.1')))!.status).toBe(404);
+    expect(h.calls.buildState).toBe(0);
+  });
+});
+
 describe('degradation', () => {
   test('uiEnabled:false hides the whole GUI surface but not pairing', async () => {
     const h = makeHarness();

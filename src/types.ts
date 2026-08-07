@@ -203,7 +203,14 @@ export interface AdminConfig {
   // instead of growing the daemon's heap without bound.
   maxOutputBytes: number;
   ratePerMin: number;
+  // uiEnabled:false is the pre-P6 switch and keeps its pre-P6 meaning unchanged: the whole surface
+  // (/ui, /ui/*, /api/ui/*) 404s, backward compatibly. uiAssets (P6, default true) is the narrower
+  // one, meaningful only while uiEnabled is true: uiAssets:false 404s just the HTML/asset routes
+  // (/ui, /ui/*) while /api/ui/* and /pair/* keep working, so a native console (which talks only
+  // to the API) can stay reachable on a machine that wants the browser GUI off. Optional so an
+  // on-disk config predating P6 is untouched -- config.ts's mergeDefaults fills the default.
   uiEnabled: boolean;
+  uiAssets?: boolean;
 }
 
 // Every way an admin call can be turned down without executing. Kept as a closed union (unlike

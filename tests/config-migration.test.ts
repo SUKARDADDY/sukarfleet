@@ -137,6 +137,37 @@ describe('notifications.os (P5): default true, explicit false round-trips', () =
   });
 });
 
+describe('admin.uiAssets (P6): default true, explicit false round-trips', () => {
+  test('a config with no admin.uiAssets key defaults it to true', async () => {
+    const cfg = await loadConfig(writeConfig({ machine: 'alpha' }));
+    expect(cfg.admin.uiAssets).toBe(true);
+  });
+
+  test('an explicit admin.uiAssets:false round-trips through loadConfig', async () => {
+    const cfg = await loadConfig(writeConfig({ machine: 'alpha', admin: { uiAssets: false } }));
+    expect(cfg.admin.uiAssets).toBe(false);
+  });
+
+  test('a real deployed-shape config (no uiAssets key) still defaults to true', async () => {
+    const cfg = await loadConfig(writeConfig(deployedShape()));
+    expect(cfg.admin.uiAssets).toBe(true);
+  });
+
+  test('uiEnabled:false round-trips unchanged, independent of uiAssets', async () => {
+    const raw = deployedShape();
+    (raw.admin as Record<string, unknown>).uiEnabled = false;
+    const cfg = await loadConfig(writeConfig(raw));
+    expect(cfg.admin.uiEnabled).toBe(false);
+    expect(cfg.admin.uiAssets).toBe(true);
+  });
+
+  test('a non-boolean uiAssets fails validation', async () => {
+    const raw = deployedShape();
+    (raw.admin as Record<string, unknown>).uiAssets = 'nope';
+    await expect(loadConfig(writeConfig(raw))).rejects.toThrow(/admin\.uiAssets must be a boolean/);
+  });
+});
+
 describe('unknown top-level blocks survive', () => {
   test('a block the running build has never heard of does not fail the load', async () => {
     const raw = deployedShape();
