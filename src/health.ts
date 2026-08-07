@@ -119,6 +119,14 @@ interface PendingNotification {
   body: string;
 }
 
+// Strips the shared "sukarfleet: " brand prefix so a batched body line reads "sync error: <msg>"
+// instead of repeating the brand on every item -- the coalesced toast's own title already carries
+// it once ("sukarfleet: N fault updates"). Only used building the multi-item body below; the
+// single-fault path keeps its title/body exactly as before, untouched.
+function shortLabel(title: string): string {
+  return title.replace(/^sukarfleet:\s*/, '');
+}
+
 function worstUrgency(items: readonly { urgency: Urgency }[]): Urgency {
   let worst: Urgency = 'low';
   for (const item of items) {
@@ -395,7 +403,13 @@ export class Health {
     }
     const urgency = worstUrgency(pending);
     const title = `sukarfleet: ${pending.length} fault updates`;
-    const body = pending.map((p) => p.body).join('; ').slice(0, BATCH_BODY_CAP);
+    // Each item prefixed with its own short label (Class C: a 5-fault toast should name its fault
+    // classes, not just say "5 fault updates"), capped AFTER joining so the cap bounds the whole
+    // notification body regardless of how many items contributed to it.
+    const body = pending
+      .map((p) => `${shortLabel(p.title)}: ${p.body}`)
+      .join('; ')
+      .slice(0, BATCH_BODY_CAP);
     await this.safeNotify(urgency, title, body);
   }
 
