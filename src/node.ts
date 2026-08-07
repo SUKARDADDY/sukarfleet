@@ -187,22 +187,64 @@ export function isLoopFresh(nowMsVal: number, lastOkMs: number, windowMs: number
   return nowMsVal - lastOkMs < windowMs;
 }
 
-// P3 single-pusher policy. The anchor always pushes derive's derived main to origin; a roamer only
-// takes over when it has independent evidence the anchor is down (transport.anchorReachable()
-// already debounces the underlying mesh sighting -- ANCHOR_MISS_POLLS -- and returns null on
-// startup, a safe no-takeover default). Exported so tests/node-exec.test.ts can table-test every
-// (role, anchorReachable) combination without a live Transport.
-export function shouldPushDerivedMain(role: 'anchor' | 'roamer', anchorReachable: boolean | null): boolean {
-  return role === 'anchor' || anchorReachable === false;
+// P3 single-pusher takeover streak threshold: a roamer needs this many CONSECUTIVE syncLoop ticks
+// of anchorDaemonOnline === false before it takes over pushing derive's derived main. Exported so
+// tests IMPORT it rather than re-hardcoding the number the gate actually checks.
+export const TAKEOVER_STREAK = 2;
+
+// P3 single-pusher policy (Class A fix). Previously this gate read transport.anchorReachable() --
+// the EasyTier PEER TABLE, a different systemd unit than the anchor's node daemon. That mismatch
+// had two failure modes, both landing on "the fleet loses its single pusher": (1) the anchor
+// daemon dies while the mesh stays up -- the roamer still sees the anchor in the peer table, reads
+// reachable, and nobody ever pushes for the whole outage; (2) a roamer whose anchorReachable()
+// never has a trusted sighting to report (zero configured peers, or an easytier CLI poll that
+// never succeeds) reads null forever, which the old gate treated as "don't take over" forever too.
+//
+// The fix keys the gate on the anchor DAEMON's own heartbeat instead: gossip.getPeerViews' `online`
+// is true only when a signed envelope from that peer arrived within gossipSec x peerOfflineFactor
+// -- direct evidence the daemon process itself is alive and broadcasting, not merely that the mesh
+// transport can see a peer. transport.anchorReachable() is left untouched (health.ts still reads
+// it for the separate anchor-unreachable alarm); this gate no longer consults it at all.
+//
+// anchorDaemonOnline is `null` only when this machine has no configured peers at all --
+// anchorDaemonOnlineFromGossip below returns null exactly then, since gossip.getPeerViews always
+// returns one PeerView per configured peer and `online` on each is a plain boolean, never null.
+//
+// KNOWN HONESTY LIMIT (accepted, self-healing): a roamer that takes over on this signal may push
+// its own last-fetched (possibly stale) refs if the mesh itself is also down -- the daemon
+// heartbeat and the transport are different failure axes, and this gate only observes the former.
+// A subsequent successful fetch/merge cycle corrects it; there is no dual-pusher risk either way,
+// since a stale push is still exactly one push.
+export function shouldPushThisTick(
+  role: 'anchor' | 'roamer',
+  anchorDaemonOnline: boolean | null,
+  streak: number,
+): boolean {
+  if (role === 'anchor') return true;
+  // No peers configured at all: there is no anchor to defer to, so this solo machine is its own
+  // pusher -- restores the pre-P3 behavior for that shape of config.
+  if (anchorDaemonOnline === null) return true;
+  return anchorDaemonOnline === false && streak >= TAKEOVER_STREAK;
 }
 
-// Roamer-only debounce layered on top of shouldPushDerivedMain: the roamer only starts pushing
-// once anchorReachable() has read false for two CONSECUTIVE syncLoop ticks (one lost/racy poll
-// must not flip who pushes), and yields the instant a tick sees anything else -- true or null
-// resets the streak to zero, not just recovery. The anchor never calls this: its push decision
-// never depends on the streak. Exported so tests/node-exec.test.ts can pin the debounce boundary.
-export function nextAnchorDownStreak(prevStreak: number, anchorReachableNow: boolean | null): number {
-  return anchorReachableNow === false ? prevStreak + 1 : 0;
+// Reads the anchor daemon's liveness the same way transport.ts's anchorReachable() identifies
+// "the anchor": PeerConfig carries no role marker (see types.ts), and the standard hub-and-spoke
+// topology gives a roamer exactly one peer anyway, so "all configured peers offline in gossip" is
+// treated as anchor-down. Returns null (not false) when there are zero configured peers -- see
+// shouldPushThisTick's null case above.
+export function anchorDaemonOnlineFromGossip(views: readonly { online: boolean }[]): boolean | null {
+  if (views.length === 0) return null;
+  return views.some((v) => v.online);
+}
+
+// Roamer-only debounce layered on top of shouldPushThisTick: the roamer only starts pushing once
+// the anchor-daemon-online signal (anchorDaemonOnlineFromGossip, NOT transport.anchorReachable())
+// has read false for two CONSECUTIVE syncLoop ticks (one lost/racy gossip cycle must not flip who
+// pushes), and yields the instant a tick sees anything else -- true or null resets the streak to
+// zero, not just recovery. The anchor never calls this: its push decision never depends on the
+// streak. Exported so tests/node-exec.test.ts can pin the debounce boundary.
+export function nextAnchorDownStreak(prevStreak: number, anchorDaemonOnlineNow: boolean | null): number {
+  return anchorDaemonOnlineNow === false ? prevStreak + 1 : 0;
 }
 
 // P4 watchdog suspend-awareness. Fresh marks always ping. Stale marks still ping while nowMs is
@@ -1190,12 +1232,13 @@ async function main(): Promise<void> {
     }
 
     // P3 single-pusher policy: one decision per tick, reused for every repo below (the debounce
-    // counts syncLoop ticks, not per-repo calls). anchorReachable() is read once here so every
-    // repo this tick agrees, rather than each racing a fresh poll result.
-    const anchorReachableNow = transport.anchorReachable();
-    if (cfg.role === 'roamer') anchorDownStreak = nextAnchorDownStreak(anchorDownStreak, anchorReachableNow);
-    const push =
-      shouldPushDerivedMain(cfg.role, anchorReachableNow) && (cfg.role === 'anchor' || anchorDownStreak >= 2);
+    // counts syncLoop ticks, not per-repo calls). Keyed on the anchor daemon's own gossip
+    // heartbeat (Class A fix), never transport.anchorReachable() -- see shouldPushThisTick's
+    // doc comment for why. Read once here so every repo this tick agrees, rather than each racing
+    // a fresh gossip snapshot.
+    const anchorDaemonOnlineNow = anchorDaemonOnlineFromGossip(gossip.getPeerViews(nowMs()));
+    if (cfg.role === 'roamer') anchorDownStreak = nextAnchorDownStreak(anchorDownStreak, anchorDaemonOnlineNow);
+    const push = shouldPushThisTick(cfg.role, anchorDaemonOnlineNow, anchorDownStreak);
 
     for (const repo of cfg.repos) {
       if (!adopted.has(repo.name)) continue; // never sync on main
