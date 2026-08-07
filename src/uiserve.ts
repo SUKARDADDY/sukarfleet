@@ -469,10 +469,17 @@ export class UiRoutes {
 
     if (!this.deps.isLoopback(srv, req)) return forbidden('the local GUI is reachable from this machine only');
     // uiEnabled:false means the surface does not exist on this machine -- a 404, not a 403, and it
-    // is checked before any handler so nothing behind it can be probed.
+    // is checked before any handler so nothing behind it can be probed. Unchanged from before P6:
+    // this still 404s /api/ui/* too, for backward compat with every deployment that already relies
+    // on the one flag turning off the whole thing.
     if (!this.cfg.admin.uiEnabled) return notFound();
 
     if (path.startsWith('/api/ui/')) return this.apiRoute(req, url, path);
+    // uiAssets:false (P6) narrows the switch to just the HTML/asset routes below, so a native
+    // console -- which only ever calls /api/ui/* -- stays reachable on a machine that wants the
+    // browser GUI off. Default true: absent (a pre-P6 config, or a harness that built `admin` by
+    // hand) behaves exactly as enabled.
+    if (this.cfg.admin.uiAssets === false) return notFound();
     return this.assetRoute(req, path);
   }
 

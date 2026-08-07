@@ -95,6 +95,7 @@ export function defaultConfig(machine: string): FleetConfig {
       maxOutputBytes: 262144,
       ratePerMin: 20,
       uiEnabled: true,
+      uiAssets: true,
     },
   };
 }
@@ -310,6 +311,11 @@ function validateAdmin(raw: unknown): void {
   const admin = raw as Record<string, unknown>;
   for (const k of ['enabled', 'acceptIncoming', 'allowPlaintextFallback', 'uiEnabled'] as const) {
     if (typeof admin[k] !== 'boolean') fail(`admin.${k} must be a boolean`);
+  }
+  // Optional (P6): absent means "default true", same as every other admin.* field mergeDefaults
+  // fills in -- only a present-but-wrong-typed value is rejected.
+  if (admin.uiAssets !== undefined && typeof admin.uiAssets !== 'boolean') {
+    fail('admin.uiAssets must be a boolean');
   }
   // sshUser may legitimately be empty before the installer fills it in; the origin leg refuses
   // rather than the daemon failing to boot.
