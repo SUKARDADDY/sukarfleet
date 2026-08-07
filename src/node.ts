@@ -247,6 +247,24 @@ export function nextAnchorDownStreak(prevStreak: number, anchorDaemonOnlineNow: 
   return anchorDaemonOnlineNow === false ? prevStreak + 1 : 0;
 }
 
+// P4 watchdog grace-window arithmetic (Class B fix). Pulled out of watchdogLoop's body so the
+// safety-critical part -- deciding whether THIS tick earns a fresh post-resume grace window -- is
+// pure and directly testable, rather than only reachable by driving the live scheduled loop.
+//
+// Grants a fresh window (nowMs + windowMs) ONLY when driftMs is a genuine jump (> SUSPEND_JUMP_MS)
+// AND the previous window has already expired (nowMs >= prevGraceUntilMs). That second condition
+// is the hardening the panel asked for: without it, a suspend/resume cycle that lands WHILE an
+// earlier grace window is still open would extend that window indefinitely -- back-to-back suspend
+// cycles must not add up to continuous grace, since grace exists to cover one resume's catch-up
+// time, not to become a standing exemption from the watchdog. A merely-stale tick (driftMs at or
+// below the threshold) never renews anything, jump or not: the return value is prevGraceUntilMs,
+// byte-identical, so callers can detect "did a grant just happen" with `!==`.
+export function nextWatchdogGrace(prevGraceUntilMs: number, driftMs: number, nowMs: number, windowMs: number): number {
+  if (nowMs < prevGraceUntilMs) return prevGraceUntilMs; // previous window still open: refuse a new grant
+  if (driftMs > SUSPEND_JUMP_MS) return nowMs + windowMs; // fresh jump, no open window: grant
+  return prevGraceUntilMs; // merely stale (including driftMs === SUSPEND_JUMP_MS exactly): unchanged
+}
+
 // P4 watchdog suspend-awareness. Fresh marks always ping. Stale marks still ping while nowMs is
 // inside the one-shot post-resume grace window (graceUntilMs) -- granted once by watchdogLoop when
 // its own tick-to-tick clockDriftMs exceeds SUSPEND_JUMP_MS, and never renewed by a later stale
@@ -1358,11 +1376,12 @@ async function main(): Promise<void> {
     const drift = clockDriftMs(watchdogPrevMonoNs, watchdogPrevWallMs, nowMonoNs, now);
     watchdogPrevMonoNs = nowMonoNs;
     watchdogPrevWallMs = now;
-    if (drift > SUSPEND_JUMP_MS) {
-      // One-shot: overwritten only when a fresh jump is detected, never extended by a later tick
-      // that is merely still stale -- a real wedge spanning a suspend still withholds once this
-      // expires.
-      watchdogGraceUntilMs = now + syncFreshWindowMs;
+    // nextWatchdogGrace (Class B fix) is a no-op unless this tick both crosses SUSPEND_JUMP_MS AND
+    // the previous grant has already expired -- a fresh jump landing mid an already-open window is
+    // refused, not extended, so back-to-back suspend cycles can't add up to continuous grace.
+    const nextGrace = nextWatchdogGrace(watchdogGraceUntilMs, drift, now, syncFreshWindowMs);
+    if (nextGrace !== watchdogGraceUntilMs) {
+      watchdogGraceUntilMs = nextGrace;
       log('info', 'watchdog: clock jump detected mid-tick, granting post-resume grace', {
         driftMs: drift,
         graceUntilMs: watchdogGraceUntilMs,
