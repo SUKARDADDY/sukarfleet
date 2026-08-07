@@ -108,6 +108,25 @@ export function formatDuration(ms: number): string {
   return remHours > 0 ? `${days}d${remHours}h` : `${days}d`;
 }
 
+const URGENCY_RANK: Record<Urgency, number> = { low: 0, normal: 1, critical: 2 };
+// Joined multi-fault bodies are capped so one batched notification cannot grow unbounded with the
+// fault count -- a desktop toast is a glance, not a report.
+const BATCH_BODY_CAP = 800;
+
+interface PendingNotification {
+  urgency: Urgency;
+  title: string;
+  body: string;
+}
+
+function worstUrgency(items: readonly { urgency: Urgency }[]): Urgency {
+  let worst: Urgency = 'low';
+  for (const item of items) {
+    if (URGENCY_RANK[item.urgency] > URGENCY_RANK[worst]) worst = item.urgency;
+  }
+  return worst;
+}
+
 function localDateString(ms: number): string {
   const d = new Date(ms);
   const y = d.getFullYear();
@@ -361,12 +380,32 @@ export class Health {
     }
   }
 
+  // Sends at most one OS notification per evaluate() call, however many fault transitions it saw.
+  // A single-item tick keeps today's exact title/body (no format change for the common case); a
+  // multi-item tick coalesces into one "N fault updates" notification, worst urgency wins.
+  // notifications.os:false skips the flush entirely -- e.g. a machine running the tray app, which
+  // polls the daemon's fault state itself and would otherwise double-notify.
+  private async flushNotifications(pending: PendingNotification[]): Promise<void> {
+    if (!this.cfg.notifications.os) return;
+    if (pending.length === 0) return;
+    if (pending.length === 1) {
+      const only = pending[0]!;
+      await this.safeNotify(only.urgency, only.title, only.body);
+      return;
+    }
+    const urgency = worstUrgency(pending);
+    const title = `sukarfleet: ${pending.length} fault updates`;
+    const body = pending.map((p) => p.body).join('; ').slice(0, BATCH_BODY_CAP);
+    await this.safeNotify(urgency, title, body);
+  }
+
   async evaluate(now: number, self: HealthSelf, peers: PeerView[]): Promise<void> {
     await this.ready;
     const repeatMs = this.cfg.thresholds.alarmRepeatMin * 60000;
     const active = computeActiveFaults(this.cfg, self, peers, now);
     const activeKeys = new Set(active.map((f) => f.key));
     let changed = false;
+    const pending: PendingNotification[] = [];
 
     for (const fault of active) {
       const existing = this.state.faults[fault.key];
@@ -379,7 +418,7 @@ export class Health {
           lastNotifiedMs: now,
         };
         changed = true;
-        await this.safeNotify(fault.urgency, titleFor(fault.faultClass), fault.message);
+        pending.push({ urgency: fault.urgency, title: titleFor(fault.faultClass), body: fault.message });
         continue;
       }
       if (existing.message !== fault.message) {
@@ -389,7 +428,7 @@ export class Health {
       if (now - existing.lastNotifiedMs >= repeatMs) {
         existing.lastNotifiedMs = now;
         changed = true;
-        await this.safeNotify(fault.urgency, titleFor(fault.faultClass), fault.message);
+        pending.push({ urgency: fault.urgency, title: titleFor(fault.faultClass), body: fault.message });
       }
     }
 
@@ -398,7 +437,11 @@ export class Health {
       const cleared = this.state.faults[key]!;
       delete this.state.faults[key];
       changed = true;
-      await this.safeNotify('normal', `sukarfleet: recovered — ${titleFor(cleared.faultClass)}`, `${cleared.message} — cleared`);
+      pending.push({
+        urgency: 'normal',
+        title: `sukarfleet: recovered — ${titleFor(cleared.faultClass)}`,
+        body: `${cleared.message} — cleared`,
+      });
     }
 
     if (active.length === 0) {
@@ -406,10 +449,11 @@ export class Health {
       if (this.state.digestDate !== today) {
         this.state.digestDate = today;
         changed = true;
-        await this.safeNotify('low', 'sukarfleet: all green', 'No active faults.');
+        pending.push({ urgency: 'low', title: 'sukarfleet: all green', body: 'No active faults.' });
       }
     }
 
+    await this.flushNotifications(pending);
     if (changed) await this.persist();
   }
 

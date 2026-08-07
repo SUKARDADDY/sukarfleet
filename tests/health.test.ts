@@ -158,7 +158,10 @@ describe('Health.evaluate', () => {
     expect(calls[1]!.body).toContain('boom');
   });
 
-  test('recovery notice fires once when the fault clears', async () => {
+  // P5: a cleared fault and the same-tick all-green digest are two notification-worthy events
+  // landing in one evaluate() call, so they coalesce into a single batched notification instead
+  // of firing as two separate calls.
+  test('recovery notice and the same-tick all-green digest coalesce into one batch', async () => {
     const cfg = healthyCfg({ alarmRepeatMin: 30 });
     const { calls, notifier } = fakeNotifier();
     const health = new Health(cfg, notifier);
@@ -167,21 +170,21 @@ describe('Health.evaluate', () => {
     const self = healthySelf();
     self.repos.repoA = { lastSyncOkMs: t0, lastCommit: 'abc', syncError: 'boom' };
     await health.evaluate(t0, self, []);
-    expect(calls.length).toBe(1);
+    expect(calls.length).toBe(1); // single fault, unchanged format
+    expect(calls[0]!.title).toBe('sukarfleet: sync error');
 
     const healed = healthySelf();
     healed.repos.repoA = { lastSyncOkMs: t0, lastCommit: 'abc', syncError: null };
     await health.evaluate(t0 + 60000, healed, []);
-    // Recovery notice plus the same-evaluation all-green digest.
-    expect(calls.length).toBe(3);
-    const recovery = calls.find((c) => c.title.includes('recovered'));
-    expect(recovery).toBeDefined();
-    expect(recovery!.body).toContain('cleared');
-    expect(calls.some((c) => c.title.includes('all green'))).toBe(true);
+    expect(calls.length).toBe(2);
+    const batch = calls[1]!;
+    expect(batch.title).toBe('sukarfleet: 2 fault updates');
+    expect(batch.body).toContain('cleared');
+    expect(batch.body).toContain('No active faults');
 
     // Staying healthy shouldn't re-fire a second recovery notice or digest.
     await health.evaluate(t0 + 120000, healed, []);
-    expect(calls.length).toBe(3);
+    expect(calls.length).toBe(2);
   });
 
   test('daily all-green digest fires once per calendar day, only while green', async () => {
@@ -202,6 +205,12 @@ describe('Health.evaluate', () => {
     const faulted = healthySelf();
     faulted.transportWedged = true;
     await health.evaluate(day1 + 4 * 3600_000, faulted, []);
+    expect(calls.filter((c) => c.title.includes('all green')).length).toBe(1);
+
+    // Fault clears in its own tick, same day: a recovery notice, not a digest (digestDate is
+    // already today's). Isolates the recovery event from the next digest so day2 below is not a
+    // coalesced batch -- that combination is covered by the recovery+digest test above.
+    await health.evaluate(day1 + 5 * 3600_000, self, []);
     expect(calls.filter((c) => c.title.includes('all green')).length).toBe(1);
 
     // Next calendar day, healthy again: digest fires.
@@ -304,5 +313,77 @@ describe('Health.evaluate', () => {
     const state = await health.getState();
     expect(state.faults).toEqual([]);
     expect(state.digestDate).toBe('2026-01-01');
+  });
+});
+
+describe('Health.evaluate: notification coalescing (P5) + notifications.os knob', () => {
+  const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+
+  test('3 simultaneous faults coalesce into exactly one call', async () => {
+    const cfg = healthyCfg();
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+    const self = healthySelf();
+    self.repos.repoA = { lastSyncOkMs: t0, lastCommit: 'a', syncError: 'boom-a' };
+    self.repos.repoB = { lastSyncOkMs: t0, lastCommit: 'b', syncError: 'boom-b' };
+    self.transportWedged = true;
+
+    await health.evaluate(t0, self, []);
+
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.title).toBe('sukarfleet: 3 fault updates');
+    expect(calls[0]!.urgency).toBe('critical');
+    expect(calls[0]!.body).toContain('boom-a');
+    expect(calls[0]!.body).toContain('boom-b');
+    expect(calls[0]!.body).toContain('wedged');
+  });
+
+  test('a single fault keeps today\'s exact title/body format, unchanged', async () => {
+    const cfg = healthyCfg();
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+    const self = healthySelf();
+    self.repos.repoA = { lastSyncOkMs: t0, lastCommit: 'a', syncError: 'boom' };
+
+    await health.evaluate(t0, self, []);
+
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.title).toBe('sukarfleet: sync error');
+    expect(calls[0]!.body).toBe('repoA: sync error — boom');
+  });
+
+  test('notifications.os:false suppresses every OS notification, even multi-fault ticks', async () => {
+    const cfg = healthyCfg();
+    cfg.notifications = { os: false };
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+    const self = healthySelf();
+    self.repos.repoA = { lastSyncOkMs: t0, lastCommit: 'a', syncError: 'boom' };
+    self.transportWedged = true;
+
+    await health.evaluate(t0, self, []);
+
+    expect(calls.length).toBe(0);
+  });
+
+  test('a cleared fault and a newly entered fault in the same tick coalesce into one batch', async () => {
+    const cfg = healthyCfg();
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+
+    const self = healthySelf();
+    self.repos.repoA = { lastSyncOkMs: t0, lastCommit: 'abc', syncError: 'boom' };
+    await health.evaluate(t0, self, []);
+    expect(calls.length).toBe(1);
+
+    const next = healthySelf();
+    next.repos.repoA = { lastSyncOkMs: t0 + 60000, lastCommit: 'abc', syncError: null }; // clears
+    next.transportWedged = true; // new fault, same tick
+    await health.evaluate(t0 + 60000, next, []);
+
+    expect(calls.length).toBe(2);
+    expect(calls[1]!.title).toBe('sukarfleet: 2 fault updates');
+    expect(calls[1]!.body).toContain('cleared');
+    expect(calls[1]!.body).toContain('wedged');
   });
 });
