@@ -32,6 +32,11 @@ export interface HealthSelf {
   clockVetted: boolean;
   transportWedged: boolean;
   anchorReachable: boolean | null;
+  // Connector-level cause behind an unreachable anchor (transport.ts's
+  // TransportFault), or null/absent when the transport had no opinion. Carried
+  // so the alarm names WHY the mesh is empty -- "anchor unreachable" alone sent
+  // one operator on a forty-minute hunt for a fault the daemon already knew.
+  transportFault?: string | null;
   // SSH admin lane (p3-ssh-admin). Optional: absent means the caller is not reporting on the lane
   // at all (a pre-p3 caller, or a health tick that ran before the lane was constructed), which
   // raises no admin faults. Never a password, never a credential value -- booleans and machine
@@ -231,7 +236,10 @@ function computeActiveFaults(cfg: FleetConfig, self: HealthSelf, peers: PeerView
       key: 'anchor-unreachable',
       faultClass: 'anchor-unreachable',
       urgency: 'critical',
-      message: 'anchor unreachable',
+      message:
+        self.transportFault && self.transportFault !== 'ok'
+          ? `anchor unreachable (${self.transportFault})`
+          : 'anchor unreachable',
     });
   }
 

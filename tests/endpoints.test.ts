@@ -14,6 +14,7 @@ import {
   lanIp,
   parseLanIpFromIpAddrJson,
   probeUpnpIgd,
+  planPeerDial,
 } from '../src/endpoints';
 
 async function withTmpDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -291,5 +292,84 @@ describe('probeUpnpIgd', () => {
     const elapsed = Date.now() - start;
     expect(typeof result).toBe('boolean');
     expect(elapsed).toBeLessThan(5000);
+  });
+});
+
+// A roamer that lands on a foreign network reusing the anchor's LAN range is the
+// scenario these guard: the anchor's LAN address is then on-link but belongs to a
+// different wire, and dialling it neither connects nor fails fast.
+function peerEndpoint(overrides: Partial<EndpointFile> = {}): EndpointFile {
+  return {
+    v: 1,
+    machine: 'anchor-machine',
+    wanIp: '198.51.100.10',
+    lanIp: '192.0.2.200',
+    meshIp: '198.51.100.1',
+    ports: { udp: 11010, tcp: 44310 },
+    tsMs: 1_700_000_000_000,
+    sigB64: 'not-checked-by-planPeerDial',
+    ...overrides,
+  };
+}
+
+describe('planPeerDial co-location gate', () => {
+  test('same WAN IP proves co-location: the LAN candidate leads', () => {
+    const plan = planPeerDial({ wanIp: '198.51.100.10', lanIp: '192.0.2.8' }, peerEndpoint(), {
+      peerLanPort: 11010,
+    });
+    expect(plan.uris).toEqual([
+      'udp://192.0.2.200:11010',
+      'udp://198.51.100.10:11010',
+      'tcp://198.51.100.10:44310',
+    ]);
+    expect(plan.lanSuppressed).toBeNull();
+    expect(plan.coLocationUnknown).toBe(false);
+  });
+
+  test('different WAN IPs: the LAN candidate is a phantom and is not offered', () => {
+    // Same /24 on both sides -- the collision that makes the address look on-link.
+    const plan = planPeerDial({ wanIp: '203.0.113.5', lanIp: '192.0.2.8' }, peerEndpoint(), {
+      peerLanPort: 11010,
+    });
+    expect(plan.uris).toEqual(['udp://198.51.100.10:11010', 'tcp://198.51.100.10:44310']);
+    expect(plan.candidates.some((c) => c.via === 'lan')).toBe(false);
+    expect(plan.lanSuppressed).toEqual({ uri: 'udp://192.0.2.200:11010', reason: 'peer-behind-different-wan' });
+    expect(plan.coLocationUnknown).toBe(false);
+  });
+
+  test('unknown WAN IP on either side: LAN is ranked last, never suppressed', () => {
+    const selfUnknown = planPeerDial({ wanIp: null, lanIp: '192.0.2.8' }, peerEndpoint(), { peerLanPort: 11010 });
+    expect(selfUnknown.uris.at(-1)).toBe('udp://192.0.2.200:11010');
+    expect(selfUnknown.lanSuppressed).toBeNull();
+    expect(selfUnknown.coLocationUnknown).toBe(true);
+
+    // Peer offline too: LAN is then the only candidate there is, and a
+    // LAN-only fleet must not be left with an empty dial list.
+    const bothUnknown = planPeerDial({ wanIp: null, lanIp: '192.0.2.8' }, peerEndpoint({ wanIp: null }), {
+      peerLanPort: 11010,
+    });
+    expect(bothUnknown.uris).toEqual(['udp://192.0.2.200:11010']);
+  });
+
+  test('uses the peer LAN listener port, not the forwarded WAN port', () => {
+    const plan = planPeerDial({ wanIp: '198.51.100.10', lanIp: '192.0.2.8' }, peerEndpoint(), {
+      peerLanPort: 11011,
+    });
+    expect(plan.uris[0]).toBe('udp://192.0.2.200:11011');
+  });
+
+  test('missing lanIp or unforwarded ports simply drop those candidates', () => {
+    const noLan = planPeerDial({ wanIp: '203.0.113.5', lanIp: '192.0.2.8' }, peerEndpoint({ lanIp: '' }), {
+      peerLanPort: 11010,
+    });
+    expect(noLan.uris).toEqual(['udp://198.51.100.10:11010', 'tcp://198.51.100.10:44310']);
+    expect(noLan.lanSuppressed).toBeNull();
+
+    const noTcp = planPeerDial(
+      { wanIp: '198.51.100.10', lanIp: '192.0.2.8' },
+      peerEndpoint({ ports: { udp: 11010, tcp: null } }),
+      { peerLanPort: 11010 },
+    );
+    expect(noTcp.uris).toEqual(['udp://192.0.2.200:11010', 'udp://198.51.100.10:11010']);
   });
 });
