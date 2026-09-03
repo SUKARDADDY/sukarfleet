@@ -75,6 +75,110 @@ export interface PeerSample {
   txBytes: number;
 }
 
+// ---------------------------------------------------------------------------
+// Connector-level diagnosis
+//
+// An empty peer table has three very different causes and, until now, one
+// message. `easytier-cli connector list` separates them: a connector that
+// reports Connected while the peer table stays empty means the transport is up
+// and the mesh session is simply not converging -- the signature of a phantom
+// LAN candidate (see planPeerDial) or a half-open session -- which is a
+// different fault from "every dial is failing", and wants a different fix.
+// ---------------------------------------------------------------------------
+
+export type ConnectorStatus = 'connected' | 'connecting' | 'unknown';
+
+export interface ConnectorSample {
+  uri: string;
+  status: ConnectorStatus;
+}
+
+// easytier v2.6.4 emits the enum ordinal in JSON (0 = Connected, 2 = Connecting),
+// and the human table renders the names. Accept both; anything unrecognised is
+// 'unknown', which counts as "not connected" without being asserted as failed.
+function toConnectorStatus(v: unknown): ConnectorStatus {
+  if (v === 0) return 'connected';
+  if (v === 2) return 'connecting';
+  if (typeof v === 'string') {
+    const s = v.toLowerCase();
+    if (s === 'connected') return 'connected';
+    if (s === 'connecting') return 'connecting';
+  }
+  return 'unknown';
+}
+
+// Parses `easytier-cli -o json connector list`. Returns null on any shape it
+// cannot trust, matching pollOnce's never-throw contract.
+export function parseConnectorJson(stdout: string): ConnectorSample[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  const out: ConnectorSample[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
+    const rec = entry as Record<string, unknown>;
+    const url = rec.url;
+    if (typeof url !== 'object' || url === null) continue;
+    const uri = (url as Record<string, unknown>).url;
+    if (typeof uri !== 'string' || uri.length === 0) continue;
+    out.push({ uri, status: toConnectorStatus(rec.status) });
+  }
+  return out;
+}
+
+export type TransportFault =
+  // A non-local peer is present: the mesh is up, whatever else may be wrong.
+  | 'ok'
+  // No connectors at all -- this node was never told who to dial.
+  | 'no-connectors'
+  // Every connector is still dialling: no path to the peer exists right now.
+  | 'all-connectors-down'
+  // At least one connector is Connected, yet no peer ever appeared. The
+  // transport works and the mesh session is not converging over it.
+  | 'connected-without-peer';
+
+export interface TransportDiagnosis {
+  fault: TransportFault;
+  connectedUris: string[];
+  dialingUris: string[];
+  summary: string;
+}
+
+export function diagnoseTransport(
+  nonLocalPeerCount: number,
+  connectors: ConnectorSample[],
+): TransportDiagnosis {
+  const connectedUris = connectors.filter((c) => c.status === 'connected').map((c) => c.uri);
+  const dialingUris = connectors.filter((c) => c.status !== 'connected').map((c) => c.uri);
+
+  if (nonLocalPeerCount > 0) {
+    return { fault: 'ok', connectedUris, dialingUris, summary: 'mesh up: at least one non-local peer is present' };
+  }
+  if (connectors.length === 0) {
+    return { fault: 'no-connectors', connectedUris, dialingUris, summary: 'no peer connectors are configured on this node' };
+  }
+  if (connectedUris.length > 0) {
+    return {
+      fault: 'connected-without-peer',
+      connectedUris,
+      dialingUris,
+      summary:
+        `transport is connected (${connectedUris.join(', ')}) but no peer joined the mesh: ` +
+        'the session is not converging -- suspect a phantom LAN candidate or a half-open session on the far side',
+    };
+  }
+  return {
+    fault: 'all-connectors-down',
+    connectedUris,
+    dialingUris,
+    summary: `no connector reached its peer (still dialling: ${dialingUris.join(', ')})`,
+  };
+}
+
 interface PollRecord {
   atMs: number;
   hadNonLocalPeer: boolean;
@@ -101,6 +205,7 @@ export class Transport {
   private readonly history: PollRecord[] = [];
   private anchorMissStreak = 0;
   private anchorSeen: boolean | null = null;
+  private lastDiagnosis: TransportDiagnosis | null = null;
 
   constructor(
     private readonly cfg: FleetConfig,
@@ -148,6 +253,15 @@ export class Transport {
     }
     const nonLocal = samples.filter((s) => s.hostname !== this.cfg.machine);
 
+    // A third CLI round-trip is only worth taking when something is already
+    // wrong: with a non-local peer present the verdict is 'ok' by definition,
+    // and connectors add nothing.
+    if (nonLocal.length === 0) {
+      await this.refreshDiagnosis(base, 0);
+    } else {
+      this.lastDiagnosis = diagnoseTransport(nonLocal.length, []);
+    }
+
     // Anchor-reachability evidence (roamer only). P1's mesh is hub-and-spoke —
     // a roamer's transport path exists only via the anchor's WAN forwards — so
     // any configured peer present in the peer table means the anchor is
@@ -177,6 +291,43 @@ export class Transport {
     this.cumulativeTotal = statsTotal;
     this.recordPoll(nowMs, nonLocal.length > 0, deltaBytes);
     return samples;
+  }
+
+  // Reads `connector list` and classifies why the peer table is empty. Never
+  // throws and never blocks a poll: an unreadable connector list leaves the
+  // diagnosis null (unknown), which reads as "no opinion", not as "healthy".
+  private async refreshDiagnosis(base: string[], nonLocalPeerCount: number): Promise<void> {
+    const res = await this.runner([...base, 'connector', 'list'], { timeoutMs: 30000 });
+    if (res.code !== 0) {
+      log('warn', 'transport: easytier-cli connector poll failed', { code: res.code, stderr: res.stderr.slice(0, 500) });
+      this.lastDiagnosis = null;
+      return;
+    }
+    const connectors = parseConnectorJson(res.stdout);
+    if (connectors === null) {
+      log('warn', 'transport: easytier-cli connector output not usable JSON', {});
+      this.lastDiagnosis = null;
+      return;
+    }
+    const next = diagnoseTransport(nonLocalPeerCount, connectors);
+    // One line per transition, not one per poll: this fires every 30s while a
+    // fleet is down, and a repeated identical warning is how a real signal gets
+    // trained out of the log.
+    if (this.lastDiagnosis === null || this.lastDiagnosis.fault !== next.fault) {
+      log('warn', 'transport: mesh fault', {
+        fault: next.fault,
+        summary: next.summary,
+        connected: next.connectedUris,
+        dialing: next.dialingUris,
+      });
+    }
+    this.lastDiagnosis = next;
+  }
+
+  // Latest connector-level verdict, or null when it could not be established.
+  // Null is "no opinion" -- never read it as healthy.
+  diagnosis(): TransportDiagnosis | null {
+    return this.lastDiagnosis;
   }
 
   // Sums traffic_bytes_rx + traffic_bytes_tx from `easytier-cli stats`.
