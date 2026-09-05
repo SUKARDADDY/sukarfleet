@@ -60,6 +60,9 @@ already running, and grants the daemon permission to restart that one service. N
 To remove it: `./install/uninstall.sh`, then `sudo ./install/uninstall.sh --elevated` for the
 root-owned half. It leaves your repositories, your config and your SSH keys alone.
 
+Running it afterwards, including the restart discipline that keeps a repository from being
+corrupted, is [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+
 The whole flow, including every failure message and its exit code, is
 [`docs/INSTALL-FLOW.md`](docs/INSTALL-FLOW.md). Other distros are refused by name with the manual
 steps in its appendix.
@@ -123,13 +126,19 @@ Two things worth knowing before you change anything:
   machines exchange, including the canonical-JSON encoder that feeds every signature. A failure
   there is not a stale fixture — it means the change would break a running fleet silently, because
   a signature that stops verifying looks exactly like a peer that went offline.
-- **Warts are written down, not fixed.** [`docs/FROZEN-WARTS.md`](docs/FROZEN-WARTS.md) records
-  what the freeze is holding in place and what to do about each one once it lifts.
+- **No personal data, checked by a test rather than by memory.**
+  `tests/no-personal-data.test.ts` walks the whole tree on every run and fails on machine names,
+  mesh addresses, hostnames and home directories, in fixtures and comments too. It runs in CI as
+  its own job.
 
 Contributions are taken under the DCO with a `Signed-off-by` trailer; there is no CLA. See
-[`CONTRIBUTING.md`](CONTRIBUTING.md).
+[`CONTRIBUTING.md`](CONTRIBUTING.md), and [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for how people
+here are expected to treat each other. Released versions are listed in
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ## Licence
 
 AGPL-3.0-or-later for the daemon; MIT for the client, SDK and MCP edges. The boundary is the
 network service, and the reasoning is in [`LICENSING.md`](LICENSING.md).
+[`THIRD-PARTY.md`](THIRD-PARTY.md) covers everything that is not ours: what is bundled, what the
+installer fetches, and where each obligation lands.

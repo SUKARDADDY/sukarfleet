@@ -385,6 +385,33 @@ describe('the pin file is read strictly', () => {
     expect(run.code).toBe(3);
     expect(run.output).toContain('is still TODO-S9');
   });
+
+  // The tray binary is built from this tree, so its hash cannot exist until the
+  // tag is cut. The committed pin therefore carries a placeholder between the
+  // last commit and the release, and a tree in that state still has to install:
+  // the placeholder is treated exactly like TODO-S9 -- skip the tray, print the
+  // web console URL, exit 0 -- rather than fetching something unverifiable or
+  // failing the install over a tray nobody has yet.
+  test('an unfilled release placeholder skips the tray and still installs', async () => {
+    h.putStub('ldconfig', 'echo "  libwebkit2gtk-4.1.so.0 (libc6,x86-64) => /usr/lib/libwebkit2gtk-4.1.so.0"\necho "  libayatana-appindicator3.so.1 (libc6,x86-64) => /usr/lib/libayatana-appindicator3.so.1"\nexit 0\n');
+    const pins = join(h.dir, 'pins-tray-placeholder.txt');
+    writeFileSync(
+      pins,
+      ['x86_64', 'aarch64']
+        .map((arch) => `0.1.0 ${arch} SHA256-FILLED-AT-RELEASE sukarfleet-tray-linux-${arch}`)
+        .join('\n'),
+    );
+
+    const run = await runInstallScript(
+      h,
+      'quickstart.sh',
+      ['--no-open', '--machine=harness-box'],
+      { DISPLAY: ':99', SUKARFLEET_PINS_FILE: pins },
+    );
+    expect(run.code).toBe(0);
+    expect(run.output).toContain('is still SHA256-FILLED-AT-RELEASE');
+    expect(run.output).toContain('Skipping the tray. Open http://127.0.0.1:');
+  });
 });
 
 // ---------------------------------------------------------------------------

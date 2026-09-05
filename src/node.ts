@@ -1301,8 +1301,10 @@ async function main(): Promise<void> {
 
     // --- Loopback-only CLI-facing routes -------------------------------------------------
     // `audit tail` is what remains of this group after the signed-job verbs were dropped. The path
-    // still says /exec/ because renaming it is a change to a running system for no operational gain
-    // during the canary window; see docs/FROZEN-WARTS.md.
+    // still says /exec/ after the layer it was named for went away. Renaming it is safe in
+    // principle -- loopback routes are machine-local and are not part of the frozen cross-machine
+    // contract, since a CLI only ever talks to its own daemon -- but it buys nothing operationally,
+    // so it waits for a release that is already changing this surface.
     //
     // Loopback is NOT a caller identity: any local process, including a web page in a browser on
     // this machine, can reach 127.0.0.1. A CORS-"simple" cross-origin request needs no preflight
