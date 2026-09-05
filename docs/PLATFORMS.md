@@ -73,6 +73,10 @@ refuses to give.
 So: the seam says **unsupported** out loud, and sync is unaffected. Run the sync half on Windows and
 drive admin from a Linux machine.
 
+The installer is [`install/windows/`](../install/windows/README.md): double-click
+`Add-To-Fleet.cmd`. It writes `admin.enabled: false` rather than leaving a lane switched on that
+refuses at the first real call.
+
 Also note the store-privacy probe will typically report that mode is **not** enforced on NTFS,
 because NTFS carries ACLs rather than POSIX mode bits. That is an honest answer, and the admin lane
 refuses on it rather than storing a credential whose privacy it cannot demonstrate.
