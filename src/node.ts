@@ -932,16 +932,56 @@ async function main(): Promise<void> {
     return meshServiceActive.active ? 'installed' : 'none';
   }
 
+  // The staged file has two shapes and the elevated stage reads both: a bare secret and a newline,
+  // or the JSON object below. Building that object is the whole of what "name a machine already in
+  // the fleet" costs -- `peers` is the only thing the bare form has no room for, and without it a
+  // second machine has no way onto the mesh at all, because pairing itself travels over the mesh.
+  //
+  // The identity fields come off DISK, not off this process's cfg. patchIdentity deliberately does
+  // not mutate the live cfg (a machine that signs gossip as one name and reports another is worse
+  // than a stale one), so between an Identity save and the restart that applies it, cfg.meshIp is
+  // the old address while config.json already holds the new one. The bare form has always taken
+  // those fields from config.json; a JSON form that copied the stale ones would OUTRANK it in
+  // install-elevated.sh (`${STAGED_MESHIP:-$CFG_MESH_IP}`) and quietly install the wrong address.
+  async function stagedMeshDetails(secret: string, peer: string): Promise<Record<string, unknown>> {
+    const disk = await loadConfig().catch(() => cfg);
+    const out: Record<string, unknown> = {};
+    if (disk.networkName) out.networkName = disk.networkName;
+    out.networkSecret = secret;
+    if (disk.meshIp) out.meshIp = disk.meshIp;
+    // The reader's key for the machine name is `hostname`, not `machine`: it is the name EasyTier
+    // is given, and an unknown key is dropped on the floor there without a word.
+    if (disk.machine) out.hostname = disk.machine;
+    out.peers = [peer];
+    return out;
+  }
+
   const networkSecretPort: UiRoutesDeps['networkSecret'] = {
     reveal: async () => {
       const file = Bun.file(pendingSecretPath);
       if (!(await file.exists().catch(() => false))) return null;
       const text = (await file.text()).trim();
-      return text.length > 0 ? text : null;
+      if (text.length === 0) return null;
+      // Same discrimination as the elevated reader: a leading `{` is the JSON shape, anything else
+      // is the bare secret. The card's "copy it to the other machines" field shows the SECRET
+      // either way -- it is the secret that gets copied, never the file.
+      if (!text.startsWith('{')) return text;
+      try {
+        const obj = JSON.parse(text) as Record<string, unknown>;
+        const secret = typeof obj.networkSecret === 'string' ? obj.networkSecret.trim() : '';
+        return secret.length > 0 ? secret : null;
+      } catch {
+        return null;
+      }
     },
-    stage: async (s) => {
-      await writeSecretFile(pendingSecretPath, `${s.trim()}\n`);
-      log('info', 'admin: mesh secret staged for the installer', { path: pendingSecretPath });
+    stage: async (s, peer) => {
+      const secret = s.trim();
+      const body = peer ? `${JSON.stringify(await stagedMeshDetails(secret, peer))}\n` : `${secret}\n`;
+      await writeSecretFile(pendingSecretPath, body);
+      log('info', 'admin: mesh secret staged for the installer', {
+        path: pendingSecretPath,
+        ...(peer ? { peer } : {}),
+      });
     },
     generate: async () => {
       const secret = randomBytes(32).toString('base64');

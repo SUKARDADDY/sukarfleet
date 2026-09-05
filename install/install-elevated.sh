@@ -657,10 +657,63 @@ EOF
 # addressed through. Never fatal -- the mesh is installed and correct by this
 # point, so a restart that cannot be driven from here is a sentence to print,
 # not a reason to fail the install.
+#
+# "The mesh service is active" is not "the mesh address exists": the TUN device
+# is configured a moment later, and restarting into that gap put the node right
+# back on the 0.0.0.0 fallback with nothing left to restart it. Hence the wait
+# below, which is bounded and then gives up out loud rather than blocking an
+# install that is otherwise finished.
 # =============================================================================
+
+# How long to wait for the TUN device to carry the mesh address before restarting
+# the node anyway. EasyTier is up by the time this runs, but "the unit is active"
+# and "the address is on an interface" are seconds apart, and the node only has
+# to lose that race once to spend the rest of its life on the 0.0.0.0 fallback.
+MESH_ADDRESS_WAIT_SECS=15
+
+# True when $1 is on an interface right now. Exact match on the address, never a
+# substring: 192.0.2.3 must not be answered by 192.0.2.30.
+mesh_address_present() {
+  command -v ip >/dev/null 2>&1 || return 1
+  ip -o -4 addr show 2>/dev/null |
+    awk -v want="$1" '{ split($4, a, "/"); if (a[1] == want) found = 1 } END { exit found ? 0 : 1 }'
+}
+
+# Polls for the mesh address, once a second, up to MESH_ADDRESS_WAIT_SECS.
+#
+# Never fatal, and never a reason to skip the restart: a node that came back on
+# 0.0.0.0 is at least running, and the warning tells the operator what to do
+# about it. Silence here was the bug -- the node restarted, took the fallback,
+# said so only in its own log, and nothing else on the machine ever restarted it.
+wait_for_mesh_address() {
+  local addr="$1" waited=0
+  if [ "$DRY_RUN" = "1" ]; then
+    dry "wait up to ${MESH_ADDRESS_WAIT_SECS}s for the mesh address ${addr} to come up, polling ip -o -4 addr once a second"
+    return 0
+  fi
+  if ! command -v ip >/dev/null 2>&1; then
+    warn "iproute2 is not installed, so the mesh address could not be waited for; restarting the node now"
+    return 0
+  fi
+  while :; do
+    if mesh_address_present "$addr"; then
+      log "mesh address ${addr} is up"
+      return 0
+    fi
+    [ "$waited" -lt "$MESH_ADDRESS_WAIT_SECS" ] || break
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  warn "mesh address ${addr} not up after ${MESH_ADDRESS_WAIT_SECS}s; the node was restarted anyway and will listen on all interfaces until you restart it"
+  return 1
+}
+
 restart_node() {
   local runtime_dir="/run/user/${TARGET_UID}"
   local by_hand="systemctl --user restart ${USER_SERVICE}"
+  # Before the restart, not after: restarting into an address that is not there
+  # yet is exactly the fallback this function exists to get the node out of.
+  wait_for_mesh_address "$MESH_IP" || true
   if [ "$DRY_RUN" = "1" ]; then
     dry "runuser -u ${TARGET_USER} -- env XDG_RUNTIME_DIR=${runtime_dir} systemctl --user restart ${USER_SERVICE}"
     return 0

@@ -102,6 +102,11 @@
           <label for="mesh-secret">Existing mesh secret</label>
           <input id="mesh-secret" type="text" autocomplete="off" spellcheck="false">
         </p>
+        <p class="field">
+          <label for="mesh-peer">A machine already in the fleet (address)</label>
+          <input id="mesh-peer" type="text" autocomplete="off" spellcheck="false" placeholder="192.0.2.1">
+        </p>
+        <p class="hint">Address of a machine already in the fleet, if this is not the first one. A name or an IP; the mesh listener port is assumed unless you add one.</p>
         <p class="actions"><button type="submit" class="primary">Stage this secret</button></p>
       </form>
       <div id="mesh-reveal" hidden>

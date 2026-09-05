@@ -153,9 +153,17 @@ needs a terminal, and only once." (`ui/index.html:51`).
    (**new in S7**); until it does, `/api/ui/state` keeps reporting `setup.identity: false` while the
    value on disk is already the new one.
 2. **Mesh network.** "Generate a new secret" on the first machine of a fleet, or "I already have
-   one" on the second (`ui/index.html:87-101`). Either way the details are staged to a 0600 file
-   under the state directory and the card shows the one root step (`ui/index.html:87-111`,
-   `src/node.ts:820-823`).
+   one" on the second (`ui/index.html:87-101`). The "I already have one" form carries a second,
+   optional field, **"A machine already in the fleet (address)"**, with the hint "Address of a
+   machine already in the fleet, if this is not the first one." (**new in S7**). The first machine
+   leaves it empty. The second machine fills it, because it is the only way that machine has of
+   reaching the first one: `/pair/hello` travels over the mesh, so the mesh has to form before the
+   Pair screen can do anything at all, and until this field existed the address could only be typed
+   as a `--peer=` flag on the sudo line that no screen ever printed. It takes what a person has to
+   hand -- `192.0.2.1`, `192.0.2.1:11010`, `alpha.local`, `[2001:db8::1]:11010` -- and a missing
+   port means 11010, the mesh listener port the other machine's own install opened. Either way the
+   details are staged to a 0600 file under the state directory and the card shows the one root step
+   (`ui/index.html:87-111`, `src/node.ts:820-823`).
 3. **Admin credential.** Optional, off by default. Skipping it costs the admin lane and nothing
    else.
 4. **Pair.** Section 2.6, after the mesh is up.
@@ -230,6 +238,17 @@ that user has no runtime directory, the script warns and prints `systemctl --use
 sukarfleet.service` for them to run instead of failing an install that is otherwise complete. It
 does not run on the exit-5 path where the mesh service failed to start: the address still does not
 exist there, so a restart would only put the node back where it already is.
+
+The restart waits first (**new in S7**). "`easytier-fleet.service` is active" and "the mesh address
+is on an interface" are not the same moment: the TUN device is configured a second or two later,
+and a restart into that gap put the node straight back on the 0.0.0.0 fallback, with nothing left
+on the machine that would ever restart it again. So the stage polls `ip -o -4 addr` once a second
+for up to 15 seconds before restarting, matching the address exactly rather than as a substring,
+and logs `[install-elevated] mesh address <ip> is up` when it appears. The wait is bounded and then
+gives up out loud: on timeout it prints `[install-elevated] WARNING: mesh address <ip> not up after
+15s; the node was restarted anyway and will listen on all interfaces until you restart it` and
+restarts anyway. A node on the fallback is at least a node that is running, and the console's Mesh
+card already renders `meshBindFallback` as a sentence with the way out of it.
 
 ### 2.6 Pairing machine A and machine B
 
@@ -409,26 +428,37 @@ contain the invoking user's `~/.bun/bin`; the user stage resolved a bun path alr
 
 #### The staged file
 
-The console's Mesh card is to write JSON: `{ "networkName", "networkSecret", "meshIp",
-"listeners" }`, for example `{"networkName":"sukarfleet","networkSecret":"...","meshIp":"192.0.2.3",
-"listeners":["tcp://0.0.0.0:11010","udp://0.0.0.0:11010"]}`. **Deferred, not shipped in S7.** The
-console still writes a bare secret and a newline (`src/node.ts:851-859`), and `POST
-/api/ui/setup/network-secret` still accepts only `{action:"generate"}` or `{action:"stage", secret}`
-(`src/uiserve.ts:683-703`). The elevated stage reads both shapes already -- JSON when it finds it,
-a bare secret otherwise, filling the missing fields from the invoking user's `config.json` -- so
-the staging change can land on its own later without touching the root stage. Moving the mesh IP
-off the **Identity** card (`ui/index.html:68-71`) and next to the secret is deferred with it: the
-two belong together because they are what the one root command consumes, and the Identity card is
-where the mesh IP is typed today. What that costs until then is one failure mode, and section 6
-carries it: the root line run before the Identity card was filled refuses with `no mesh IP` and
-writes nothing. Listeners default to the pair the Windows installer builds
-(`Install-Sukarfleet.ps1:405`) and are not exposed in the card in v1. Either way the file goes
+The staged file has two shapes and the elevated stage reads both. **A peer was named:** the Mesh
+card writes JSON, for example
+
+```json
+{"networkName":"sukarfleet","networkSecret":"...","meshIp":"192.0.2.3","hostname":"beta","peers":["tcp://192.0.2.1:11010"]}
+```
+
+**No peer was named** (the first machine of a fleet): the card writes the bare secret and a
+newline, byte for byte as it always has. That split is deliberate. `peers` is the only field the
+bare form has no room for and the only one that cannot be recovered from anywhere else, so it is
+the only thing worth changing the file's shape for; every other machine already staged is reading
+its own bare file and must keep working unchanged. The key the reader takes the machine name from
+is `hostname`, not `machine` -- an unknown key is dropped on the floor there without a word
+(`install-elevated.sh:read_staged`). `peers` entries are `tcp://host:port`, normalized by
+`parseMeshPeer` in `src/uiserve.ts` from whatever was typed in the card, and the daemon reads
+`networkName` / `meshIp` / `hostname` back off `config.json` rather than out of its own live `cfg`:
+the Identity card writes that file without mutating the running config, so a copy taken from `cfg`
+could be one restart stale, and a staged `meshIp` OUTRANKS `config.json` in the root stage
+(`${STAGED_MESHIP:-$CFG_MESH_IP}`). `GET /api/ui/setup/network-secret` parses both shapes and
+returns the secret either way, because it is the secret that gets copied to the other machine,
+never the file. **Still deferred:** `listeners`, which stay the default pair the Windows installer
+builds (`Install-Sukarfleet.ps1:405`) and are exposed in neither console; and moving the mesh IP off
+the **Identity** card (`ui/index.html:68-71`) to sit next to the secret, which is where it belongs
+because the two are what the one root command consumes. What that second one costs is one failure
+mode, and section 6 carries it: the root line run before the Identity card was filled refuses with
+`no mesh IP` and writes nothing. Either way the file goes
 through `writeSecretFile`, which creates it at 0600 via a temp file and a rename so it is never
 briefly world readable (`src/keys.ts:84-100`, `SECRET_FILE_MODE` at `:16`), and the secret is never
 an argument to anything, so it reaches no command line, no shell history and no `ps` output
-(`src/node.ts:820-822`). Changing the mesh IP or the secret later is an edit in the console and a
-re-run of the same sudo line: the stage is idempotent, rewrites the TOML from whatever is staged,
-and restarts the unit.
+(`src/node.ts:820-822`). Changing the mesh IP, the secret or the peer later is an edit in the
+console and a re-run of the same sudo line -- section 4 has the sequence.
 
 #### Reading the staged file safely
 
@@ -494,6 +524,17 @@ rewritten from the template every run, which is how a moved checkout gets a corr
 pin. The elevated stage rewrites the same sudoers drop-in, revalidates it, rewrites the TOML from
 whatever is staged, and leaves an already-installed EasyTier alone unless a reinstall is asked for;
 re-running is the intended upgrade path (`install-elevated.sh:19-20`).
+
+**Changing the mesh secret or the peer after the install.** Through the Mesh card again, and there
+is no flag for it (**new in S7**). Open "I already have one", paste the secret again, fill or
+change the address field, stage, and re-run the same sudo line. The root stage is idempotent: it
+reads whatever is staged, rewrites `/etc/easytier/fleet.toml`, restarts `easytier-fleet.service`
+and then the node. Re-running it with `--peer=` and nothing staged is refused with `nothing is
+staged`, and that refusal is correct rather than a gap -- the staged file was shredded on adoption,
+so there is no secret left to write a TOML from, and a flag that could rewrite the mesh
+configuration without one would be a second, quieter way to do the thing the console is for. The
+Mesh card says as much once the secret is installed: "Installed. To change the secret or the peer,
+stage again here and re-run the same sudo line." (`ui/app.js`, `clients/tray/src/console.js`).
 
 **An upgrade run** is the same command with a newer tag. Restart discipline here is not the
 installer's to invent: `docs/CUTOVER.md` requires a graceful `systemctl --user stop` and a `git
