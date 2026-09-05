@@ -30,6 +30,14 @@ export interface SyncerDeps {
   onStep?: () => void;
 }
 
+// What one sync cycle observed that a caller outside the Syncer needs. Deliberately narrow: the
+// per-repo stats keep flowing through SyncerDeps.onRepoStat, and callers that only drive the cycle
+// (`await syncer.syncOnce(repo)`) can go on ignoring the return value.
+export interface SyncOnceResult {
+  // Did the origin fetch succeed this cycle? null when the repo has no origin remote configured.
+  originFetchOk: boolean | null;
+}
+
 export interface SyncerOptions {
   sleep?: (ms: number) => Promise<void>;
   debounceMs?: number;
@@ -137,7 +145,18 @@ export class Syncer {
     }
   }
 
-  async syncOnce(repo: RepoConfig): Promise<void> {
+  // originFetchOk answers one question for P3's single-pusher gate in node.ts: did THIS cycle
+  // actually reach origin, the repo derive force-pushes main to? `null` means the repo has no
+  // origin remote configured, so there was nothing to reach and nothing to push. `false` covers
+  // both a failed fetch and a cycle that threw before fetchAll ran -- either way this machine has
+  // no fresh view of origin, which is exactly when a roamer must not take over the push.
+  //
+  // A cycle that throws AFTER a successful fetchAll still reports true, deliberately: the question
+  // is whether origin was reached this cycle, and it was. The later step that failed (merge,
+  // postMerge, pushOrigin) is reported through onRepoStat's syncError, and the lease baseline this
+  // answer exists to vouch for is genuinely fresh.
+  async syncOnce(repo: RepoConfig): Promise<SyncOnceResult> {
+    let originFetchOk: boolean | null = false;
     try {
       const branchR = await this.gitOk(repo.path, ['symbolic-ref', '--short', 'HEAD']);
       const branch = branchR.stdout.trim();
@@ -153,13 +172,14 @@ export class Syncer {
         log('info', 'clock unvetted; skipping auto-commit', { repo: repo.name });
       }
 
-      await this.fetchAll(repo);
+      originFetchOk = await this.fetchAll(repo);
       const { mergedAny, unionRegenNeeded } = await this.mergePeers(repo, vetted);
       await this.runPostMerge(repo, mergedAny, unionRegenNeeded);
       await this.pushOrigin(repo);
 
       const lastCommit = await this.head(repo.path);
       this.deps.onRepoStat(repo.name, { lastSyncOkMs: this.now(), lastCommit, syncError: null });
+      return { originFetchOk };
     } catch (err) {
       // Never leave the repo wedged mid-merge.
       await this.git(repo.path, ['merge', '--abort']).catch(() => {});
@@ -167,6 +187,7 @@ export class Syncer {
       const msg = err instanceof Error ? err.message : String(err);
       log('error', 'sync cycle failed', { repo: repo.name, error: msg });
       this.deps.onRepoStat(repo.name, { lastSyncOkMs: null, lastCommit, syncError: msg });
+      return { originFetchOk };
     }
   }
 
@@ -210,9 +231,19 @@ export class Syncer {
   }
 
   // (2) fetch origin + every fleet-<peer>, tolerating unreachable remotes.
-  private async fetchAll(repo: RepoConfig): Promise<void> {
+  // Returns whether the origin fetch succeeded this cycle (null: no origin remote configured).
+  // Unreachable fleet peers stay tolerated and do not affect the answer -- during a real anchor
+  // outage the fleet-<anchor> fetch fails by construction, since the anchor's git server lives
+  // inside the daemon that just died, and that is the case takeover exists for.
+  private async fetchAll(repo: RepoConfig): Promise<boolean | null> {
     const remotesR = await this.git(repo.path, ['remote']);
+    // `git remote` itself failed, so this cycle cannot even tell whether an origin exists. Report
+    // false, not null: null means "no origin remote, nothing to veto", and an unanswerable question
+    // must not read as a licence to take over the push. Nothing is fetched either way -- the loop
+    // below would find an empty remote set.
+    if (remotesR.code !== 0) return false;
     const present = new Set(remotesR.stdout.split('\n').map((s) => s.trim()).filter(Boolean));
+    let originFetchOk: boolean | null = null;
     for (const remote of this.remoteNames()) {
       if (!present.has(remote)) continue;
       // fleet-<peer> remotes are served by gitserve.ts, which requires a signed
@@ -237,6 +268,9 @@ export class Syncer {
       const startedMs = this.now();
       const r = await this.git(repo.path, args, timeoutMs);
       const durationMs = this.now() - startedMs;
+      // Keyed on the remote name, not on !isFleet: origin is the push target, and this must not
+      // start tracking some other non-fleet remote if remoteNames() ever grows one.
+      if (remote === 'origin') originFetchOk = r.code === 0;
       if (r.code !== 0) {
         const timedOut = r.code === 124 && durationMs >= timeoutMs - TIMEOUT_SLACK_MS;
         const detail = { repo: repo.name, remote, code: r.code, stderr: r.stderr.trim().slice(0, 300) };
@@ -259,6 +293,7 @@ export class Syncer {
         this.fetchGate.observe(`fetch:${repo.name}:${remote}`, false);
       }
     }
+    return originFetchOk;
   }
 
   // (3) merge each peer's newest sync/<peer> tip into sync/<machine> with conflict rules.

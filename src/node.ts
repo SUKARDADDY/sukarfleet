@@ -211,11 +211,34 @@ export const TAKEOVER_STREAK = 2;
 // anchorDaemonOnlineFromGossip below returns null exactly then, since gossip.getPeerViews always
 // returns one PeerView per configured peer and `online` on each is a plain boolean, never null.
 //
-// KNOWN HONESTY LIMIT (accepted, self-healing): a roamer that takes over on this signal may push
-// its own last-fetched (possibly stale) refs if the mesh itself is also down -- the daemon
-// heartbeat and the transport are different failure axes, and this gate only observes the former.
-// A subsequent successful fetch/merge cycle corrects it; there is no dual-pusher risk either way,
-// since a stale push is still exactly one push.
+// KNOWN HONESTY LIMIT (accepted, bounded): a roamer that takes over on this signal may push its
+// own last-fetched (possibly stale) refs if the mesh itself is also down -- the daemon heartbeat
+// and the transport are different failure axes, and this gate only observes the former. A
+// subsequent successful fetch/merge cycle corrects it.
+//
+// What an earlier version of this comment wrongly waved away as "no dual-pusher risk either way":
+// the takeover signal is receive-side, so an ordinary network change on the ROAMER is enough to
+// stop the anchor's gossip from arriving. The streak reaches TAKEOVER_STREAK and the roamer starts
+// force-pushing a main built from its last-fetched refs while the anchor, perfectly alive, keeps
+// force-pushing its own -- two divergent pushers on one refs/heads/main. Three things bound that
+// now, none of them a change to this gate, which stays pure and unchanged:
+//   1. derive.ts pushes the derived main under --force-with-lease against the last-fetched
+//      refs/remotes/origin/main, so no single push discards a main this machine had not seen: it
+//      is refused and logged. That is a guarantee about one push and nothing more -- every cycle
+//      fetches origin, which refreshes the baseline, so the next lease is valid again.
+//   2. The yield rule, which is the actual defence. Before a roamer takes over for a repo, node.ts
+//      asks derive.originMainMovedByOther: if origin's main now holds a sha this machine did not
+//      push, somebody else is demonstrably pushing, so the roamer stands down for that repo and
+//      resets its streak -- whatever gossip says about the anchor's heartbeat.
+//   3. derive.ts retries a refused push at most derive.MAX_PUSH_RETRIES times and then leaves
+//      origin alone until inputs change, so a machine losing the argument stops arguing.
+//
+// What honestly remains: a roamer whose own inputs change can push ONCE before it observes the
+// other pusher and yields. So during a mesh-only partition main can still alternate a bounded
+// number of times -- one round per roamer input change, not one per tick -- and it stops the moment
+// the roamer sees a main it did not push. It self-heals when the mesh returns and gossip resets the
+// streak. The origin-fetch veto in pushAllowedForRepo is a narrow guard on top of this, not the
+// main defence: see its comment for the exact (small) shape of what it catches.
 export function shouldPushThisTick(
   role: 'anchor' | 'roamer',
   anchorDaemonOnline: boolean | null,
@@ -226,6 +249,46 @@ export function shouldPushThisTick(
   // pusher -- restores the pre-P3 behavior for that shape of config.
   if (anchorDaemonOnline === null) return true;
   return anchorDaemonOnline === false && streak >= TAKEOVER_STREAK;
+}
+
+// Per-repo veto layered on top of shouldPushThisTick, which stays pure and unchanged above. Only a
+// ROAMER that is pushing BECAUSE it read the anchor daemon offline is a takeover, and there are two
+// independent reasons to refuse one for a given repo.
+//
+// originFetchOk === false -- this cycle never reached origin. Worth being honest about how little
+// this catches: the takeover fires whenever the ANCHOR's gossip stops arriving, and in most of
+// those shapes (mesh/EasyTier down, LAN change, VPN, firewall on the mesh port) the roamer still
+// reaches GitHub perfectly well, so this reads true and the takeover stands. It refuses only the
+// roamer that is fully offline -- the one that could not have pushed anyway. It is kept because it
+// costs nothing, and because a machine that cannot see origin is holding a stale lease baseline and
+// has no business trying; it is a narrow guard, not the defence against two pushers.
+//
+// originMovedByOther === true -- origin's main moved under a push this machine did not make. That
+// is direct evidence of another live pusher, and it is the veto that actually bounds the two-pusher
+// window (see shouldPushThisTick's honesty note). node.ts computes it from
+// derive.originMainMovedByOther after the cycle's fetch, for roamers only and only on a tick that
+// would otherwise push, and resets the takeover streak at the call site.
+//
+// Why the ORIGIN fetch and not the fleet-peer fetch: during a genuine anchor outage the
+// fleet-<anchor> fetch fails by construction (the anchor's git server lives inside the daemon that
+// died), so gating on fleet fetches would veto precisely the case takeover exists for.
+//
+// Untouched by design: the anchor (never a takeover), a roamer whose push decision was already
+// false, and a solo roamer with no configured peers (anchorDaemonOnline null, so no anchor was
+// deferred to and nothing was taken over). originFetchOk null means the repo has no origin remote
+// at all -- nothing to fetch, nothing to push to, no reason to veto.
+export function pushAllowedForRepo(
+  role: 'anchor' | 'roamer',
+  push: boolean,
+  anchorDaemonOnline: boolean | null,
+  originFetchOk: boolean | null,
+  originMovedByOther: boolean,
+): boolean {
+  if (!push) return false;
+  if (role !== 'roamer') return true;
+  if (anchorDaemonOnline !== false) return true; // not a takeover
+  if (originFetchOk === false) return false;
+  return !originMovedByOther;
 }
 
 // Reads the anchor daemon's liveness the same way transport.ts's anchorReachable() identifies
@@ -1292,14 +1355,49 @@ async function main(): Promise<void> {
     for (const repo of cfg.repos) {
       if (!adopted.has(repo.name)) continue; // never sync on main
 
-      await syncer.syncOnce(repo);
+      const sync = await syncer.syncOnce(repo);
+      // Yield check, roamer-only and only on a tick that would otherwise push: a push:false tick
+      // costs nothing new, and the anchor never asks. It reads refs/remotes/origin/main as the
+      // fetch above just left it -- one local rev-parse, no network. A main this machine did not
+      // push means somebody else is pushing, so stand down for this repo and drop the streak, which
+      // makes the roamer wait out another full TAKEOVER_STREAK before it considers taking over
+      // again. The streak lives here, not in the pure gate, which is why the reset is at the call
+      // site.
+      let originMovedByOther = false;
+      if (cfg.role === 'roamer' && push) {
+        originMovedByOther = await derive.originMainMovedByOther(repo.path);
+        if (originMovedByOther) {
+          log('info', 'derive: main on origin moved by another pusher, yielding takeover', {
+            repo: repo.name,
+          });
+          anchorDownStreak = 0;
+        }
+      }
+      // Per-repo veto on the tick's decision. One line per repo per tick when it fires, at info --
+      // a refused takeover is the difference between one pusher and two, so it must be visible in
+      // a normal log rather than only under debug. The yield above logs its own reason, so this
+      // line is only for the other veto: the repo whose origin fetch failed this cycle.
+      const repoPush = pushAllowedForRepo(
+        cfg.role,
+        push,
+        anchorDaemonOnlineNow,
+        sync.originFetchOk,
+        originMovedByOther,
+      );
+      if (push && !repoPush && !originMovedByOther) {
+        log('info', 'derive: takeover push refused, origin fetch failed this cycle', {
+          repo: repo.name,
+        });
+      }
       try {
-        const derived = await derive.updateMain(repo.path, { push });
-        // A fresh sha existed and this machine sat it out -- the durable "who pushes" signal is
-        // the absence of a force-push race, not a log line, so this stays at debug. Skipped for
-        // 'unchanged-inputs': that tick minted nothing, so there was never anything to suppress.
+        const derived = await derive.updateMain(repo.path, { push: repoPush });
+        // A fresh sha existed and this machine sat it out. At info, not debug: who pushed is an
+        // operational fact, and this is the line that says the roamer is deferring rather than
+        // racing the anchor -- at one line per repo per sync tick, cheap enough to keep in a
+        // normal log. Skipped for 'unchanged-inputs': that tick minted nothing, so there was
+        // never anything to suppress.
         if (cfg.role === 'roamer' && derived.skipped === 'push-suppressed-non-owner') {
-          log('debug', 'derive: push suppressed this tick, anchor is the pusher', {
+          log('info', 'derive: push suppressed this tick, anchor is the pusher', {
             repo: repo.name,
             sha: derived.sha,
           });

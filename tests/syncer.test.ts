@@ -328,6 +328,38 @@ test('push retry on a broken origin records failure without throwing', async () 
   expect(recA.stats.at(-1)!.lastSyncOkMs).not.toBeNull();
 });
 
+test('syncOnce reports whether origin was reachable this cycle (P3 takeover gate input)', async () => {
+  // null: no origin remote at all. setupPair leaves dirA without one.
+  const { dirA, syncA, repoA } = await setupPair({ 'foo.txt': 'base\n' });
+  expect((await syncA.syncOnce(repoA)).originFetchOk).toBeNull();
+
+  // false: origin configured but unreachable. The cycle itself still succeeds -- only the answer
+  // to "did we see origin" changes, which is what P3's per-repo veto reads.
+  await git(dirA, ['remote', 'add', 'origin', 'file:///nonexistent/nope.git']);
+  const broken = await syncA.syncOnce(repoA);
+  expect(broken.originFetchOk).toBe(false);
+
+  // true: a real bare origin.
+  const bare = join(base, 'reachable-origin.git');
+  await git(base, ['init', '-q', '--bare', bare]);
+  await git(dirA, ['remote', 'set-url', 'origin', `file://${bare}`]);
+  expect((await syncA.syncOnce(repoA)).originFetchOk).toBe(true);
+});
+
+test('a cycle that fails before fetchAll reports originFetchOk false, never a stale true', async () => {
+  // Single-writer guard trips on the wrong HEAD, so fetchAll never runs. A takeover must not be
+  // allowed on a cycle that never looked at origin.
+  const dir = join(base, 'origin-fetch-early-throw');
+  await initRepo(dir, 'alpha'); // HEAD is 'main', not sync/alpha: syncOnce throws immediately
+  await git(dir, ['remote', 'add', 'origin', 'file:///nonexistent/nope.git']);
+  const rec = recorder();
+  const s = new Syncer(makeConfig('alpha', [], dir), rec.deps, FAST);
+
+  const res = await s.syncOnce({ name: 'r', path: dir });
+  expect(res.originFetchOk).toBe(false);
+  expect(rec.stats.at(-1)!.syncError).toContain('refusing sync');
+});
+
 test('push to a healthy bare origin reports a timestamp', async () => {
   const { dirA, syncA, recA, repoA } = await setupPair({ 'foo.txt': 'base\n' });
   const bare = join(base, 'origin.git');
