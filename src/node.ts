@@ -29,6 +29,7 @@ import * as endpoints from './endpoints';
 import * as derive from './derive';
 import * as gitserve from './gitserve';
 import { join, dirname } from 'node:path';
+import { networkInterfaces } from 'node:os';
 
 import {
   AuditLog,
@@ -56,6 +57,7 @@ import { readCappedBody, DEFAULT_MAX_BODY_BYTES, BODY_READ_TIMEOUT_MS } from './
 import { randomBytes } from 'node:crypto';
 import { SshAdmin } from './sshadmin';
 import { Pairing } from './pairing';
+import { currentPlatform } from './platform';
 import { UiRoutes, elevatedInstallCommand, type UiRoutesDeps } from './uiserve';
 import * as secrets from './secrets';
 
@@ -394,6 +396,82 @@ export function buildAdminLaneView(args: BuildAdminLaneViewArgs): UiAdminLaneVie
   };
 }
 
+// --- Where the peer-facing server binds (Class H: the fresh-machine deadlock) ------------------
+//
+// cfg.meshIp is set by the console's Identity card, but the address itself only exists once
+// EasyTier is installed and up, which is the sudo step AFTER that card. A daemon that insists on
+// binding it in between dies at boot, systemd restarts it every 3s, and the console the user needs
+// in order to reach the sudo step is gone. So a mesh address that is not on this machine yet is a
+// reason to listen on 0.0.0.0 and say so, not a reason to fail.
+//
+// The bind error cannot be trusted to tell the two cases apart. Bun 1.3.14 reports
+// `code: 'EADDRINUSE'`, `errno: 0` and "Failed to start server. Is port N in use?" for a genuine
+// in-use port AND for EADDRNOTAVAIL -- verified by binding 192.0.2.1 (TEST-NET-1, on no
+// interface) on a free port. What does distinguish them is the machine's own address list, so
+// that is what these two decide on; the error code is only consulted to keep a real in-use port
+// from being read as an absent address.
+
+/** Bind hosts that are not an address of this machine's: they mean "every interface". */
+const WILDCARD_BIND_HOSTS = new Set(['0.0.0.0', '::', '']);
+
+/** Case, surrounding space, and the `%zone` suffix networkInterfaces() puts on link-local IPv6. */
+function normalizeAddress(addr: string): string {
+  const zone = addr.indexOf('%');
+  return (zone === -1 ? addr : addr.slice(0, zone)).trim().toLowerCase();
+}
+
+function isLocalAddress(host: string, localAddresses: readonly string[]): boolean {
+  const want = normalizeAddress(host);
+  return localAddresses.some((a) => normalizeAddress(a) === want);
+}
+
+export interface BindChoice {
+  /** The hostname to hand Bun.serve. */
+  host: string;
+  /** True iff a mesh address was configured and this is 0.0.0.0 instead of it. */
+  fallback: boolean;
+}
+
+/**
+ * Picks the peer-facing bind host before anything is bound. Pure: `localAddresses` is every
+ * address of every interface on this machine (node.ts passes networkInterfaces()).
+ */
+export function chooseBindHost(meshIp: string, localAddresses: readonly string[]): BindChoice {
+  if (meshIp.length === 0) return { host: '0.0.0.0', fallback: false };
+  if (isLocalAddress(meshIp, localAddresses)) return { host: meshIp, fallback: false };
+  return { host: '0.0.0.0', fallback: true };
+}
+
+export type BindFailure = 'in-use' | 'address-unavailable';
+
+/**
+ * Reads a Bun.serve bind failure. 'in-use' means the port is genuinely taken and the caller must
+ * let the error through with Bun's own message; 'address-unavailable' means the host is not an
+ * address this machine has, and listening on 0.0.0.0 instead is the right answer.
+ */
+export function classifyBindError(host: string, err: unknown, localAddresses: readonly string[]): BindFailure {
+  // A wildcard bind cannot fail for want of an address, so only the port can be the problem.
+  if (WILDCARD_BIND_HOSTS.has(normalizeAddress(host))) return 'in-use';
+  // Bun mislabels EADDRNOTAVAIL as EADDRINUSE, so the address list outranks the code.
+  if (!isLocalAddress(host, localAddresses)) return 'address-unavailable';
+  const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+  return code === 'EADDRINUSE' ? 'in-use' : 'address-unavailable';
+}
+
+/** The one sentence the daemon logs and the console repeats when the mesh address is not up. */
+export function meshBindFallbackWarning(meshIp: string): string {
+  return `node: mesh address ${meshIp} is not on any interface yet -- listening on all interfaces until the mesh is up and the daemon restarts`;
+}
+
+/** Every address of every interface on this machine, in networkInterfaces() order. */
+function localBindAddresses(): string[] {
+  const out: string[] = [];
+  for (const addrs of Object.values(networkInterfaces())) {
+    for (const a of addrs ?? []) out.push(a.address);
+  }
+  return out;
+}
+
 // --- Shape guards for the loopback-only CLI-facing exec routes (see fetchHandler below) --------
 // These mirror execroutes.ts's isSignedJobShape style: cheap, non-throwing structural checks on
 // caller-supplied JSON before it ever reaches jobqueue.ts/membership.ts.
@@ -469,7 +547,7 @@ async function main(): Promise<void> {
   // at startup and as ClockSentinel's post-resume republish step.
   async function republishEndpoint(): Promise<void> {
     try {
-      const [wanIp, lanIpAddr] = await Promise.all([endpoints.probeWanIp(), endpoints.lanIp()]);
+      const [wanIp, lanIpAddr] = await Promise.all([endpoints.probeWanIp(), endpoints.lanIp(undefined, { meshIp: cfg.meshIp })]);
       if (lanIpAddr === null) {
         log('warn', 'endpoint publish skipped: no LAN IPv4 address detected');
         return;
@@ -835,8 +913,21 @@ async function main(): Promise<void> {
     if (await Bun.file(pendingSecretPath).exists().catch(() => false)) return 'pending';
     const now = nowMs();
     if (!meshServiceActive || now - meshServiceActive.atMs >= MESH_STATE_TTL_MS) {
-      const res = await run(['systemctl', 'is-active', 'easytier-fleet.service'], { timeoutMs: 5000 });
-      meshServiceActive = { atMs: now, active: res.code === 0 };
+      // Asked of the platform's service manager, and never allowed to throw: this runs on every
+      // console poll, and a missing systemctl (Windows) used to take the whole state builder down.
+      const platform = currentPlatform();
+      const argv =
+        platform === 'windows'
+          ? ['sc', 'query', 'easytier-fleet']
+          : ['systemctl', 'is-active', 'easytier-fleet.service'];
+      let active = false;
+      try {
+        const res = await run(argv, { timeoutMs: 5000 });
+        active = res.code === 0 && (platform !== 'windows' || /\bRUNNING\b/.test(res.stdout));
+      } catch {
+        active = false;
+      }
+      meshServiceActive = { atMs: now, active };
     }
     return meshServiceActive.active ? 'installed' : 'none';
   }
@@ -944,6 +1035,11 @@ async function main(): Promise<void> {
     await run(['systemctl', '--user', 'restart', 'sukarfleet.service'], { timeoutMs: 10000 });
   }
 
+  // Set once, at the bind below, and read by buildUiState on every poll. Declared here rather
+  // than next to the bind because the closure that reads it is defined first; the bind runs long
+  // before any request can arrive, so a poll never sees the initial value by accident.
+  let meshBindFallback = false;
+
   async function buildUiState(): Promise<UiState> {
     const now = nowMs();
     const views = new Map(gossip.getPeerViews(now).map((p) => [p.name, p]));
@@ -1011,6 +1107,7 @@ async function main(): Promise<void> {
         meshSecret,
         credential: credentialReady,
         paired,
+        meshBindFallback,
         // import.meta.dir is src/, so its parent is the checkout get.sh made --
         // and it survives the daemon being started from any cwd, or from none,
         // which is what a systemd unit does.
@@ -1201,25 +1298,45 @@ async function main(): Promise<void> {
   // Peer-facing surfaces (/gossip, /git) are bound to the mesh interface only, not every
   // interface on the host; /status additionally gets a dedicated loopback-only listener so
   // the CLI (which always dials 127.0.0.1) keeps working without widening the peer surface.
-  const meshBindHost = cfg.meshIp.length > 0 ? cfg.meshIp : '0.0.0.0';
-  if (meshBindHost === '0.0.0.0') {
+  //
+  // cfg.meshIp is configured one step BEFORE the address exists (see chooseBindHost above), so a
+  // mesh address that is not on any interface yet means "listen everywhere and say so", never a
+  // failed boot. The pre-check decides; the catch is the race between checking and binding.
+  const localAddresses = localBindAddresses();
+  const choice = chooseBindHost(cfg.meshIp, localAddresses);
+  let meshBindHost = choice.host;
+  meshBindFallback = choice.fallback;
+  if (cfg.meshIp.length === 0) {
     log('warn', 'node: no meshIp configured -- peer-facing server binding to 0.0.0.0 (all interfaces)', {});
+  } else if (meshBindFallback) {
+    log('warn', meshBindFallbackWarning(cfg.meshIp), { port: cfg.nodePort });
   }
-  const meshServer = Bun.serve({
-    hostname: meshBindHost,
-    port: cfg.nodePort,
-    idleTimeout: 0,
-    fetch: fetchHandler,
-  }) as unknown as MinimalServer;
+  const serveOn = (hostname: string): MinimalServer =>
+    Bun.serve({
+      hostname,
+      port: cfg.nodePort,
+      idleTimeout: 0,
+      fetch: fetchHandler,
+    }) as unknown as MinimalServer;
+  let meshServer: MinimalServer;
+  try {
+    meshServer = serveOn(meshBindHost);
+  } catch (err) {
+    if (classifyBindError(meshBindHost, err, localAddresses) === 'in-use') {
+      // Genuinely taken. Bun's own message names the port, and a daemon that quietly listened
+      // somewhere else instead would be worse than one that refuses to start.
+      log('error', 'node: peer-facing port is already in use', { host: meshBindHost, port: cfg.nodePort });
+      throw err;
+    }
+    log('warn', meshBindFallbackWarning(meshBindHost), { port: cfg.nodePort, error: String(err) });
+    meshBindHost = '0.0.0.0';
+    meshBindFallback = true;
+    meshServer = serveOn(meshBindHost);
+  }
   const statusServer =
     meshBindHost === '127.0.0.1' || meshBindHost === '::1' || meshBindHost === '0.0.0.0'
       ? null
-      : (Bun.serve({
-          hostname: '127.0.0.1',
-          port: cfg.nodePort,
-          idleTimeout: 0,
-          fetch: fetchHandler,
-        }) as unknown as MinimalServer);
+      : serveOn('127.0.0.1');
 
   // --- Loops -------------------------------------------------------------
   const gossipLoop = scheduleLoop('gossip', cfg.intervals.gossipSec * 1000, async () => {

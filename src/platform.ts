@@ -35,6 +35,22 @@ const DEFAULT_TIMEOUT_MS = 10000;
 
 const defaultRunner: Runner = (argv, opts) => run(argv, { timeoutMs: opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS });
 
+// The shell's "command not found". A seam reports an absent tool as a non-zero result carrying the
+// reason, never as an exception.
+const SPAWN_FAILED_CODE = 127;
+
+// Bun.spawn raises ENOENT when the binary does not exist, and that is not a hypothetical: the first
+// real Windows boot of this daemon died on `uv_spawn 'timedatectl'`. A seam that lets that through
+// is failing obscurely, which is exactly what rule 2 above forbids. Absent tool and failed tool
+// arrive at the call site as the same shape -- a non-zero exit whose stderr says what happened.
+async function runSeam(runner: Runner, argv: string[], opts?: { timeoutMs?: number }): Promise<RunResult> {
+  try {
+    return await runner(argv, opts);
+  } catch (err) {
+    return { code: SPAWN_FAILED_CODE, stdout: '', stderr: `could not run ${argv[0]}: ${String(err)}` };
+  }
+}
+
 export function currentPlatform(): PlatformId {
   switch (process.platform) {
     case 'linux':
@@ -72,7 +88,7 @@ const linuxServiceManager: ServiceManager = {
   platform: 'linux',
   support: 'supported',
   async restart(serviceName, runner = defaultRunner) {
-    const res = await runner(['sudo', '-n', 'systemctl', 'restart', serviceName]);
+    const res = await runSeam(runner, ['sudo', '-n', 'systemctl', 'restart', serviceName]);
     return res.code === 0
       ? { ok: true, detail: `systemctl restarted ${serviceName}` }
       : { ok: false, detail: `systemctl restart failed (exit ${res.code}): ${res.stderr.slice(0, 300)}` };
@@ -87,7 +103,7 @@ const macosServiceManager: ServiceManager = {
     // equivalent to `systemctl restart`. The gui/<uid> domain matches a per-user agent, which is
     // what this daemon installs as.
     const target = `gui/${process.getuid?.() ?? 501}/${serviceName}`;
-    const res = await runner(['launchctl', 'kickstart', '-k', target]);
+    const res = await runSeam(runner, ['launchctl', 'kickstart', '-k', target]);
     return res.code === 0
       ? { ok: true, detail: `launchctl kickstarted ${target}` }
       : { ok: false, detail: `launchctl kickstart failed (exit ${res.code}): ${res.stderr.slice(0, 300)}` };
@@ -98,7 +114,7 @@ const windowsServiceManager: ServiceManager = {
   platform: 'windows',
   support: 'experimental',
   async restart(serviceName, runner = defaultRunner) {
-    const res = await runner([
+    const res = await runSeam(runner, [
       'powershell',
       '-NoProfile',
       '-NonInteractive',
@@ -578,5 +594,129 @@ export function storePrivacyProbeFor(platform: PlatformId = currentPlatform()): 
       return roundTripPrivacyProbe('windows', 'experimental');
     default:
       return roundTripPrivacyProbe('unknown', 'unsupported');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Clock synchronisation probe
+//
+// Newest-wins conflict resolution and the audit chain both read this machine's wall clock, so the
+// daemon refuses to auto-commit until something has vouched for it. That check used to be one
+// inline `timedatectl` call, which is a Linux answer to a question every platform has: the first
+// real Windows boot died on `uv_spawn 'timedatectl'` before it ever served a request.
+//
+// This seam obeys both rules at the top of this file. It never asks whether a time service exists;
+// it runs the platform's own time client and reports what came back. And it cannot fail obscurely:
+// an absent tool, a timeout, a non-zero exit or output in a language this parser does not read all
+// come back as 'unknown'. Three states, not a boolean, because "I could not find out" is a
+// different fact from "the clock is wrong" -- both leave the clock unvetted, and only one of them
+// is worth going and fixing.
+// ---------------------------------------------------------------------------
+
+export type ClockSyncState = 'synced' | 'unsynced' | 'unknown';
+
+export interface ClockSyncProbe {
+  readonly platform: PlatformId;
+  readonly support: SupportLevel;
+  // NEVER throws. Every failure is 'unknown'.
+  probe(runner?: Runner): Promise<ClockSyncState>;
+}
+
+const CLOCK_PROBE_TIMEOUT_MS = 10000;
+
+const linuxClockSyncProbe: ClockSyncProbe = {
+  platform: 'linux',
+  support: 'supported',
+  async probe(runner = defaultRunner) {
+    const res = await runSeam(runner, ['timedatectl', 'show', '-p', 'NTPSynchronized', '--value'], {
+      timeoutMs: CLOCK_PROBE_TIMEOUT_MS,
+    });
+    if (res.code !== 0) return 'unknown';
+    const value = res.stdout.trim();
+    if (value === 'yes') return 'synced';
+    if (value === 'no') return 'unsynced';
+    return 'unknown';
+  },
+};
+
+// A w32tm source that names the machine's own hardware rather than a time server. The leap
+// indicator is usually 3 in that state, but not always -- a machine that has been its own reference
+// since boot can report 0(no warning) about a clock nothing outside has ever checked.
+const LOCAL_CLOCK_SOURCES = ['local cmos clock', 'free-running system clock'];
+
+// Parses `w32tm /query /status`. Exported for direct unit testing against captured output.
+//
+// Two facts are needed and both must be present. The leap indicator is the NTP-level verdict:
+// 0(no warning) is a synchronised clock, 3(not synchronized) is the state Windows reports when the
+// time service has never reached a server. The Source line says WHAT it synchronised to, which is
+// what separates a real time server from the machine's own oscillator.
+//
+// Note that w32tm's output is localised: on a non-English Windows these labels are translated and
+// nothing here matches, which lands on 'unknown'. That is the honest answer -- an unvetted clock
+// and a logged reason -- rather than a confident verdict read from text this does not understand.
+export function parseW32tmStatus(text: string): ClockSyncState {
+  const lines = text.split(/\r?\n/).map((l) => l.trim());
+  const leapLine = lines.find((l) => /^Leap Indicator\s*:/i.test(l));
+  const sourceLine = lines.find((l) => /^Source\s*:/i.test(l));
+  if (leapLine === undefined || sourceLine === undefined) return 'unknown';
+
+  const source = sourceLine.slice(sourceLine.indexOf(':') + 1).trim();
+  if (source.length === 0) return 'unknown';
+
+  const leap = leapLine.slice(leapLine.indexOf(':') + 1).trim();
+  const leapDigit = /^(\d)/.exec(leap)?.[1];
+  if (leapDigit === undefined) return 'unknown';
+  if (leapDigit !== '0') return 'unsynced';
+
+  const lower = source.toLowerCase();
+  if (LOCAL_CLOCK_SOURCES.some((s) => lower.startsWith(s))) return 'unsynced';
+  return 'synced';
+}
+
+const windowsClockSyncProbe: ClockSyncProbe = {
+  platform: 'windows',
+  support: 'experimental',
+  async probe(runner = defaultRunner) {
+    // w32tm exits non-zero when the Windows Time service is stopped ("The service has not been
+    // started. (0x80070426)"), which is a real and common state on a desktop that has never joined
+    // a domain. Unknown, not unsynced: nothing was measured.
+    const res = await runSeam(runner, ['w32tm', '/query', '/status'], { timeoutMs: CLOCK_PROBE_TIMEOUT_MS });
+    if (res.code !== 0) return 'unknown';
+    return parseW32tmStatus(res.stdout);
+  },
+};
+
+const macosClockSyncProbe: ClockSyncProbe = {
+  platform: 'macos',
+  support: 'unsupported',
+  async probe() {
+    // There is no honest macOS probe here yet, so this says so rather than inventing one. `sntp`
+    // queries a server over the network instead of reporting what timed(8) believes, so it answers
+    // a different question and fails on any machine without egress to that server; and
+    // `systemsetup -getusingnetworktime` reports whether the feature is switched ON, which is a
+    // capability question -- precisely the confidently-wrong answer this module exists to avoid.
+    // Unvetted on macOS means auto-commit holds and the log says why.
+    return 'unknown';
+  },
+};
+
+const unsupportedClockSyncProbe: ClockSyncProbe = {
+  platform: 'unknown',
+  support: 'unsupported',
+  async probe() {
+    return 'unknown';
+  },
+};
+
+export function clockSyncProbeFor(platform: PlatformId = currentPlatform()): ClockSyncProbe {
+  switch (platform) {
+    case 'linux':
+      return linuxClockSyncProbe;
+    case 'macos':
+      return macosClockSyncProbe;
+    case 'windows':
+      return windowsClockSyncProbe;
+    default:
+      return unsupportedClockSyncProbe;
   }
 }

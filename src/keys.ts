@@ -9,11 +9,94 @@ import type { GossipEnvelope, MachineKey, PeerConfig } from './types';
 import { b64decode, b64encode, canonicalJson, ensureDir, log, nowMs, runBytes } from './util';
 import type { RunBytesResult } from './util';
 import { configDir } from './config';
+import { currentPlatform } from './platform';
+import type { PlatformId } from './platform';
 
 const CURVE_ALG = { name: 'ECDSA', namedCurve: 'P-256' } as const;
 const SIGN_ALG = { name: 'ECDSA', hash: 'SHA-256' } as const;
 const AUTH_WINDOW_MS = 120000;
 const SECRET_FILE_MODE = 0o600;
+
+// One notice per path per process. The ACL notice in enforcePrivateMode below states a standing
+// fact about the filesystem, not an event, so repeating it on every load would bury the lines
+// that do mean something.
+const aclNoticeGiven = new Set<string>();
+
+export type PrivateModeOutcome = 'enforced' | 'not-enforced';
+
+export interface PrivateModeOpts {
+  // Which platform's rule to apply. Defaults to this process's. Additive test seam: it lets the
+  // Windows branch be exercised on a Linux box without mutating process.platform globally.
+  platform?: PlatformId;
+  // The chmod to attempt. Defaults to the real one. Additive test seam: the refusal below fires
+  // when a correction does not stick, which no ordinary POSIX filesystem can be asked to do on
+  // demand.
+  chmodFile?: (path: string, mode: number) => Promise<void>;
+}
+
+// The one rule for the permission bits on a private file, so that no two private-file sites can
+// drift apart on what "private" means here.
+//
+// POSIX: stat, and if the mode is not 0600, chmod it and stat again. must-keep #7 -- a
+// world/group-readable key (bad restore, umask mishap, manual edit) is repaired in place rather
+// than merely logged, and re-verified before any private key material is read into memory. A
+// correction that fails or does not stick is a refusal, because signing with a key that may have
+// leaked is worse than not starting.
+//
+// Windows: NTFS carries ACLs rather than POSIX mode bits. Node and Bun synthesise 0666 for every
+// file on it and chmod is a no-op, so the POSIX rule can only ever reach its refusal and the
+// daemon could never start -- which is exactly what the first real Windows run hit. Privacy there
+// comes from the installer instead: install/windows/Install-Sukarfleet.ps1 gives ~/.config/
+// sukarfleet an ACL admitting only the installing user's SID, with inheritance, so every private
+// file created inside it carries the NTFS equivalent of 0600. Say that once and load.
+//
+// Deliberately a platform question and not the store-privacy probe in platform.ts. That probe
+// asks whether a filesystem enforces mode at all, and the credential store refuses when the
+// answer is no -- fail closed, on every platform, unchanged by this helper (see docs/PLATFORMS.md,
+// "store-privacy probe"). Reusing it here would also stop enforcing on a mode-blind POSIX mount,
+// which would relax POSIX behaviour that is currently correct, so POSIX keeps the rule verbatim.
+export async function enforcePrivateMode(
+  path: string,
+  opts: PrivateModeOpts = {},
+): Promise<PrivateModeOutcome> {
+  const platform = opts.platform ?? currentPlatform();
+  if (platform === 'windows') {
+    if (!aclNoticeGiven.has(path)) {
+      aclNoticeGiven.add(path);
+      log(
+        'warn',
+        `keys: NTFS carries ACLs rather than mode bits; relying on the installer's ACL for ${path}`,
+      );
+    }
+    return 'not-enforced';
+  }
+
+  const chmodFile = opts.chmodFile ?? chmod;
+  const st = await stat(path);
+  const mode = st.mode & 0o777;
+  if (mode === SECRET_FILE_MODE) return 'enforced';
+
+  log('warn', 'keys: machine key file permissions are not 0600 -- correcting', {
+    path,
+    mode: mode.toString(8),
+  });
+  try {
+    await chmodFile(path, SECRET_FILE_MODE);
+  } catch (chmodErr) {
+    throw new Error(
+      `sukarfleet keys: machine key file at ${path} has insecure permissions (${mode.toString(8)}) and could not be corrected to 0600: ${String(chmodErr)}`,
+    );
+  }
+  const rechecked = await stat(path);
+  const recheckedMode = rechecked.mode & 0o777;
+  if (recheckedMode !== SECRET_FILE_MODE) {
+    throw new Error(
+      `sukarfleet keys: machine key file at ${path} still has insecure permissions (${recheckedMode.toString(8)}) after chmod 0600; refusing to load`,
+    );
+  }
+  log('info', 'keys: corrected machine key file permissions to 0600', { path });
+  return 'enforced';
+}
 
 function machineKeyPath(): string {
   return join(configDir(), 'machine-key.json');
@@ -114,39 +197,12 @@ function isMachineKey(v: unknown): v is MachineKey {
   );
 }
 
-async function tryLoadMachineKey(path: string): Promise<MachineKey | null> {
+async function tryLoadMachineKey(path: string, opts: PrivateModeOpts = {}): Promise<MachineKey | null> {
   const file = Bun.file(path);
   if (!(await file.exists())) return null;
 
   try {
-    const st = await stat(path);
-    const mode = st.mode & 0o777;
-    if (mode !== SECRET_FILE_MODE) {
-      log('warn', 'keys: machine key file permissions are not 0600 -- correcting', {
-        path,
-        mode: mode.toString(8),
-      });
-      // must-keep #7: the machine key must be chmod 0600. A world/group-readable key (bad
-      // restore, umask mishap, manual edit) is repaired in place rather than merely logged, and
-      // re-verified before the private key material is ever read into memory. If the correction
-      // itself fails (e.g. read-only filesystem), refuse to start rather than sign with a key
-      // that may have leaked.
-      try {
-        await chmod(path, SECRET_FILE_MODE);
-      } catch (chmodErr) {
-        throw new Error(
-          `sukarfleet keys: machine key file at ${path} has insecure permissions (${mode.toString(8)}) and could not be corrected to 0600: ${String(chmodErr)}`,
-        );
-      }
-      const rechecked = await stat(path);
-      const recheckedMode = rechecked.mode & 0o777;
-      if (recheckedMode !== SECRET_FILE_MODE) {
-        throw new Error(
-          `sukarfleet keys: machine key file at ${path} still has insecure permissions (${recheckedMode.toString(8)}) after chmod 0600; refusing to load`,
-        );
-      }
-      log('info', 'keys: corrected machine key file permissions to 0600', { path });
-    }
+    await enforcePrivateMode(path, opts);
   } catch (err) {
     if (err instanceof Error && err.message.startsWith('sukarfleet keys:')) throw err;
     log('warn', 'keys: could not stat machine key file', { path, error: String(err) });
@@ -182,9 +238,13 @@ async function generateMachineKey(machine: string): Promise<MachineKey> {
 // `opts.decryptCred` is likewise an additive test seam for the sealed-blob path (see
 // trySealedMachineKey above) -- omit it for normal use, where the real `systemd-creds decrypt`
 // binary is invoked via the bounded runner.
+//
+// `opts.platform` overrides the permission rule applied to an existing key file (see
+// enforcePrivateMode above). Additive test seam as well -- omit it and this process's own
+// platform decides.
 export async function loadOrCreateMachineKey(
   machine: string,
-  opts: { keyPath?: string; decryptCred?: RunSystemdCredsDecrypt } = {},
+  opts: { keyPath?: string; decryptCred?: RunSystemdCredsDecrypt; platform?: PlatformId } = {},
 ): Promise<MachineKey> {
   const path = opts.keyPath ?? machineKeyPath();
   const decryptCred = opts.decryptCred ?? defaultDecryptCred;
@@ -195,7 +255,7 @@ export async function loadOrCreateMachineKey(
     return sealed;
   }
 
-  const existing = await tryLoadMachineKey(path);
+  const existing = await tryLoadMachineKey(path, { platform: opts.platform });
   if (existing) {
     warnIfNameMismatch(existing, machine, path);
     return existing;

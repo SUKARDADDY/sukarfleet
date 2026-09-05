@@ -931,13 +931,15 @@ else
 
       ${ROOT_STEP}
 
-  It will do exactly four things, and nothing else:
+  It will do exactly five things, and nothing else:
     1. read the staged mesh details, refusing the file unless it is a
        regular file you own at mode 0600
     2. write /etc/easytier/fleet.toml (0600 root), shred the staged copy
     3. fetch EasyTier, check it against a SHA256 pinned here, install it
     4. if a firewall is running, open the mesh listener ports, and ${NODE_PORT}
        from the mesh subnet only
+    5. restart your own sukarfleet daemon, so it listens on the mesh address
+       instead of on every interface
 
   Do the console's "Mesh network" card first. Until you do, this command
   refuses and writes nothing: it has no secret to adopt.

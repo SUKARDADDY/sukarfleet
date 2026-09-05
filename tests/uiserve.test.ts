@@ -745,6 +745,47 @@ describe('api routes', () => {
     }
   });
 
+  // The fresh-machine deadlock (Class H). Between the Identity card and the sudo step the mesh
+  // address is configured but on no interface, so the daemon binds 0.0.0.0 instead and sets this
+  // flag. It has to survive the transport: a boolean the state route drops is a console that
+  // cannot explain why the address it was just given is not in use.
+  test('setup.meshBindFallback reaches the console through /api/ui/state', async () => {
+    const withFallback = makeHarness({
+      buildState: async () =>
+        ({
+          v: 1,
+          nowMs: 1,
+          self: { machine: 'test-machine' },
+          setup: {
+            complete: false,
+            identity: true,
+            meshSecret: 'pending',
+            credential: false,
+            paired: false,
+            meshBindFallback: true,
+            elevatedCommand: elevatedInstallCommand('/opt/sukarfleet', '/var/lib/sukarfleet'),
+          },
+        }) as unknown as UiState,
+    });
+    const res = (await withFallback.routes.handle(req('/api/ui/state'), server('127.0.0.1')))!;
+    expect(res.status).toBe(200);
+    const state = (await res.json()) as { setup: { meshBindFallback?: boolean } };
+    expect(state.setup.meshBindFallback).toBe(true);
+  });
+
+  test('both consoles turn that flag into the same sentence on the Mesh card', async () => {
+    for (const script of [
+      join(import.meta.dir, '..', 'ui', 'app.js'),
+      join(import.meta.dir, '..', 'clients', 'tray', 'src', 'console.js'),
+    ]) {
+      const js = await readFile(script, 'utf8');
+      expect(js).toContain(
+        "meshAddressNotUp: 'The mesh address is set but not up on this machine yet, so the node is listening on all interfaces. The root step below is what brings it up.'",
+      );
+      expect(js).toContain('setup.meshBindFallback');
+    }
+  });
+
   test('a rejected identity patch surfaces its message as a 400', async () => {
     const h = makeHarness({ patchIdentity: async () => ({ ok: false, message: 'meshIp is already taken' }) });
     const res = (await h.routes.handle(guiPost('/api/ui/setup/identity', { meshIp: '192.0.2.9' }), server('127.0.0.1')))!;

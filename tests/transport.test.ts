@@ -286,6 +286,121 @@ describe('ClockSentinel.vet', () => {
   });
 });
 
+// The daemon vets its clock before it will auto-commit, and it used to do that by spawning
+// timedatectl unconditionally. On Windows that binary does not exist, Bun.spawn raised ENOENT, and
+// the whole node failed to start. Vetting now runs through platform.ts's seam: it degrades, and
+// the daemon keeps running and says why it is holding commits.
+describe('ClockSentinel.vet across platforms', () => {
+  const w32tmSynced = [
+    'Leap Indicator: 0(no warning)',
+    'Stratum: 3 (secondary reference - syncd by (S)NTP)',
+    'ReferenceId: 0x51E1F1EF (source IP:  81.225.241.239)',
+    'Source: time.windows.com,0x8',
+    '',
+  ].join('\r\n');
+
+  const w32tmUnsynced = [
+    'Leap Indicator: 3(not synchronized)',
+    'Stratum: 0 (unspecified)',
+    'Source: Local CMOS Clock',
+    '',
+  ].join('\r\n');
+
+  test('windows vets through w32tm', async () => {
+    const cfg = defaultConfig('alpha');
+    const calls: string[][] = [];
+    const sentinel = new ClockSentinel(cfg, {
+      platform: 'windows',
+      runner: fakeRunner((argv) => {
+        calls.push(argv);
+        return { code: 0, stdout: w32tmSynced, stderr: '' };
+      }),
+    });
+    expect(await sentinel.vet()).toBe(true);
+    expect(sentinel.isClockVetted()).toBe(true);
+    expect(sentinel.clockSyncState()).toBe('synced');
+    expect(calls[0]).toEqual(['w32tm', '/query', '/status']);
+  });
+
+  test('an unsynchronised Windows clock stays unvetted', async () => {
+    const cfg = defaultConfig('alpha');
+    const sentinel = new ClockSentinel(cfg, {
+      platform: 'windows',
+      runner: fakeRunner(() => ({ code: 0, stdout: w32tmUnsynced, stderr: '' })),
+    });
+    expect(await sentinel.vet()).toBe(false);
+    expect(sentinel.clockSyncState()).toBe('unsynced');
+  });
+
+  test('a spawn that throws does NOT escape vet() -- it lands as unknown and unvetted', async () => {
+    const cfg = defaultConfig('alpha');
+    for (const platform of ['linux', 'windows'] as const) {
+      const sentinel = new ClockSentinel(cfg, {
+        platform,
+        runner: async (argv) => {
+          throw new Error(`ENOENT: no such file or directory, uv_spawn '${argv[0]}'`);
+        },
+      });
+      expect(await sentinel.vet()).toBe(false);
+      expect(sentinel.isClockVetted()).toBe(false);
+      expect(sentinel.clockSyncState()).toBe('unknown');
+    }
+  });
+
+  test('macos reports unknown without spawning anything', async () => {
+    const cfg = defaultConfig('alpha');
+    let spawned = 0;
+    const sentinel = new ClockSentinel(cfg, {
+      platform: 'macos',
+      runner: fakeRunner(() => {
+        spawned++;
+        return { code: 0, stdout: '', stderr: '' };
+      }),
+    });
+    expect(await sentinel.vet()).toBe(false);
+    expect(spawned).toBe(0);
+  });
+
+  test('the startup vet+resume path completes on a machine with no time client', async () => {
+    const cfg = defaultConfig('alpha');
+    const steps: string[] = [];
+    const sentinel = new ClockSentinel(cfg, {
+      platform: 'windows',
+      runner: async (argv) => {
+        throw new Error(`ENOENT: no such file or directory, uv_spawn '${argv[0]}'`);
+      },
+      pollTransport: async () => {
+        steps.push('poll');
+      },
+      onEndpointRepublish: async () => {
+        steps.push('republish');
+      },
+      isWedged: () => false,
+    });
+    await sentinel.vet();
+    await sentinel.resumeSequence(1000);
+    expect(steps).toEqual(['poll', 'republish']);
+    expect(sentinel.isClockVetted()).toBe(false);
+  });
+});
+
+// pollOnce and its two helpers all document that they never throw. An easytier-cli that is not
+// installed used to break that promise, because Bun.spawn raises rather than returning an exit
+// code -- ordinary on a machine that has the daemon but not the mesh yet.
+describe('Transport polls degrade when easytier-cli is absent', () => {
+  test('a spawn that throws is recorded as a failed poll, not an exception', async () => {
+    const cfg = defaultConfig('alpha');
+    const transport = new Transport(cfg, {
+      runner: async (argv) => {
+        throw new Error(`ENOENT: no such file or directory, uv_spawn '${argv[0]}'`);
+      },
+    });
+    expect(await transport.pollOnce(1000)).toBeNull();
+    expect(transport.diagnosis()).toBeNull();
+    expect(transport.wedged(1000)).toBe(false);
+  });
+});
+
 describe('ClockSentinel peer-skew demotion', () => {
   test('median peer clock offset beyond threshold demotes an already-vetted clock', async () => {
     const cfg = defaultConfig('alpha');
