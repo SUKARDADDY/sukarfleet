@@ -317,6 +317,95 @@ export async function readPeerEndpoint(cfg: FleetConfig, machine: string): Promi
   return file;
 }
 
+// --- Peer dial-candidate planning -------------------------------------------
+//
+// A roamer that lands on a foreign network which happens to reuse the anchor's
+// LAN range turns the anchor's LAN address into a PHANTOM candidate: it looks
+// on-link, so the kernel ARPs for it on the wrong wire and the dial neither
+// connects nor fails fast. easytier retries it forever, and because a stuck
+// connector is not an error, nothing upstream ever says why the mesh is empty.
+//
+// Two hosts share a LAN only if they sit behind the same NAT, so the WAN IP the
+// endpoint files already carry is the co-location proof. Same WAN IP: the LAN
+// candidate is real and cheapest, so it goes first. Different WAN IPs: it is a
+// phantom and is not offered at all. Unknown on either side (no internet, or a
+// probe that failed) we can neither prove nor disprove it, so it is offered
+// last -- never suppressed, because a LAN-only fleet with no WAN IP to publish
+// has nothing else to dial.
+
+export type DialVia = 'lan' | 'wan-udp' | 'wan-tcp';
+
+export interface DialCandidate {
+  uri: string;
+  via: DialVia;
+}
+
+export type LanSuppressionReason = 'peer-behind-different-wan';
+
+export interface PeerDialPlan {
+  candidates: DialCandidate[];
+  // Same candidates as bare URIs, in dial order, for generateEasytierToml.
+  uris: string[];
+  // Set only when a LAN candidate existed and was deliberately withheld.
+  lanSuppressed: { uri: string; reason: LanSuppressionReason } | null;
+  // True when co-location could be neither proven nor disproven.
+  coLocationUnknown: boolean;
+}
+
+export interface SelfEndpointView {
+  wanIp: string | null;
+  lanIp: string;
+}
+
+export interface PeerDialOptions {
+  // The peer's mesh transport listener port as reachable on its own LAN. This is
+  // NOT the forwarded WAN port: a router commonly forwards an arbitrary external
+  // port at the real listener, and the endpoint file publishes the former.
+  peerLanPort: number;
+}
+
+export function planPeerDial(
+  self: SelfEndpointView,
+  peer: EndpointFile,
+  opts: PeerDialOptions,
+): PeerDialPlan {
+  const wan: DialCandidate[] = [];
+  if (peer.wanIp) {
+    if (peer.ports.udp !== null) wan.push({ uri: `udp://${peer.wanIp}:${peer.ports.udp}`, via: 'wan-udp' });
+    if (peer.ports.tcp !== null) wan.push({ uri: `tcp://${peer.wanIp}:${peer.ports.tcp}`, via: 'wan-tcp' });
+  }
+
+  const lan: DialCandidate | null = peer.lanIp
+    ? { uri: `udp://${peer.lanIp}:${opts.peerLanPort}`, via: 'lan' }
+    : null;
+
+  const bothWanKnown = self.wanIp !== null && peer.wanIp !== null;
+  const coLocated = bothWanKnown && self.wanIp === peer.wanIp;
+  const coLocationUnknown = !bothWanKnown;
+
+  let candidates: DialCandidate[];
+  let lanSuppressed: PeerDialPlan['lanSuppressed'] = null;
+
+  if (lan === null) {
+    candidates = wan;
+  } else if (coLocated) {
+    candidates = [lan, ...wan];
+  } else if (coLocationUnknown) {
+    candidates = [...wan, lan];
+  } else {
+    candidates = wan;
+    lanSuppressed = { uri: lan.uri, reason: 'peer-behind-different-wan' };
+    log('warn', 'planPeerDial: withholding phantom LAN candidate', {
+      peer: peer.machine,
+      lanUri: lan.uri,
+      selfWanIp: self.wanIp,
+      peerWanIp: peer.wanIp,
+    });
+  }
+
+  return { candidates, uris: candidates.map((c) => c.uri), lanSuppressed, coLocationUnknown };
+}
+
 // --- UPnP IGD presence probe (anchor-only standing warning, plan section 07) -
 
 const SSDP_ADDR = '239.255.255.250';
