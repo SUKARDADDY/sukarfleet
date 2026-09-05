@@ -140,16 +140,19 @@ if [ "$DO_REPAIR" = 1 ] && [ "${#LOCAL_BROKEN[@]}" -gt 0 ]; then
   done < <(repo_paths)
 fi
 
-ssh "${SSH_OPTS[@]}" "$PEER_IP" '
+# Read the peer's results with process substitution, not a pipe: a piped `while` runs in a
+# subshell, so its bad() calls incremented a FAIL counter that died with it and a corrupt peer
+# repo still printed FLEET HEALTHY at the bottom.
+while read -r state name extra; do
+    if [ "$state" = "OK" ]; then ok "$PEER_NAME $name: fsck clean"; else bad "$PEER_NAME $name: corrupt ($extra)"; fi
+done < <(ssh "${SSH_OPTS[@]}" "$PEER_IP" '
   for p in $(jq -r ".repos[].path" ~/.config/sukarfleet/config.json 2>/dev/null); do
     [ -d "$p/.git" ] || continue
     n=$(find "$p/.git/objects" -type f -size 0 2>/dev/null | wc -l)
     if [ "$n" -gt 0 ]; then echo "BROKEN $(basename $p) $n";
     elif git -C "$p" fsck --no-dangling --no-progress >/dev/null 2>&1; then echo "OK $(basename $p)";
     else echo "BROKEN $(basename $p) fsck"; fi
-  done' 2>/dev/null | while read -r state name extra; do
-    if [ "$state" = "OK" ]; then ok "$PEER_NAME $name: fsck clean"; else bad "$PEER_NAME $name: corrupt ($extra)"; fi
-  done
+  done' 2>/dev/null)
 
 # --- 3. fleet health --------------------------------------------------------
 head_ "Fleet health"
