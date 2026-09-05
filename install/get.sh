@@ -31,6 +31,12 @@ set -eu
 #                            path or a file:// mirror.
 #   SUKARFLEET_RELEASE_BASE  where quickstart.sh fetches release assets (the
 #                            tray binary) from. Exported for the next stage.
+#   SUKARFLEET_APP_DIR       where the checkout goes. Defaults to
+#                            ~/.local/share/sukarfleet/app, which is the path
+#                            the console and the banner print in the one root
+#                            command; move it and you are on your own for that
+#                            line. Used by the tests to clone into a throwaway
+#                            directory rather than over a real install.
 #   SUKARFLEET_DRY_RUN=1     walk the whole control flow, print every write,
 #                            download and exec as `[dry-run] ...`, change
 #                            nothing on disk.
@@ -40,6 +46,9 @@ RELEASE_BASE="${SUKARFLEET_RELEASE_BASE:-https://github.com/SUKARDADDY/sukarflee
 DRY_RUN="${SUKARFLEET_DRY_RUN:-0}"
 
 APP_DIR="${SUKARFLEET_APP_DIR:-$HOME/.local/share/sukarfleet/app}"
+
+START_TS="$(date +%s)"
+elapsed() { echo "$(( $(date +%s) - START_TS ))"; }
 
 log()  { printf '[get] %s\n' "$*"; }
 warn() { printf '[get] WARNING: %s\n' "$*" >&2; }
@@ -75,11 +84,15 @@ if [ -e "$APP_DIR" ]; then
     die "$APP_DIR is a git repository, but not a sukarfleet one (no install/quickstart.sh). Move it aside, then run this again. Nothing was written." 3
   fi
   log "updating the checkout at $APP_DIR to $REF"
+  # --depth 1 and no --tags: the checkout below uses FETCH_HEAD, so every other
+  # tag's objects are a download nobody reads. This is the re-run path -- the one
+  # a person runs to upgrade and then waits on -- and it is the whole cost of
+  # this stage.
   if [ "$DRY_RUN" = "1" ]; then
-    dry "git -C $APP_DIR fetch --tags --force $GIT_URL $REF"
+    dry "git -C $APP_DIR fetch --force --depth 1 $GIT_URL $REF"
     dry "git -C $APP_DIR checkout --force FETCH_HEAD"
   else
-    git -C "$APP_DIR" fetch --tags --force "$GIT_URL" "$REF" >/dev/null 2>&1 || \
+    git -C "$APP_DIR" fetch --force --depth 1 "$GIT_URL" "$REF" >/dev/null 2>&1 || \
       die "could not fetch $REF from $GIT_URL. Check the network and the tag name. The existing checkout was left alone." 5
     git -C "$APP_DIR" -c advice.detachedHead=false checkout --force FETCH_HEAD >/dev/null 2>&1 || \
       die "fetched $REF but could not check it out in $APP_DIR. Nothing else was written." 5
@@ -105,11 +118,18 @@ if [ "$DRY_RUN" = "1" ]; then
   log "[dry-run] would report the checked-out commit here"
 else
   COMMIT="$(git -C "$APP_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
-  log "checked out $REF at $COMMIT"
+  log "checked out $REF at $COMMIT in $(elapsed)s"
 fi
 
 # --- 5. hand over -------------------------------------------------------------
 QUICKSTART="$APP_DIR/install/quickstart.sh"
+
+# The elapsed time belongs here, on its own line, printed on every path. The
+# next stage starts its own clock, so without this the clone or the fetch above
+# is wall-clock nobody can attribute: `[quickstart] done in NNs` covers stage 1
+# only, and a re-run that feels slow is usually this stage, not that one.
+log "checkout stage done in $(elapsed)s"
+
 if [ "$DRY_RUN" = "1" ]; then
   dry "exec $QUICKSTART $*"
   log "[dry-run] nothing was installed."

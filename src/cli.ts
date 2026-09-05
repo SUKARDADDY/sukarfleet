@@ -342,7 +342,12 @@ async function cmdVersion(): Promise<number> {
 }
 
 // Generic argv splitter. It lived inside the signed-job section before the extraction, but it is
-// not part of that ceremony -- `audit tail` and `admin run` both parse their flags with it.
+// not part of that ceremony -- `audit tail` reads its positional through it, and `admin run` has
+// its own parser (parseAdminRunArgs) because a `--` separator changes the rules.
+//
+// It reads no flag VALUE -- `audit tail` takes a positional limit and nothing else -- so the
+// `--flag VALUE` / `--flag=VALUE` split that bit easytier-toml cannot bite here. Anything that
+// starts reading values out of `flags` has to take the separated form too.
 export function extractFlags(args: string[]): { flags: Record<string, string>; positional: string[] } {
   const flags: Record<string, string> = {};
   const positional: string[] = [];
@@ -442,8 +447,12 @@ export function parseAdminRunArgs(args: string[]): { ok: true; value: AdminRunAr
   for (let i = 0; i < head.length; i++) {
     const token = head[i]!;
     if (token === '--reason' || token === '--timeout') {
+      // Both spellings are accepted here, as they are for easytier-toml -- but a
+      // value that is itself a flag means the value was forgotten, and taking it
+      // would silently drop the flag AND record a nonsense reason in the audit
+      // log, which is the one thing this argument exists for.
       const value = head[i + 1];
-      if (value === undefined) return { ok: false, error: `${token} needs a value` };
+      if (value === undefined || value.startsWith('--')) return { ok: false, error: `${token} needs a value` };
       i += 1;
       if (token === '--reason') reason = value;
       else timeoutSec = Number(value);
@@ -848,6 +857,23 @@ export interface EasytierTomlArgs {
   rpcAddr: string;
 }
 
+// Every flag takes a value, in either spelling: `--flag=VALUE` and `--flag VALUE`
+// both parse. Accepting only one of them is not a style question -- the usage
+// text above advertises the separated form, install/install-elevated.sh built
+// it, and a parser that took only `=` turned every real elevated run into an
+// exit 5 after EasyTier was already installed. Both spellings are now pinned by
+// tests/install-scripts.test.ts, which feeds this parser the argv the shell
+// actually builds.
+const EASYTIER_TOML_FLAGS = new Set([
+  '--secret-file',
+  '--mesh-ip',
+  '--hostname',
+  '--network-name',
+  '--rpc-addr',
+  '--listener',
+  '--peer',
+]);
+
 // Repeated flags accumulate; everything else is last-wins. Unknown flags are an
 // error rather than a shrug, because a typo'd --listener would silently produce
 // a TOML that listens nowhere.
@@ -861,10 +887,25 @@ export function parseEasytierTomlArgs(args: string[]): { ok: true; value: Easyti
     peers: [],
     rpcAddr: '127.0.0.1:15888',
   };
-  for (const arg of args) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
     const eq = arg.indexOf('=');
-    const [flag, value] = eq === -1 ? [arg, null] : [arg.slice(0, eq), arg.slice(eq + 1)];
-    if (value === null) return { ok: false, message: `easytier-toml: ${flag} needs a value, as ${flag}=VALUE` };
+    const flag = eq === -1 ? arg : arg.slice(0, eq);
+    if (!EASYTIER_TOML_FLAGS.has(flag)) return { ok: false, message: `easytier-toml: unknown argument ${flag}` };
+    let value: string;
+    if (eq === -1) {
+      // The next token is the value -- unless it is itself a flag, which means
+      // the value was forgotten and swallowing the flag would silently drop it.
+      const next = args[i + 1];
+      const nextFlag = next === undefined ? '' : next.slice(0, next.indexOf('=') === -1 ? next.length : next.indexOf('='));
+      if (next === undefined || EASYTIER_TOML_FLAGS.has(nextFlag)) {
+        return { ok: false, message: `easytier-toml: ${flag} needs a value, as ${flag} VALUE or ${flag}=VALUE` };
+      }
+      value = next;
+      i += 1;
+    } else {
+      value = arg.slice(eq + 1);
+    }
     switch (flag) {
       case '--secret-file': out.secretFile = value; break;
       case '--mesh-ip': out.meshIp = value; break;

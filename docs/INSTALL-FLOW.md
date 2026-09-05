@@ -146,7 +146,12 @@ A fresh machine lands on the setup takeover, not the fleet screen (`ui/index.htm
 needs a terminal, and only once." (`ui/index.html:51`).
 
 1. **Identity.** Machine name, role, mesh IP, node port, network name, written to
-   `~/.config/sukarfleet/config.json` (`ui/index.html:53-85`).
+   `~/.config/sukarfleet/config.json` (`ui/index.html:53-85`). Saving writes that file and nothing
+   else: the daemon binds `cfg.nodePort` and signs gossip as `cfg.machine` once, at boot
+   (`src/node.ts:864-869`), so the save answers `restartRequired` and the card says `Saved. Restart
+   the daemon to apply.` with the restart button beside it. The restart happens here, on this card
+   (**new in S7**); until it does, `/api/ui/state` keeps reporting `setup.identity: false` while the
+   value on disk is already the new one.
 2. **Mesh network.** "Generate a new secret" on the first machine of a fleet, or "I already have
    one" on the second (`ui/index.html:87-101`). Either way the details are staged to a 0600 file
    under the state directory and the card shows the one root step (`ui/index.html:87-111`,
@@ -235,11 +240,18 @@ address, unexpected answer, half-paired); section 6 quotes the two a stranger hi
 ### Stage 0: `install/get.sh` (**new in S7**)
 
 **Preconditions:** `sh`, `curl` and `git`. **Writes:** the checkout at
-`~/.local/share/sukarfleet/app`, at the tag in the URL, nothing else. **Then:** prints the resolved
-commit and `exec`s `install/quickstart.sh "$@"` out of it. If that directory already exists and is a
-sukarfleet git repository, `get.sh` fetches and checks out the requested tag rather than cloning,
-which is what makes the upgrade path a re-run of the same command with a newer tag. If it exists and
-is not a sukarfleet repository, it refuses and names the path.
+`~/.local/share/sukarfleet/app` (`SUKARFLEET_APP_DIR` moves it, which is how the tests clone into a
+throwaway directory), at the tag in the URL, nothing else. **Then:** prints the resolved commit,
+prints `[get] checkout stage done in NNs`, and `exec`s `install/quickstart.sh "$@"` out of it. If
+that directory already exists and is a sukarfleet git repository, `get.sh` fetches and checks out
+the requested tag rather than cloning, which is what makes the upgrade path a re-run of the same
+command with a newer tag. That fetch is `--depth 1` and does **not** pass `--tags`: the checkout
+uses `FETCH_HEAD`, so every other tag's objects are bytes nobody reads on the one path a person sits
+and waits on. If it exists and is not a sukarfleet repository, it refuses and names the path.
+
+The duration line is there because the next stage starts its own clock. A re-run of the one command
+that takes twenty seconds of wall clock and ends in `[quickstart] done in 4s` is not lying: the rest
+was this stage, and until it printed its own number that time belonged to nobody (**new in S7**).
 
 ### Stage 1: user stage, `install/quickstart.sh`
 
@@ -372,14 +384,19 @@ contain the invoking user's `~/.bun/bin`; the user stage resolved a bun path alr
 
 #### The staged file
 
-The console's Mesh card writes JSON (**new in S7**): `{ "networkName", "networkSecret", "meshIp",
+The console's Mesh card is to write JSON: `{ "networkName", "networkSecret", "meshIp",
 "listeners" }`, for example `{"networkName":"sukarfleet","networkSecret":"...","meshIp":"192.0.2.3",
-"listeners":["tcp://0.0.0.0:11010","udp://0.0.0.0:11010"]}`. Today it writes a bare secret and a
-newline (`src/node.ts:851-859`), and `POST /api/ui/setup/network-secret` accepts only
-`{action:"generate"}` or `{action:"stage", secret}` (`src/uiserve.ts:683-703`), so the three extra
-fields are new. So is the card: the mesh IP is asked on the **Identity** card today
-(`ui/index.html:68-71`) and belongs next to the secret, because those two are what the one root
-command consumes. Listeners default to the pair the Windows installer builds
+"listeners":["tcp://0.0.0.0:11010","udp://0.0.0.0:11010"]}`. **Deferred, not shipped in S7.** The
+console still writes a bare secret and a newline (`src/node.ts:851-859`), and `POST
+/api/ui/setup/network-secret` still accepts only `{action:"generate"}` or `{action:"stage", secret}`
+(`src/uiserve.ts:683-703`). The elevated stage reads both shapes already -- JSON when it finds it,
+a bare secret otherwise, filling the missing fields from the invoking user's `config.json` -- so
+the staging change can land on its own later without touching the root stage. Moving the mesh IP
+off the **Identity** card (`ui/index.html:68-71`) and next to the secret is deferred with it: the
+two belong together because they are what the one root command consumes, and the Identity card is
+where the mesh IP is typed today. What that costs until then is one failure mode, and section 6
+carries it: the root line run before the Identity card was filled refuses with `no mesh IP` and
+writes nothing. Listeners default to the pair the Windows installer builds
 (`Install-Sukarfleet.ps1:405`) and are not exposed in the card in v1. Either way the file goes
 through `writeSecretFile`, which creates it at 0600 via a temp file and a rename so it is never
 briefly world readable (`src/keys.ts:84-100`, `SECRET_FILE_MODE` at `:16`), and the secret is never
@@ -433,10 +450,16 @@ construction (`quickstart.sh:4-5`); what is missing is the summary that makes th
 (**new in S7**):
 
 ```
+[get] updating the checkout at ~/.local/share/sukarfleet/app to v0.1.0
+[get] checkout stage done in 4s
 [quickstart] t+1s   config exists at ~/.config/sukarfleet/config.json -- left untouched.
 [quickstart] t+2s   sukarfleet.service enabled and active; mesh secret installed
-[quickstart] done in 3s. This machine is already installed.
+[quickstart] done in 3s in this stage (install/get.sh timed the checkout separately). This machine is already installed.
 ```
+
+Two timers, because there are two stages and only one of them was ever measured. The stage-1 line
+counts from the moment `quickstart.sh` starts, so on a re-run the network round trip in stage 0 is
+the larger half and used to be invisible.
 
 Config is never overwritten: only the admin lane's non-privileged fields are backfilled, and only
 when missing, because switching a root-capable lane on mid-upgrade is the operator's call
@@ -477,7 +500,7 @@ breaks the fleet's other machines.
 
 ```
 [uninstall] stopped and removed sukarfleet.service, the tray, its autostart entry, the CLI wrapper
-[uninstall] shredded the stored credential and the staged mesh secret
+[uninstall] shredded the staged mesh secret and the stored credential
 [uninstall] removed /etc/sudoers.d/sukarfleet-transport, easytier-fleet.service, /etc/easytier,
             /opt/easytier and the firewall rules it added
 [uninstall] left in place: your repositories, config.json, the fleet SSH key, authorized_keys,
@@ -513,6 +536,7 @@ describe turns out to be sudo's, not ours.
 | Tray runs but GNOME shows no icon | `[quickstart] the tray is running but GNOME needs the AppIndicator extension (gnome-shell-extension-appindicator) to show it. Until it is installed, open the console at http://127.0.0.1:7710/ui/` (there is no `--console` flag to offer instead: `clients/tray/src-tauri/src/config.rs:22-33` parses only `--endpoint`) | 0 | install the extension and log back in, or use the browser console | yes, everything installed |
 | Sudo line run before the console staged anything | `[install-elevated] ERROR: nothing is staged at $HOME/.local/state/sukarfleet/pending-easytier-secret. Do the console's "Mesh network" card first, then run this command again. Nothing was written.` | 3 | stage the secret in the console, re-run the line | yes, nothing under /etc |
 | Staged file is a symlink, wrong owner, or wrong mode | `[install-elevated] ERROR: refusing $HOME/.local/state/sukarfleet/pending-easytier-secret: it is a symbolic link (expected a regular file owned by you at mode 0600). Nothing was written and the file was left alone.` | 3 | inspect the file, delete it, re-stage from the console | yes, nothing under /etc, file untouched |
+| Sudo line run before the Identity card was filled | `[install-elevated] ERROR: no mesh IP: the staged file does not carry one and $HOME/.config/sukarfleet/config.json has meshIp empty. Set this machine's mesh address on the console's Identity card, then run this command again. Nothing was written.` | 3 | set the mesh IP on the Identity card, restart the daemon, re-run the line | yes, nothing under /etc, staged file untouched |
 | sudo refuses, or the password is wrong | `sudo`'s own message and nothing else: the elevated script never starts, so it prints nothing and changes nothing | n/a, sudo's own exit code | run the line again | yes, staged file still 0600, nothing under /etc; the console keeps showing the Mesh card |
 | EasyTier download fails | `[install-elevated] ERROR: could not download easytier-linux-x86_64-v2.6.4.zip. Nothing was installed. Check the network, or re-run with --no-easytier and install EasyTier yourself.` | 5 | retry, or `--no-easytier` | yes, nothing under /etc or /opt |
 | SHA256 mismatch | `[install-elevated] ERROR: SHA256 mismatch for easytier-linux-x86_64-v2.6.4.zip. expected <pin>, got <actual>. Nothing was installed.` (mirrors `Install-Sukarfleet.ps1:371-373`) | 5 | report it; do not retry blindly | yes, download deleted |
@@ -527,13 +551,17 @@ describe turns out to be sudo's, not ours.
 ## 7. Timing budget
 
 A fresh Ubuntu 24.04 VM, a normal home connection, one user at it. Wall clock from Enter on the
-`curl` line to a paired machine. Two stages are measured by the installer, three stretches by a
+`curl` line to a paired machine. Three stages are measured by the installer, three stretches by a
 human with a stopwatch: the split S8 records.
 
-**User stage, 72 s** (measured, `[quickstart] done in NNs`): `get.sh` clone and hand off 10 s;
-preflight 2 s; Bun install when absent 25 s; `bun install --frozen-lockfile` 5 s; config, SSH key,
-directories, credential probe 5 s; unit install, enable, start, wait for `/health` 10 s (the poll
-allows 20 s, `quickstart.sh:325-331`); tray fetch, checksum, autostart, launch 15 s.
+**Checkout stage, 10 s** (measured, `[get] checkout stage done in NNs`): clone or fetch at the tag
+and hand over. On a re-run this is most of the wall clock, which is why it has its own number
+(**new in S7**).
+
+**User stage, 62 s** (measured, `[quickstart] done in NNs`): preflight 2 s; Bun install when absent
+25 s; `bun install --frozen-lockfile` 5 s; config, SSH key, directories, credential probe 5 s; unit
+install, enable, start, wait for `/health` 10 s (the poll allows 20 s, `quickstart.sh:325-331`);
+tray fetch, checksum, autostart, launch 15 s.
 
 **Human in the console, 45 s** (stopwatch, console open to a staged secret on the Mesh card):
 identity, then generate or paste the mesh secret. **Human at the terminal, 30 s** (stopwatch, banner

@@ -50,7 +50,17 @@ const FORBIDDEN: { pattern: RegExp; what: string }[] = [
   // reasoning that puts ipify.org and icanhazip.com in the hostname allowlist
   // below. Anywhere else, including a home directory or a config value, it is
   // still a username and still caught.
-  { pattern: /(?<!\bgithub(?:usercontent)?\.com\/)\bsukardaddy\b/i, what: 'a real username' },
+  // The exception is spelled as a WHOLE host, not as a suffix. `\b` before
+  // `github` spared anything ending in it, so `not-github.com/sukardaddy` and
+  // `x-github.com/sukardaddy` -- a host somebody else can register, which is
+  // exactly where the username still has to be caught -- went through the hole
+  // the exception opened. The inner lookbehind refuses a leading word
+  // character, dot or dash, and the two hosts this project actually uses,
+  // `github.com` and `raw.githubusercontent.com`, are named in full.
+  {
+    pattern: /(?<!(?<![\w.-])(?:raw\.)?github(?:usercontent)?\.com\/)\bsukardaddy\b/i,
+    what: 'a real username',
+  },
   // .local and the reserved example domains are synthetic by definition; anything else that looks
   // like an address is assumed to belong to a person. The second lookahead spares exactly one
   // shape and no more: Tauri's bundler mandates icons named `128x128@2x.png`, which reads as an
@@ -129,7 +139,16 @@ const PATTERN_CASES: { what: string; caught: string[]; spared: string[] }[] = [
   { what: 'a real machine name', caught: ['GODFATHER', 'godfather'], spared: ['godmother'] },
   {
     what: 'a real username',
-    caught: ['sukardaddy', '/home/sukardaddy/notes', 'user=SUKARDADDY', 'gitlab.com/SUKARDADDY/x'],
+    caught: [
+      'sukardaddy',
+      '/home/sukardaddy/notes',
+      'user=SUKARDADDY',
+      'gitlab.com/SUKARDADDY/x',
+      // A host that merely ENDS in github.com belongs to whoever registered it.
+      'https://not-github.com/sukardaddy',
+      'https://x-github.com/sukardaddy',
+      'https://evil.github.com.example.org/sukardaddy',
+    ],
     spared: [
       'sukarfleet',
       'https://github.com/SUKARDADDY/sukarfleet.git',

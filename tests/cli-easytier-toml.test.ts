@@ -10,12 +10,16 @@
 //
 // Every address here is from 192.0.2.0/24 (TEST-NET-1), which is reserved for
 // documentation.
+//
+// The second thing pinned here is the CLI's flag-spelling contract, for both
+// parsers that have one. `--flag VALUE` and `--flag=VALUE` are the same flag,
+// and a value that was forgotten is an error rather than the next flag.
 
 import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cmdEasytierToml, parseEasytierTomlArgs, renderEasytierToml } from '../src/cli';
+import { cmdEasytierToml, parseAdminRunArgs, parseEasytierTomlArgs, renderEasytierToml } from '../src/cli';
 import { defaultConfig } from '../src/config';
 import { generateEasytierToml } from '../src/transport';
 
@@ -73,6 +77,73 @@ describe('easytier-toml argument parsing', () => {
     expect(parsed.ok).toBe(false);
     if (parsed.ok) return;
     expect(parsed.message).toContain(message);
+  });
+});
+
+// The elevated stage builds this argv in bash, and the usage text has always
+// advertised the separated form. Taking only `--flag=VALUE` is what made every
+// real elevated run die at exit 5 with EasyTier already installed, so both
+// spellings are pinned here per flag; tests/install-scripts.test.ts pins the
+// other half, that the tokens the script really prints parse.
+describe('easytier-toml takes both spellings of every flag', () => {
+  test('--flag VALUE parses to exactly what --flag=VALUE parses to', () => {
+    const separated = [
+      '--secret-file', '/dev/null',
+      '--mesh-ip', FIXTURE.meshIp,
+      '--hostname', FIXTURE.hostname,
+      '--network-name', FIXTURE.networkName,
+      ...FIXTURE.listeners.flatMap((l) => ['--listener', l]),
+      ...FIXTURE.peers.flatMap((p) => ['--peer', p]),
+      '--rpc-addr', FIXTURE.rpcAddr,
+    ];
+    const a = parseEasytierTomlArgs(separated);
+    const b = parseEasytierTomlArgs(argv());
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    if (!a.ok || !b.ok) return;
+    expect(a.value).toEqual(b.value);
+  });
+
+  test('the two spellings can be mixed in one command line', () => {
+    const parsed = parseEasytierTomlArgs([
+      '--secret-file=/dev/null',
+      '--mesh-ip', '192.0.2.7',
+      '--hostname=beta',
+      '--listener', 'udp://0.0.0.0:11011',
+    ]);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.meshIp).toBe('192.0.2.7');
+    expect(parsed.value.hostname).toBe('beta');
+    expect(parsed.value.listeners).toEqual(['udp://0.0.0.0:11011']);
+  });
+
+  test('a forgotten value is an error rather than a swallowed flag', () => {
+    // `--hostname --mesh-ip=...` must not read the next flag as the hostname and
+    // then silently produce a TOML naming this machine "--mesh-ip=192.0.2.3".
+    const parsed = parseEasytierTomlArgs(['--secret-file=/x', '--hostname', '--mesh-ip=192.0.2.3']);
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.message).toContain('--hostname needs a value');
+  });
+});
+
+describe('admin run takes both spellings too', () => {
+  test('--reason VALUE and --reason=VALUE parse the same way', () => {
+    const separated = parseAdminRunArgs(['beta', '--reason', 'disk full', '--timeout', '30', '--', 'df', '-h']);
+    const joined = parseAdminRunArgs(['beta', '--reason=disk full', '--timeout=30', '--', 'df', '-h']);
+    expect(separated.ok).toBe(true);
+    expect(joined.ok).toBe(true);
+    if (!separated.ok || !joined.ok) return;
+    expect(separated.value).toEqual(joined.value);
+    expect(separated.value.argv).toEqual(['df', '-h']);
+  });
+
+  test('a forgotten reason does not eat the next flag', () => {
+    const parsed = parseAdminRunArgs(['beta', '--reason', '--timeout=30', '--', 'df']);
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error).toContain('--reason needs a value');
   });
 });
 

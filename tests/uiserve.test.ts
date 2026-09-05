@@ -13,9 +13,11 @@
 //     actively tries to hand one back.
 
 import { beforeEach, describe, expect, test } from 'bun:test';
+import { realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { UiRoutes, UI_ASSETS, elevatedInstallCommand, isLoopbackHostHeader, rejectCrossSiteBrowser } from '../src/uiserve';
+import { REPO_ROOT, makeInstallHarness, runInstallScript } from './support/install-harness';
 import type { CredentialStatusView, LanePatch, UiRoutesDeps } from '../src/uiserve';
 import { defaultConfig } from '../src/config';
 import type { AdminRunRequest, AdminRunView, AuditEntry, FleetConfig, MinimalServer, UiState } from '../src/types';
@@ -714,6 +716,35 @@ describe('api routes', () => {
     expect(harness.calls.identity.length).toBe(1);
   });
 
+  // The daemon binds cfg.nodePort and signs gossip as cfg.machine at boot, so a
+  // saved identity is a file on disk and a stale process until it restarts.
+  // /api/ui/state kept answering setup.identity:false after a successful save
+  // and neither console said why; this flag is what both of them turn into a
+  // sentence with a restart button next to it.
+  test('a saved identity says a restart is what applies it', async () => {
+    const res = (await local(guiPost('/api/ui/setup/identity', { machine: 'laptop-2' })))!;
+    expect(res.status).toBe(200);
+    expect((await res.json()) as unknown).toEqual({ ok: true, restartRequired: true });
+  });
+
+  test('both consoles turn that flag into the same sentence, next to a restart control', async () => {
+    for (const [script, page] of [
+      [join(import.meta.dir, '..', 'ui', 'app.js'), join(import.meta.dir, '..', 'ui', 'index.html')],
+      [
+        join(import.meta.dir, '..', 'clients', 'tray', 'src', 'console.js'),
+        join(import.meta.dir, '..', 'clients', 'tray', 'src', 'index.html'),
+      ],
+    ]) {
+      const js = await readFile(script!, 'utf8');
+      const html = await readFile(page!, 'utf8');
+      expect(js).toContain("identitySavedRestart: 'Saved. Restart the daemon to apply.'");
+      expect(js).toContain('saved && saved.restartRequired');
+      // The restart action lives on the identity card itself, not only on the
+      // fleet screen three clicks away.
+      expect(html).toMatch(/id="identity-restart(-actions)?"/);
+    }
+  });
+
   test('a rejected identity patch surfaces its message as a 400', async () => {
     const h = makeHarness({ patchIdentity: async () => ({ ok: false, message: 'meshIp is already taken' }) });
     const res = (await h.routes.handle(guiPost('/api/ui/setup/identity', { meshIp: '192.0.2.9' }), server('127.0.0.1')))!;
@@ -999,13 +1030,26 @@ describe('elevatedInstallCommand', () => {
     expect(elevatedInstallCommand('/a/app', '/b/state')).toContain('--pending=/b/state/pending-easytier-secret');
   });
 
-  test('install/quickstart.sh builds the same string in bash', async () => {
-    const script = await readFile(join(import.meta.dir, '..', 'install', 'quickstart.sh'), 'utf8');
-    // The banner's ROOT_STEP assignment, spelled in the script's own variables.
-    expect(script).toContain('ROOT_STEP="sudo $ELEVATED --adopt-pending-secret --pending=$PENDING_SECRET"');
-    expect(script).toContain('ELEVATED="$REPO_ROOT/install/install-elevated.sh"');
-    expect(script).toContain('PENDING_SECRET="$STATE_DIR/pending-easytier-secret"');
-  });
+  // Behavioural, not a substring pin: the script is RUN, under
+  // SUKARFLEET_DRY_RUN=1 in a throwaway HOME and state directory, and the line
+  // it actually prints in its banner is compared against this function computed
+  // for the same two paths. A pin on the assignment's source text goes on
+  // passing when the two halves of the ROOT_STEP variable drift, which is the
+  // failure it exists to catch.
+  test('install/quickstart.sh prints exactly this string in its banner', async () => {
+    const h = makeInstallHarness('sukarfleet-banner');
+    try {
+      const run = await runInstallScript(h, 'quickstart.sh', ['--no-open', '--no-tray', '--machine=harness-box']);
+      expect(run.code).toBe(0);
+      const printed = run.stdout
+        .split('\n')
+        .map((l) => l.trim())
+        .find((l) => l.startsWith('sudo '));
+      expect(printed).toBe(elevatedInstallCommand(realpathSync(REPO_ROOT), h.state));
+    } finally {
+      h.cleanup();
+    }
+  }, 60_000);
 
   test('both consoles have somewhere to put it, and neither hardcodes the old path', async () => {
     for (const page of [
