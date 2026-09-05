@@ -1234,6 +1234,7 @@ async function main(): Promise<void> {
         clockVetted: clockSentinel.isClockVetted(),
         transportWedged: transport.wedged(now),
         anchorReachable: transport.anchorReachable(),
+        transportFault: transport.diagnosis()?.fault ?? null,
         admin: adminSelf,
         auditIntegrity,
       },

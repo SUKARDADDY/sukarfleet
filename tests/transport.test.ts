@@ -2,7 +2,14 @@
 import { describe, expect, test } from 'bun:test';
 import { defaultConfig } from '../src/config';
 import type { RunOptions, RunResult } from '../src/util';
-import { ANCHOR_MISS_POLLS, ClockSentinel, Transport, generateEasytierToml } from '../src/transport';
+import {
+  ANCHOR_MISS_POLLS,
+  ClockSentinel,
+  Transport,
+  diagnoseTransport,
+  generateEasytierToml,
+  parseConnectorJson,
+} from '../src/transport';
 
 function fakeRunner(handler: (argv: string[], opts?: RunOptions) => RunResult | Promise<RunResult>) {
   return async (argv: string[], opts?: RunOptions): Promise<RunResult> => handler(argv, opts);
@@ -95,12 +102,22 @@ describe('Transport.pollOnce defensive parsing', () => {
 
 // Dispatching fake for the real two-command poll: `peer list` for presence,
 // `stats` for the raw aggregate counters.
-function fleetRunner(opts: { peers: () => string; statsTotal: () => number | null }) {
+function fleetRunner(opts: {
+  peers: () => string;
+  statsTotal: () => number | null;
+  // Polled only when the peer table holds nobody but this machine; an empty
+  // list is the honest default for a fixture that does not care.
+  connectors?: () => string;
+}) {
   const cfg = defaultConfig('alpha');
   const base = [cfg.easytier.cliPath, '-p', cfg.easytier.rpcAddr, '-o', 'json'];
   return fakeRunner((argv) => {
     // Pin the exact CLI vectors: the production outage was a wrong interface
     // (`peer --output-format json`), so a loose match here guards nothing.
+    if (argv.includes('connector')) {
+      expect(argv).toEqual([...base, 'connector', 'list']);
+      return { code: 0, stdout: opts.connectors?.() ?? '[]', stderr: '' };
+    }
     if (argv.includes('peer')) {
       expect(argv).toEqual([...base, 'peer', 'list']);
       return { code: 0, stdout: opts.peers(), stderr: '' };
@@ -444,5 +461,126 @@ describe('Transport anchor reachability', () => {
     const t = new Transport(roamerCfg(), { runner: fleetRunner({ peers: stranger, statsTotal: () => 100 }) });
     for (let i = 1; i <= ANCHOR_MISS_POLLS; i++) await t.pollOnce(i * 1000);
     expect(t.anchorReachable()).toBe(false);
+  });
+});
+
+describe('parseConnectorJson', () => {
+  test('reads the v2.6.4 ordinal shape', () => {
+    const out = parseConnectorJson(
+      JSON.stringify([
+        { url: { url: 'udp://192.0.2.200:11010' }, status: 2 },
+        { url: { url: 'tcp://198.51.100.10:44310' }, status: 0 },
+      ]),
+    );
+    expect(out).toEqual([
+      { uri: 'udp://192.0.2.200:11010', status: 'connecting' },
+      { uri: 'tcp://198.51.100.10:44310', status: 'connected' },
+    ]);
+  });
+
+  test('also accepts the rendered status names, and calls anything else unknown', () => {
+    const out = parseConnectorJson(
+      JSON.stringify([
+        { url: { url: 'udp://192.0.2.1:11010' }, status: 'Connected' },
+        { url: { url: 'udp://192.0.2.2:11010' }, status: 99 },
+      ]),
+    );
+    expect(out).toEqual([
+      { uri: 'udp://192.0.2.1:11010', status: 'connected' },
+      { uri: 'udp://192.0.2.2:11010', status: 'unknown' },
+    ]);
+  });
+
+  test('untrusted shapes return null or are skipped, never throw', () => {
+    expect(parseConnectorJson('not json')).toBeNull();
+    expect(parseConnectorJson('{"oops":true}')).toBeNull();
+    expect(parseConnectorJson(JSON.stringify([{ url: null, status: 0 }, { status: 0 }, 7]))).toEqual([]);
+  });
+});
+
+describe('diagnoseTransport', () => {
+  const connected = { uri: 'udp://198.51.100.10:11010', status: 'connected' as const };
+  const dialing = { uri: 'udp://192.0.2.200:11010', status: 'connecting' as const };
+
+  test('a non-local peer is ok regardless of connector state', () => {
+    expect(diagnoseTransport(1, [dialing]).fault).toBe('ok');
+  });
+
+  test('no connectors at all is its own fault', () => {
+    expect(diagnoseTransport(0, []).fault).toBe('no-connectors');
+  });
+
+  test('every connector still dialling means no path exists', () => {
+    const d = diagnoseTransport(0, [dialing]);
+    expect(d.fault).toBe('all-connectors-down');
+    expect(d.dialingUris).toEqual(['udp://192.0.2.200:11010']);
+  });
+
+  test('connected but peerless is the non-converging session, not an outage', () => {
+    const d = diagnoseTransport(0, [dialing, connected]);
+    expect(d.fault).toBe('connected-without-peer');
+    expect(d.connectedUris).toEqual(['udp://198.51.100.10:11010']);
+    expect(d.dialingUris).toEqual(['udp://192.0.2.200:11010']);
+    expect(d.summary).toContain('not converging');
+  });
+});
+
+describe('Transport diagnosis wiring', () => {
+  function runnerFor(peers: string, connectors: string, seen: string[][]) {
+    return fakeRunner((argv) => {
+      seen.push(argv);
+      if (argv.includes('connector')) return { code: 0, stdout: connectors, stderr: '' };
+      if (argv.includes('peer')) return { code: 0, stdout: peers, stderr: '' };
+      return { code: 0, stdout: JSON.stringify([{ name: 'traffic_bytes_rx', value: 1 }]), stderr: '' };
+    });
+  }
+
+  test('an empty peer table with a connected connector is diagnosed, not just reported empty', async () => {
+    const cfg = defaultConfig('alpha');
+    const seen: string[][] = [];
+    const t = new Transport(cfg, {
+      runner: runnerFor(
+        peerJson([{ hostname: 'alpha', rx_bytes: 0, tx_bytes: 0 }]),
+        JSON.stringify([
+          { url: { url: 'udp://192.0.2.200:11010' }, status: 2 },
+          { url: { url: 'udp://198.51.100.10:11010' }, status: 0 },
+        ]),
+        seen,
+      ),
+    });
+    await t.pollOnce(1000);
+    expect(t.diagnosis()?.fault).toBe('connected-without-peer');
+    expect(seen.some((argv) => argv.includes('connector'))).toBe(true);
+  });
+
+  test('a healthy mesh costs no extra connector round-trip', async () => {
+    const cfg = defaultConfig('alpha');
+    const seen: string[][] = [];
+    const t = new Transport(cfg, {
+      runner: runnerFor(
+        peerJson([
+          { hostname: 'alpha', rx_bytes: 0, tx_bytes: 0 },
+          { hostname: 'beta', rx_bytes: 10, tx_bytes: 10 },
+        ]),
+        '[]',
+        seen,
+      ),
+    });
+    await t.pollOnce(1000);
+    expect(t.diagnosis()?.fault).toBe('ok');
+    expect(seen.some((argv) => argv.includes('connector'))).toBe(false);
+  });
+
+  test('an unreadable connector list leaves no opinion rather than a false all-clear', async () => {
+    const cfg = defaultConfig('alpha');
+    const t = new Transport(cfg, {
+      runner: fakeRunner((argv) => {
+        if (argv.includes('connector')) return { code: 1, stdout: '', stderr: 'rpc portal refused' };
+        if (argv.includes('peer')) return { code: 0, stdout: peerJson([]), stderr: '' };
+        return { code: 0, stdout: JSON.stringify([{ name: 'traffic_bytes_rx', value: 1 }]), stderr: '' };
+      }),
+    });
+    await t.pollOnce(1000);
+    expect(t.diagnosis()).toBeNull();
   });
 });

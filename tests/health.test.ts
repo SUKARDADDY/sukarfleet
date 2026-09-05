@@ -294,6 +294,33 @@ describe('Health.evaluate', () => {
     expect(roamerCalls.some((c) => c.title.includes('anchor unreachable'))).toBe(true);
   });
 
+  test('anchor-unreachable names the transport cause when the daemon knows it', async () => {
+    const cfg = healthyCfg({}, 'roamer');
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+    const self = healthySelf();
+    self.anchorReachable = false;
+    self.transportFault = 'connected-without-peer';
+    await health.evaluate(Date.UTC(2026, 0, 1, 12, 0, 0), self, []);
+    expect(calls.some((c) => c.title.includes('anchor unreachable'))).toBe(true);
+    const state = await health.getState();
+    expect(state.faults.some((f) => f.message === 'anchor unreachable (connected-without-peer)')).toBe(true);
+  });
+
+  test('an ok or absent transport fault leaves the plain message untouched', async () => {
+    for (const fault of [undefined, null, 'ok']) {
+      const cfg = healthyCfg({}, 'roamer');
+      const { notifier } = fakeNotifier();
+      const health = new Health(cfg, notifier);
+      const self = healthySelf();
+      self.anchorReachable = false;
+      self.transportFault = fault as string | null | undefined;
+      await health.evaluate(Date.UTC(2026, 0, 1, 12, 0, 0), self, []);
+      const state = await health.getState();
+      expect(state.faults.some((f) => f.message === 'anchor unreachable')).toBe(true);
+    }
+  });
+
   test('getState exposes faults with firstSeenMs/lastNotifiedMs and digest date', async () => {
     const cfg = healthyCfg();
     const { notifier } = fakeNotifier();
