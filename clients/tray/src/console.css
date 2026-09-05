@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* sukarfleet native console. Dark-first brand theme; a light scheme is provided via
    prefers-color-scheme. No web fonts beyond the two bundled IBM Plex Sans weights —
    everything else in here is self-contained, matching the CSP (default-src 'self'). */
@@ -236,8 +237,13 @@ button.quiet.danger { color: var(--bad); }
 .parsed .bad { color: var(--bad); }
 
 /* ── pairing code ───────────────────────────────────────────────────── */
+/* Sized so all fourteen characters of XXXX-XXXX-XXXX stay on ONE line: at the 1.5rem floor a
+   monospace character plus its tracking is about 17px, so the line is ~242px. This window cannot
+   go below 760px, so the clamp never reaches that floor here -- the rule is kept identical to the
+   web console's (ui/style.css) so the code reads the same in both, and word-break stays as the
+   last resort. */
 .code-display {
-  font-family: var(--mono); font-size: clamp(1.8rem, 7vw, 3rem); font-weight: 700;
+  font-family: var(--mono); font-size: clamp(1.5rem, 5.4vw, 2.6rem); font-weight: 700;
   letter-spacing: .12em; margin: .4rem 0; word-break: break-all; color: var(--accent);
 }
 

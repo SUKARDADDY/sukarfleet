@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Generate tray + app icons from the sukarfleet brand mark (brand/icon-reduced.svg
 geometry: hex mesh on a 100-unit grid). The mesh silhouette is constant; the CENTER
 node carries the health state — colour AND shape (colourblind-safe, survives GNOME

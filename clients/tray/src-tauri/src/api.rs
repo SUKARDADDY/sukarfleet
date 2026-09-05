@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Allowlisted passthrough bridge: the console webview's ONLY path to the
 //! daemon. The webview cannot fetch 127.0.0.1 directly (no CORS on the
 //! daemon), and this allowlist keeps it from becoming a generic localhost

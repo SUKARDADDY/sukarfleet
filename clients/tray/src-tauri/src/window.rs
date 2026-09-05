@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Console window lifecycle. A normal decorated, resizable window (forms and
 //! out-of-band steps must survive focus loss — e.g. copying the mesh-secret
 //! sudo command into a terminal). Hidden, not destroyed, on close so reopen

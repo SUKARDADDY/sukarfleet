@@ -5,3 +5,8 @@ node_modules/
 # names, mesh addresses and public keys, so it must never reach the public repo
 # (see tests/freeze/README.md). The committed golden files are synthetic.
 tests/freeze/live-capture.json
+
+# The native tray's build output -- cargo's target/ and Tauri's codegen gen/ -- is
+# ignored by clients/tray/.gitignore, which git reads relative to that directory.
+# Listed here so a reader at the root knows where it is handled, not duplicated.
+# tests/no-personal-data.test.ts skips the same two directory names.

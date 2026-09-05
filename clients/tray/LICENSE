@@ -1,0 +1,20 @@
+The native tray is MIT-licensed, not AGPL like the daemon it talks to. It is a
+client: it speaks to sukarfleetd over the daemon's local HTTP API and ships as a
+separate binary, so embedding it or building on it carries no copyleft duty.
+
+Full text: ../../LICENSES/MIT.txt
+Rationale and the licence boundary for the whole repository: ../../LICENSING.md
+
+Two things in this directory are outside that MIT grant.
+
+src/fonts/*.woff2 is a different licence entirely: it covers the bundled IBM
+Plex Sans font files, which are not ours. IBM's copyright notice and the
+Reserved Font Name are in src/fonts/LICENSE.txt; the SIL Open Font License 1.1
+itself is in ../../LICENSES/OFL-1.1.txt, and OFL condition 2 means both have to
+travel with any copy of those files.
+
+brand/ holds the project's marks -- the sukarfleet symbol and wordmark -- along
+with every icon derived from them under src-tauri/icons/ and src/assets/. Those
+are not licensed under MIT and are excluded from the grant: MIT covers the code,
+not the identity. Use them to refer to sukarfleet, not to imply the project
+endorses you and not to brand other software.

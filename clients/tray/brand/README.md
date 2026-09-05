@@ -19,3 +19,11 @@ Wordmark: IBM Plex Sans 500, tracking −0.035em, always lowercase.
 Clear space: one node diameter (10 units of the 100-unit grid) on all sides.
 
 Lockup SVGs keep live text — convert to outlines before handing to anyone without IBM Plex Sans.
+
+## Licence
+
+These marks are not MIT. `clients/tray/**` is MIT and `brand/` is carved out of
+it, along with every icon derived from these files under `../src-tauri/icons/`
+and `../src/assets/`: MIT covers the code, not the identity. Use them to refer
+to sukarfleet, not to imply the project endorses you and not to brand other
+software. Full picture: `../../../LICENSING.md`.
