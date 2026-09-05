@@ -3,7 +3,7 @@
 
 import { join } from 'node:path';
 import type { FleetConfig, GossipEnvelope, MachineKey, PeerConfig, PeerView, PresencePayload } from './types';
-import { atomicWrite, b64decode, b64encode, canonicalJson, log, nowMs, readJsonFile } from './util';
+import { atomicWrite, b64decode, b64encode, canonicalJson, log, nowMs, readJsonFile, TransitionGate } from './util';
 import { stateDir } from './config';
 
 type UnsignedEnvelope = Omit<GossipEnvelope, 'sigB64'>;
@@ -72,6 +72,10 @@ export class Gossip {
   private seqLoaded = false;
   private seqValue = 0;
   private lastPersistMs = 0;
+  // Keyed by peer name. broadcastOnce logs loud (info) only on the entered/recovered transitions;
+  // a peer stuck down repeats at debug instead of a warn every gossip tick. The durable signal for
+  // an operator stays the peer-offline health fault -- this only quiets the journal.
+  private readonly broadcastGate = new TransitionGate();
 
   constructor(
     private readonly cfg: FleetConfig,
@@ -132,15 +136,40 @@ export class Gossip {
             signal: controller.signal,
           });
           if (!res.ok) {
+            // The peer ANSWERED -- it is up, just rejecting (auth/version skew, most likely).
+            // That is a different failure than "can't reach it at all" (the catch block below,
+            // which IS the offline signal), so it deliberately never touches broadcastGate: an
+            // unpaired/rejecting peer would otherwise sit silently debounced as if it were merely
+            // offline. Unconditional warn every tick -- this is the only visibility the sending
+            // side has at all on a one-way trust break, since the rejecting peer's own operator
+            // sees nothing wrong from where they sit.
             log('warn', 'gossip: broadcast rejected by peer', { peer: peer.name, status: res.status });
+          } else {
+            this.logBroadcastTransition(peer.name, false, { peer: peer.name });
           }
         } catch (err) {
-          log('warn', 'gossip: broadcast to peer failed', { peer: peer.name, error: String(err) });
+          this.logBroadcastTransition(peer.name, true, { peer: peer.name, error: String(err) });
         } finally {
           clearTimeout(timer);
         }
       }),
     );
+  }
+
+  // Transition-only logging for one peer's broadcast outcome this tick. isBad=true here means
+  // "unreachable" (a thrown/aborted fetch) ONLY -- a non-OK response is a peer that answered and
+  // is handled separately, unconditionally, in broadcastOnce, because "up but rejecting" and "not
+  // reachable at all" are different failures an operator needs to tell apart. Only the flip logs
+  // loud: the first unreachable tick is worth an operator's attention (info), a peer still down an
+  // hour later is not (debug); the first success after failures gets its own "recovered" line, a
+  // peer that was already fine stays silent.
+  private logBroadcastTransition(peerName: string, isBad: boolean, extra: Record<string, unknown>): void {
+    const transition = this.broadcastGate.observe(peerName, isBad);
+    if (isBad) {
+      log(transition === 'entered' ? 'info' : 'debug', 'gossip: peer went offline', extra);
+    } else if (transition === 'recovered') {
+      log('info', 'gossip: peer recovered', extra);
+    }
   }
 
   async receive(envelope: GossipEnvelope, peers: PeerConfig[]): Promise<boolean> {
