@@ -24,7 +24,10 @@ exists. That means a LAN or WAN address and the EasyTier listener port, not a me
 Written as `tcp://198.51.100.7:11010`.
 
 You also need Git for Windows on PATH (`winget install --id Git.Git`) and the OpenSSH client,
-which Windows 10 and 11 ship as an optional feature. Bun is installed for you if it is missing.
+which Windows 10 and 11 ship as an optional feature. Both are checked before anything is
+downloaded or installed, so a machine that is missing one is refused while it is still
+untouched. Bun is installed for you if it is missing, pinned to the version this tree's
+`bun.lock` was resolved against, the same one `install/quickstart.sh` gives a Linux machine.
 
 ## What it does
 

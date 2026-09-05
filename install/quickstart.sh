@@ -42,7 +42,7 @@ USER_UNIT_DIR="$HOME/.config/systemd/user"
 UNIT_SRC="$REPO_ROOT/systemd/sukarfleet.service"
 UNIT_DST="$USER_UNIT_DIR/sukarfleet.service"
 ELEVATED="$REPO_ROOT/install/install-elevated.sh"
-PINS_FILE="$REPO_ROOT/install/easytier-pins.txt"
+PINS_FILE="${SUKARFLEET_PINS_FILE:-$REPO_ROOT/install/easytier-pins.txt}"
 BIN_DIR="$HOME/.local/bin"
 TRAY_BIN="$BIN_DIR/sukarfleet-tray"
 AUTOSTART_DIR="$HOME/.config/autostart"
@@ -86,15 +86,38 @@ act() {
 
 # put_file <mode> <path>, content on stdin. One place that knows how to not write
 # a file, and one place that knows a config file is 0600 the moment it exists.
+#
+# Temp file, then chmod, then content, then rename. Writing first and chmod'ing
+# after leaves the file readable by every process on the machine for as long as
+# the write takes, and config.json is where the mesh identity lives; the rename
+# also means a daemon reading the file concurrently sees the old one or the new
+# one, never half of one.
 put_file() {
-  local mode="$1" path="$2" content
+  local mode="$1" path="$2" content tmp
   content="$(cat)"
   if [ "$DRY_RUN" = "1" ]; then
     dry "write $path (mode $mode, $(printf '%s' "$content" | wc -c) bytes)"
     return 0
   fi
-  printf '%s\n' "$content" > "$path"
-  chmod "$mode" "$path"
+  tmp="$(mktemp "$path.XXXXXX")" || die "could not create a temporary file beside $path" 3
+  chmod "$mode" "$tmp"
+  printf '%s\n' "$content" > "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+# Shapes for anything that reaches config.json or a command line. The name
+# charset is the daemon's own MACHINE_NAME_RE (src/uiserve.ts): a machine name
+# carrying a quote is a config.json this scaffold would write broken, and the
+# daemon would then refuse to start on a file the installer wrote.
+valid_name() {
+  [ -n "$1" ] || return 1
+  [ "${#1}" -le 64 ] || return 1
+  case "$1" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+}
+valid_ipv4() {
+  local o
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do [ "$o" -le 255 ] || return 1; done
 }
 
 # Every systemctl call, read or write, so a dry run cannot touch a live daemon.
@@ -134,6 +157,7 @@ Environment (test seams, see docs/INSTALL-FLOW.md):
   SUKARFLEET_SKIP_DISTRO_CHECK=1  the non-apt escape hatch (section 9)
   SUKARFLEET_RELEASE_BASE=URL     where the tray binary is fetched from
   SUKARFLEET_STATE=DIR            state directory (also read by the daemon)
+  SUKARFLEET_PINS_FILE=PATH       the pin file to read (tests use a copy)
 EOF
 }
 
@@ -156,6 +180,14 @@ case "${OPT_ROLE:-anchor}" in
   anchor|roamer) ;;
   *) die "--role must be 'anchor' or 'roamer', got '$OPT_ROLE'" ;;
 esac
+# Both of these are interpolated into the scaffolded config.json below, so they
+# are checked here rather than trusted there.
+if [ -n "$OPT_MACHINE" ] && ! valid_name "$OPT_MACHINE"; then
+  die "--machine must be 1-64 characters of letters, digits, dot, dash or underscore, got '$OPT_MACHINE'"
+fi
+if [ -n "$OPT_MESH_IP" ] && ! valid_ipv4 "$OPT_MESH_IP"; then
+  die "--mesh-ip must be an IPv4 address like 192.0.2.3, got '$OPT_MESH_IP'"
+fi
 if [ -n "$OPT_NODE_PORT" ]; then
   case "$OPT_NODE_PORT" in
     ''|*[!0-9]*) die "--node-port must be a number, got '$OPT_NODE_PORT'" ;;
@@ -278,7 +310,17 @@ else
     ldconfig -p 2>/dev/null | grep -q "$lib" || MISSING_LIBS+=("$lib")
   done
   if [ "${#MISSING_LIBS[@]}" -gt 0 ]; then
-    TRAY_REASON="the console window needs ${MISSING_LIBS[*]}, which ldconfig cannot find"
+    # Wording matched to the failure table in docs/INSTALL-FLOW.md section 6:
+    # "A and B, neither of which ldconfig can find" when both are missing, and
+    # the singular when only one is. "${MISSING_LIBS[*]}" reads as one library
+    # with a space in its name.
+    MISSING_JOINED="$(printf '%s and ' "${MISSING_LIBS[@]}")"
+    MISSING_JOINED="${MISSING_JOINED% and }"
+    if [ "${#MISSING_LIBS[@]}" -gt 1 ]; then
+      TRAY_REASON="the console window needs ${MISSING_JOINED}, neither of which ldconfig can find"
+    else
+      TRAY_REASON="the console window needs ${MISSING_JOINED}, which ldconfig cannot find"
+    fi
   fi
 fi
 
@@ -360,6 +402,13 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 MACHINE="${OPT_MACHINE:-${CONFIG_MACHINE:-$(hostname)}}"
 [ -n "$MACHINE" ] || die "hostname is empty and --machine= was not given"
+# Not only the flag: this value can also come from `hostname` or from an existing
+# config.json, and it is written into config.json, into the SSH key comment and
+# into the banner from all three.
+valid_name "$MACHINE" || \
+  die "this machine's name is '$MACHINE', which is not 1-64 characters of letters, digits, dot, dash or underscore. Pass --machine=NAME to choose one." 3
+SSH_USER="${USER:-$(id -un)}"
+valid_name "$SSH_USER" || die "the user name '$SSH_USER' is not a shape this installer can write into config.json." 3
 
 ADMIN_ENABLED=false
 
@@ -375,7 +424,7 @@ backfill_admin_fields() {
   # The single-quoted body is a JS program handed to bun; nothing in it may be
   # expanded by this shell, which is the point of the quoting.
   # shellcheck disable=SC2016
-  SUKARFLEET_CONFIG_FILE="$CONFIG_FILE" SUKARFLEET_SSH_USER="${USER:-$(id -un)}" "$BUN_BIN" -e '
+  SUKARFLEET_CONFIG_FILE="$CONFIG_FILE" SUKARFLEET_SSH_USER="$SSH_USER" "$BUN_BIN" -e '
     const fs = require("node:fs");
     const path = process.env.SUKARFLEET_CONFIG_FILE;
     const user = process.env.SUKARFLEET_SSH_USER || "";
@@ -452,7 +501,7 @@ else
   "admin": {
     "enabled": false,
     "acceptIncoming": true,
-    "sshUser": "${USER:-$(id -un)}",
+    "sshUser": "$SSH_USER",
     "uiEnabled": true
   }
 }
@@ -684,26 +733,53 @@ fi
 # console URL and continues at exit 0 -- a machine with a daemon and a browser is
 # installed; a machine with a half-written binary in ~/.local/bin is not.
 
-# Reads one pin line: pin_lookup <asset-prefix> <arch> -> "sha256 asset"
+# Reads one pin line: pin_lookup <asset-prefix> <arch> -> "sha256 asset".
+# Exit 0 with the line, 1 for no pin, 2 for a pin file that contradicts itself.
+# Two lines for the same (version, arch, asset-prefix) mean nobody knows which
+# SHA256 this machine should trust, and taking the first is how a stale pin
+# outlives the line meant to replace it. A TODO-S9 line never shadows a real
+# one either: the first VALID pin wins, whatever order they sit in.
 pin_lookup() {
   local prefix="$1" arch="$2"
   [ -f "$PINS_FILE" ] || return 1
   awk -v p="$prefix" -v a="$arch" '
     /^[[:space:]]*#/ { next }
     NF < 4 { next }
-    $2 == a && index($4, p) == 1 { print $3 " " $4; found = 1; exit }
-    END { if (!found) exit 1 }
+    $2 != a { next }
+    index($4, p) != 1 { next }
+    {
+      key = $1 SUBSEP $2
+      if (key in seen) { dupver = $1; duparch = $2; exit }
+      seen[key] = 1
+      if ($3 != "TODO-S9") { if (!haveval) { haveval = 1; valline = $3 " " $4 } }
+      else if (!havetodo) { havetodo = 1; todoline = $3 " " $4 }
+    }
+    END {
+      if (dupver != "") { printf("duplicate pin for %s %s\n", dupver, duparch) > "/dev/stderr"; exit 2 }
+      if (haveval) { print valline; exit 0 }
+      if (havetodo) { print todoline; exit 0 }
+      exit 1
+    }
   ' "$PINS_FILE"
 }
 
 TRAY_INSTALLED=0
+# A fetch or a checksum that failed is a different sentence from "this machine
+# was never going to get a tray", and section 6 gives it its own row.
+TRAY_FETCH_FAILED=0
+TRAY_DETAIL=""
 if [ -n "$TRAY_REASON" ]; then
   : # decided in preflight; reported in the banner
 else
-  PIN_LINE="$(pin_lookup 'sukarfleet-tray-' "$ARCH" || true)"
+  set +e
+  PIN_LINE="$(pin_lookup 'sukarfleet-tray-' "$ARCH" 2>/dev/null)"
+  PIN_RC=$?
+  set -e
   TRAY_SHA="${PIN_LINE%% *}"
   TRAY_ASSET="${PIN_LINE##* }"
-  if [ -z "$PIN_LINE" ]; then
+  if [ "$PIN_RC" = "2" ]; then
+    TRAY_REASON="install/easytier-pins.txt has more than one tray pin for $ARCH at the same version, so there is no single SHA256 to trust"
+  elif [ -z "$PIN_LINE" ]; then
     TRAY_REASON="no tray pin for $ARCH in install/easytier-pins.txt"
   elif [ "$TRAY_SHA" = "TODO-S9" ]; then
     # The honest state before the first release: a pin nobody has computed is not
@@ -726,12 +802,15 @@ else
       TRAY_TMP="$(mktemp -t sukarfleet-tray.XXXXXX)"
       if ! curl -fsSL --max-time 120 -o "$TRAY_TMP" "$RELEASE_BASE/$TRAY_ASSET" 2>/dev/null; then
         rm -f "$TRAY_TMP"
+        TRAY_FETCH_FAILED=1
         TRAY_REASON="could not download $TRAY_ASSET from $RELEASE_BASE"
       else
         GOT="$(sha256sum "$TRAY_TMP" | cut -d' ' -f1)"
         if [ "$GOT" != "$TRAY_SHA" ]; then
           rm -f "$TRAY_TMP"
-          TRAY_REASON="SHA256 mismatch for $TRAY_ASSET against install/easytier-pins.txt (expected $TRAY_SHA, got $GOT). Nothing was installed to $BIN_DIR"
+          TRAY_FETCH_FAILED=1
+          TRAY_REASON="SHA256 mismatch against install/easytier-pins.txt"
+          TRAY_DETAIL="expected $TRAY_SHA, got $GOT for $TRAY_ASSET. Report a checksum mismatch rather than retrying it."
         else
           install -m 0755 "$TRAY_TMP" "$TRAY_BIN"
           rm -f "$TRAY_TMP"
@@ -769,8 +848,11 @@ EOF
   # --endpoint), so the browser console is the fallback worth naming.
   case "${XDG_CURRENT_DESKTOP:-}" in
     *GNOME*|*gnome*)
-      note "  if no icon appears, GNOME needs the AppIndicator extension (gnome-shell-extension-appindicator) to show it. Until it is installed, open the console at ${UI_URL}" ;;
+      note "the tray is running but GNOME needs the AppIndicator extension (gnome-shell-extension-appindicator) to show it. Until it is installed, open the console at ${UI_URL}" ;;
   esac
+elif [ "$TRAY_FETCH_FAILED" = "1" ]; then
+  warn "could not install sukarfleet-tray (${TRAY_REASON}). Nothing was installed to ${BIN_DIR}. The daemon and the web console are unaffected: ${UI_URL}"
+  [ -n "$TRAY_DETAIL" ] && note "  $TRAY_DETAIL"
 elif [ -n "$TRAY_REASON" ] && [ "$DESKTOP" = "1" ] && [ "$ARCH" != "x86_64" ]; then
   note "no tray build for $ARCH yet. The daemon is installed and running; use the web console at ${UI_URL}"
 elif [ -n "$TRAY_REASON" ] && [ "$DESKTOP" = "1" ] && [ "$DO_TRAY" = "1" ]; then
@@ -871,8 +953,12 @@ fi
 # "Already installed" is the user stage's verdict on itself: a config it did not
 # have to write and a daemon that was already answering /health. Whether the mesh
 # is up is the banner's line above, not this one's.
+# The elapsed time here is THIS stage. install/get.sh clones or fetches the
+# checkout before this script starts and prints its own duration, so a re-run
+# that took twenty seconds of wall clock and reports four here is not a lie --
+# the other sixteen were the checkout, and that line says so.
 if [ "$CONFIG_EXISTED" = "1" ] && [ "$RERUN" = "1" ]; then
-  note "done in $(elapsed)s. This machine is already installed."
+  note "done in $(elapsed)s in this stage (install/get.sh timed the checkout separately). This machine is already installed."
 else
   note "done in $(elapsed)s"
 fi

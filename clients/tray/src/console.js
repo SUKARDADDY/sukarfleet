@@ -37,9 +37,12 @@ const COPY = {
   noAudit: 'No audit entries yet.',
   noTargets: 'No paired machine to target yet.',
 
-  identitySaved: 'Identity saved.',
+  identitySaved: 'Saved.',
+  // Identity is read once at boot, so a save is a config.json write and nothing
+  // else until the daemon comes back. POST /api/ui/setup/identity says so with
+  // restartRequired; the restart control below the card is the other half.
+  identitySavedRestart: 'Saved. Restart the daemon to apply.',
   identityUnchanged: 'Nothing changed.',
-  identityRestartNote: 'A saved identity needs a daemon restart to take effect.',
   meshStateNone: 'No mesh secret staged on this machine.',
   meshStatePending: 'A secret is staged and waiting for the one root step below.',
   meshStateInstalled: 'The mesh secret is installed. Nothing to do here.',
@@ -887,9 +890,9 @@ function wireSetup() {
     if (networkName) patch.networkName = networkName;
     if (!Object.keys(patch).length) { result('identity-result', COPY.identityUnchanged); return; }
     try {
-      await api('/api/ui/setup/identity', { method: 'POST', body: patch });
+      const saved = await api('/api/ui/setup/identity', { method: 'POST', body: patch });
       identityDirty = false;
-      result('identity-result', `${COPY.identitySaved} ${COPY.identityRestartNote}`, 'ok');
+      result('identity-result', saved && saved.restartRequired ? COPY.identitySavedRestart : COPY.identitySaved, 'ok');
       await pollState();
     } catch (err) {
       result('identity-result', err.message, 'bad');

@@ -691,7 +691,14 @@ export class UiRoutes {
 
     const result = await this.deps.patchIdentity(patch);
     if (!result.ok) return jsonResponse({ ok: false, message: result.message ?? 'the change was rejected' }, 400);
-    return jsonResponse({ ok: true });
+    // The write lands in config.json and NOWHERE else: the servers bound
+    // cfg.nodePort and gossip signs as cfg.machine at boot, so this process
+    // keeps reporting the old identity -- `setup.identity` in /api/ui/state
+    // stays false -- until it is restarted. That was invisible on a fresh
+    // machine: the save said "Identity saved", the state said the step was not
+    // done, and nothing on either console connected the two. The flag is what
+    // both consoles turn into a sentence and a restart button.
+    return jsonResponse({ ok: true, restartRequired: true });
   }
 
   private async getNetworkSecret(): Promise<Response> {

@@ -73,6 +73,10 @@ param(
   [string[]] $Repo = @(),
 
   # --- behaviour ---
+  # The Bun this tree's bun.lock was resolved against, matching BUN_VERSION in
+  # install/quickstart.sh. Pinned rather than 'latest' so a fresh Windows machine and a fresh
+  # Linux machine end up on the same Bun. Pass 'latest' if you want whatever bun.sh ships today.
+  [string] $BunVersion = '1.3.14',
   [switch] $Restart,
   [switch] $NoOpen,
 
@@ -99,6 +103,9 @@ $PeerUri = @($PeerUri |
 # ---------------------------------------------------------------------------
 
 $script:Tag = if ($Stage -eq 'Elevated') { 'elevated' } else { 'quickstart' }
+# StrictMode 2.0 throws on a read of a variable that was never assigned, so this is declared
+# here rather than the first time Invoke-Preflight looks at it.
+$script:PreflightDone = $false
 
 function Write-Step { param([string] $m) Write-Host "[$script:Tag] $m" }
 function Write-Note { param([string] $m) Write-Host "[$script:Tag] $m" -ForegroundColor DarkGray }
@@ -147,6 +154,22 @@ function Test-Elevated {
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# The two things this installer will not install for you. It runs before anything is
+# downloaded, unpacked or registered, so a machine that is going to be refused is refused while
+# it is still untouched. Deliberately NOT called from the elevated stage: that stage needs
+# neither tool, and an administrator's PATH is not the logged-in user's PATH, so checking there
+# would refuse a machine that is in fact fine.
+function Invoke-Preflight {
+  if ($script:PreflightDone) { return }
+  foreach ($tool in @('git', 'ssh-keygen')) {
+    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+      if ($tool -eq 'git') { Write-Die 'git is not on PATH. Install Git for Windows (winget install --id Git.Git), open a new terminal, then re-run. Nothing was installed.' }
+      Write-Die 'ssh-keygen is not on PATH. Add the OpenSSH Client optional feature (Settings > System > Optional features), then re-run. Nothing was installed.'
+    }
+  }
+  $script:PreflightDone = $true
+}
+
 # ---------------------------------------------------------------------------
 # Paths. These must match src/config.ts, which uses os.homedir() + '.config' and
 # '.local/state' on every platform. They are not Windows conventions; they are what
@@ -185,6 +208,17 @@ $MeshHashes = @{
 # equivalent is: break inheritance, drop every inherited entry, grant exactly one identity.
 # ---------------------------------------------------------------------------
 
+# Two writes, not one, and the order matters. Set-Acl persists the sections the ACL object was
+# asked to change, so an object carrying both a new DACL and a new owner goes in one
+# all-or-nothing call: refuse the owner and the access rules are refused with it, leaving the
+# file with the inherited, everyone-in-the-box ACL this function exists to remove. Ownership is
+# the half that gets refused. Launched from a scheduled task under an elevated account the file
+# is often already owned by BUILTIN\Administrators, and handing it back to the user is a
+# privileged write that the task's token need not carry.
+#
+# So the access rules go first and stand on their own, and the owner is a second, best-effort
+# call. Ownership is worth having, since an owner can re-open a file whatever the DACL says, but
+# it is not the security property here: "nobody else can read this" is, and that is the DACL.
 function Set-PrivateAcl {
   param([Parameter(Mandatory)] [string] $Path,
         [string[]] $Identities = @())
@@ -192,17 +226,38 @@ function Set-PrivateAcl {
   if (-not $Identities -or $Identities.Count -eq 0) {
     $Identities = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
   }
+  # Inheritance flags say what a CHILD of this object inherits, so they are meaningless on a
+  # leaf file and Windows is entitled to reject an ACE that carries them there. This function is
+  # called on three directories and on one file, the SSH private key, and the key is the one
+  # whose ACL step was failing, so it asks what it is looking at rather than assuming.
+  $inherit = if ([IO.Directory]::Exists($Path)) { 'ContainerInherit,ObjectInherit' } else { 'None' }
+
   $acl = Get-Acl -LiteralPath $Path
   $acl.SetAccessRuleProtection($true, $false)   # protect from inheritance, copy nothing down
   foreach ($rule in @($acl.Access)) { [void] $acl.RemoveAccessRule($rule) }
   foreach ($ident in $Identities) {
     $sid = New-Object Security.Principal.SecurityIdentifier($ident)
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
-      $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+      $sid, 'FullControl', $inherit, 'None', 'Allow')))
   }
-  $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier(
-    [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)))
   Set-Acl -LiteralPath $Path -AclObject $acl
+
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  try {
+    $owned = Get-Acl -LiteralPath $Path
+    if ($owned.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $me) {
+      $owned.SetOwner((New-Object Security.Principal.SecurityIdentifier($me)))
+      Set-Acl -LiteralPath $Path -AclObject $owned
+    }
+  } catch {
+    # Only on the failure path, and only for the message: a raw S-1-5-32-544 tells the operator
+    # nothing about what did get restricted.
+    $who = @($Identities | ForEach-Object {
+      try { (New-Object Security.Principal.SecurityIdentifier($_)).Translate([Security.Principal.NTAccount]).Value }
+      catch { $_ }
+    }) -join ', '
+    Write-Warn "$Path is now open to $who and to nobody else, which is the part that matters, but its owner could not be changed to this account: $($_.Exception.Message). Access is restricted; ownership is not. Take it by hand if you want it: takeown /f `"$Path`""
+  }
 }
 
 function New-PrivateDir {
@@ -213,8 +268,15 @@ function New-PrivateDir {
 }
 
 # Writes a file only the current user can read, without ever putting the content on a command line.
+#
+# [AllowEmptyString()] because Mandatory implies the opposite: PowerShell rejects '' for a
+# mandatory [string] with "Cannot bind argument to parameter 'Content' because it is an empty
+# string", and this function's whole job for authorized_keys and known_hosts is to create them
+# empty with the right ACL. Mandatory is still what is wanted here - the caller must say what
+# goes in the file, and "nothing" is a thing to say.
 function Write-PrivateFile {
-  param([Parameter(Mandatory)] [string] $Path, [Parameter(Mandatory)] [string] $Content)
+  param([Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Content)
   $dir = Split-Path -Parent $Path
   if (-not (Test-Path -LiteralPath $dir)) { [void] (New-Item -ItemType Directory -Force -Path $dir) }
   $utf8 = New-Object Text.UTF8Encoding($false)
@@ -255,6 +317,8 @@ function New-EasytierToml {
   param([string] $Hostname, [string] $Ipv4, [string] $Secret,
         [string[]] $Listeners, [string[]] $Peers, [string] $Network, [string] $Rpc)
 
+  # List[string].Add() returns void. An ArrayList's returns the new index, which would land in
+  # this function's output and put a column of integers through the middle of the TOML.
   $lines = New-Object Collections.Generic.List[string]
   $lines.Add("# rpc_portal is passed as a CLI flag (-r $Rpc) at service registration, not in this file.")
   $lines.Add("hostname = $(ConvertTo-TomlString $Hostname)")
@@ -481,48 +545,105 @@ function Invoke-ElevatedStage {
 # STAGE: User
 # ===========================================================================
 
+# Returns a path or $null, and nothing else: every branch is a return, because the caller uses
+# the return value as an executable. $env:BUN_INSTALL is where bun.sh's installer puts bun when
+# it is set, and PATH is checked last because a bun installed in this same run is not on the
+# PATH of a process that started before it existed.
 function Resolve-Bun {
   $candidates = @(
     (Join-Path $UserHome '.bun\bin\bun.exe'),
     (Join-Path $env:USERPROFILE '.bun\bin\bun.exe')
   )
+  if ($env:BUN_INSTALL) { $candidates += (Join-Path $env:BUN_INSTALL 'bin\bun.exe') }
   foreach ($c in $candidates) { if (Test-Path -LiteralPath $c) { return $c } }
   $onPath = Get-Command bun -ErrorAction SilentlyContinue
   if ($onPath) { return $onPath.Source }
   return $null
 }
 
+# bun.sh's install.ps1 is a script, not a library. It writes its whole progress log AND its
+# success banner ("Bun 1.4.2 was installed successfully! The binary is located at ...", with
+# ANSI colour in it) to the PIPELINE with Write-Output, and its failure paths `return 1`. Run
+# inline with `& ([scriptblock]::Create(...))`, every one of those lines becomes part of THIS
+# function's return value; the caller then treats an array of banner text as the path to
+# bun.exe and the next line dies with CommandNotFoundException on a "command" that is the
+# banner. Observed on Windows 11 Pro / Windows PowerShell 5.1, 2026-09-05.
+#
+# So it goes to a temp file and runs in a separate PowerShell process. A child process cannot
+# put anything into this pipeline at all, whatever it prints still reaches the operator, it is
+# not subject to this machine's execution policy, and it does not inherit Set-StrictMode 2.0 or
+# our $ErrorActionPreference, neither of which bun's installer was written against.
 function Install-Bun {
   $bun = Resolve-Bun
   if ($bun) { return $bun }
-  Write-Step 'Bun not found; installing it from bun.sh'
+  Write-Step "Bun not found; installing Bun $BunVersion from bun.sh"
+
+  $tmp = Join-Path $env:TEMP "bun-install-$([Guid]::NewGuid().ToString('N')).ps1"
   try {
-    & ([scriptblock]::Create((Invoke-WebRequest -Uri 'https://bun.sh/install.ps1' -UseBasicParsing).Content))
-  } catch {
-    Write-Die "Bun install failed: $($_.Exception.Message)`nInstall it by hand from https://bun.sh, then re-run."
+    try {
+      Invoke-WebRequest -Uri 'https://bun.sh/install.ps1' -OutFile $tmp -UseBasicParsing
+      $psExe = Get-Prop -Object (Get-Process -Id $PID -ErrorAction SilentlyContinue) -Name 'Path' -Default 'powershell.exe'
+      # Splatted from a variable, which is how the rest of this file calls a native command: an
+      # array literal in the argument position is a different construct and its unrolling is
+      # not something to take on trust across two PowerShell majors.
+      # -Version is bun's own parameter and takes a bare 1.2.3. Out-Host, not a capture: the
+      # operator watches the download live and not one line of it can reach a caller.
+      $bunArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $tmp, '-Version', $BunVersion)
+      # Run in its own scope with the same stderr rule Invoke-Native documents: on Windows
+      # PowerShell 5.1 a native command's stderr can reach the error stream, and
+      # $ErrorActionPreference = 'Stop' would make bun's first progress line on stderr
+      # terminating. Scoped, so the download above keeps its 'Stop' and still throws to catch.
+      $code = & {
+        $ErrorActionPreference = 'Continue'
+        & $psExe @bunArgs | Out-Host
+        $LASTEXITCODE
+      }
+    } catch {
+      Write-Die "Bun install failed: $($_.Exception.Message)`nInstall it by hand from https://bun.sh, then re-run."
+    }
+    # bun's installer reports failure by printing and `return 1`, which still leaves the host
+    # exiting 0, so a non-zero code is worth saying out loud but a zero one proves nothing.
+    # Whether bun.exe is on disk is the verdict, and that is the check below.
+    if ($code -ne 0) { Write-Warn "the Bun installer exited $code." }
+  } finally {
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
   }
+
   $bun = Resolve-Bun
   if (-not $bun) { Write-Die 'Bun still not found after installing. Install it by hand from https://bun.sh, then re-run.' }
   return $bun
 }
 
 # Proves the private key opens without a passphrase, instead of trusting that the -N argument
-# survived the shell. stdin comes from NUL so a passphrase prompt fails immediately rather than
-# hanging an installer that nobody is watching.
+# survived the shell. stdin comes from an empty file, so a passphrase prompt reads end-of-file
+# and ssh-keygen gives up at once rather than hanging an installer nobody is watching.
+#
+# An empty FILE, not 'NUL'. Start-Process resolves -RedirectStandardInput as a path and opens it
+# with the .NET file APIs, which do not honour the DOS device names, so 'NUL' fails the whole
+# call with "This command cannot be run because either the parameter ... is not valid". That is
+# the check failing, not the key: it warned on a key that was in fact fine. Observed on Windows
+# 11, both Windows PowerShell 5.1 and pwsh 7.6.5, 2026-09-05.
 function Test-KeyUnencrypted {
   param([Parameter(Mandatory)] [string] $KeyPath)
-  $out = Join-Path $env:TEMP "sukarfleet-keycheck-$PID.out"
-  $err = Join-Path $env:TEMP "sukarfleet-keycheck-$PID.err"
+  # Two runs of this installer can overlap (a scheduled task and a console), and $PID alone gets
+  # reused, so the three temp paths carry a GUID as well.
+  $stem = Join-Path $env:TEMP "sukarfleet-keycheck-$PID-$([Guid]::NewGuid().ToString('N'))"
+  $in   = "$stem.in"
+  $out  = "$stem.out"
+  $err  = "$stem.err"
   try {
+    # WriteAllBytes on an empty array, not New-Item: it creates and truncates in one call and
+    # says nothing on the pipeline.
+    [IO.File]::WriteAllBytes($in, (New-Object byte[] 0))
     $p = Start-Process -FilePath 'ssh-keygen' -ArgumentList @('-y', '-f', "`"$KeyPath`"") `
       -NoNewWindow -Wait -PassThru `
-      -RedirectStandardInput 'NUL' -RedirectStandardOutput $out -RedirectStandardError $err
+      -RedirectStandardInput $in -RedirectStandardOutput $out -RedirectStandardError $err
     return ($p.ExitCode -eq 0)
   } catch {
     Write-Warn "could not verify that $KeyPath is passphrase-free: $($_.Exception.Message)"
     return $true   # do not delete a key over a failed check
   } finally {
-    Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $in, $out, $err -Force -ErrorAction SilentlyContinue
   }
 }
 
@@ -549,6 +670,10 @@ function Resolve-SourceDir {
 }
 
 function Invoke-UserStage {
+  # First, before anything is fetched or written. Bun used to be installed and only then was
+  # the machine told it had no git, which left a Bun behind on a box the installer refused.
+  Invoke-Preflight
+
   if (Test-Elevated) {
     Write-Warn 'this stage is running as administrator. The node will then own its config and SSH key as an administrator, which is not what you want on a machine you log into normally. Close this and run the .cmd without "Run as administrator"; it asks for elevation only for the one stage that needs it.'
   }
@@ -558,13 +683,6 @@ function Invoke-UserStage {
   Write-Step "sukarfleet source at $repoRoot"
   $bun = Install-Bun
   Write-Step "bun $(& $bun --version) at $bun"
-
-  foreach ($tool in @('git', 'ssh-keygen')) {
-    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-      if ($tool -eq 'git') { Write-Die 'git is not on PATH. Install Git for Windows (winget install --id Git.Git), open a new terminal, then re-run.' }
-      Write-Die 'ssh-keygen is not on PATH. Add the OpenSSH Client optional feature (Settings > System > Optional features), then re-run.'
-    }
-  }
 
   Push-Location $repoRoot
   try {
@@ -655,7 +773,8 @@ function Invoke-UserStage {
     }
     Write-Step "generated $SshKey"
   }
-  try { Set-PrivateAcl -Path $SshKey } catch { Write-Warn "could not restrict the ACL on $SshKey" }
+  try { Set-PrivateAcl -Path $SshKey }
+  catch { Write-Warn "could not restrict the ACL on $SshKey : $($_.Exception.Message). Anyone who can read that file can use this machine's fleet identity, so fix it before pairing: icacls `"$SshKey`" /inheritance:r /grant:r `"${env:USERNAME}:F`"" }
 
   $authorized = Join-Path $SshDir 'authorized_keys'
   if (-not (Test-Path -LiteralPath $authorized)) { Write-PrivateFile -Path $authorized -Content '' }
@@ -701,6 +820,14 @@ function Invoke-UserStage {
 # turning a lane on during an upgrade is the operator's call.
 function Update-ExistingConfig {
   $raw = Get-Content -LiteralPath $ConfigFile -Raw
+  # A config that is empty, or holds nothing but whitespace. The zero-byte case already lands in
+  # the catch below: Get-Content -Raw returns $null on both runtimes and ConvertFrom-Json refuses
+  # to bind it on both. Whitespace does not. PowerShell 7 takes a blank string, emits nothing and
+  # leaves $cfg as $null, so the catch never fires and the first Add-Member a few lines down
+  # throws an uncaught stack trace instead of a message an operator can act on; Windows
+  # PowerShell 5.1 rejects it as an invalid JSON primitive and dies cleanly. Checked here so both
+  # runtimes say the same thing whatever the file holds.
+  if ([string]::IsNullOrWhiteSpace($raw)) { Write-Die "$ConfigFile has no JSON in it; it is empty or only whitespace. Fix it by hand, then re-run - or delete it and re-run, and this installer will scaffold a fresh one." }
   try { $cfg = $raw | ConvertFrom-Json }
   catch { Write-Die "could not read $ConfigFile as JSON. Fix it by hand, then re-run." }
 
@@ -891,11 +1018,20 @@ switch ($Stage) {
 }
 
 # --- Auto: elevated stage first, in a child process, then the user stage here -------------
+
+# Before the UAC prompt, not after it: the elevated stage installs EasyTier, registers a service
+# and opens a firewall port, and none of that should happen on a machine the user stage is going
+# to refuse two minutes later.
+Invoke-Preflight
+
 if (Test-Elevated) {
-  Write-Warn 'this whole session is elevated. Run the .cmd normally instead; it asks for elevation only for the mesh transport, and a node whose config is owned by an administrator is a nuisance to fix later.'
+  # A warning, not a refusal. This fires whenever there is no UAC split token, which includes
+  # an admin account running the installer from a scheduled task, where there is nobody to
+  # answer a prompt and Read-Host on a session with no console turns the warning itself into a
+  # crash. What it costs is a nuisance, not a broken install, so say what it costs, say how to
+  # avoid it, and carry on.
+  Write-Warn 'this whole session is elevated, so the config, the SSH key and the scheduled task will end up owned by an administrator, which is a nuisance to unpick later. Continuing anyway. To get the intended layout instead: close this window and double-click install\windows\Add-To-Fleet.cmd normally, WITHOUT "Run as administrator" - it asks for elevation itself, once, for the only stage that needs it.'
   Write-Host ''
-  $ans = Read-Host '  Continue anyway? (y/N)'
-  if ($ans -notmatch '^[Yy]') { exit 1 }
   # Auto in an already-elevated session does the mesh work inline, so the output has to say
   # so. Without this the elevated stage's messages arrive tagged [quickstart], which sends you
   # looking in the wrong half of the script.

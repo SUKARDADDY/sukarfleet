@@ -184,7 +184,13 @@ if [ -f "$USER_NOTIF_SVC" ] && grep -q "^Exec=$HOME/.local/bin/gjs" "$USER_NOTIF
   REMOVED+=("the GNOME notification D-Bus override")
 fi
 
-log "stopped and removed $(join_list "${REMOVED[@]}")"
+# Only when something actually came off. "stopped and removed nothing" was
+# printed on a machine whose daemon was already gone and whose credential and
+# staged secret were about to be shredded two lines below -- a summary that
+# contradicted the next line of its own output.
+if [ "${#REMOVED[@]}" -gt 0 ]; then
+  log "stopped and removed $(join_list "${REMOVED[@]}")"
+fi
 
 # --- secrets ------------------------------------------------------------------
 # Overwrite before delete, with the same honesty about what it buys as the
@@ -214,8 +220,18 @@ if [ -d "$SECRETS_DIR" ]; then
 fi
 # An empty secrets directory is not a stored credential, and saying it shredded
 # one would be a lie in the one place a reader is checking what came off.
-[ "$CRED_COUNT" -gt 0 ] && SHREDDED+=("the stored credential")
-[ "${#SHREDDED[@]}" -gt 0 ] && log "shredded $(join_list "${SHREDDED[@]}")"
+if [ "$CRED_COUNT" = "1" ]; then
+  SHREDDED+=("the stored credential")
+elif [ "$CRED_COUNT" -gt 1 ]; then
+  SHREDDED+=("$CRED_COUNT stored credentials")
+fi
+if [ "${#SHREDDED[@]}" -gt 0 ]; then
+  log "shredded $(join_list "${SHREDDED[@]}")"
+elif [ "${#REMOVED[@]}" -eq 0 ]; then
+  # Reached only when config.json is the single thing present, which this half
+  # deliberately leaves. Saying so beats printing nothing at all.
+  log "nothing to stop, remove or shred: only ${CONFIG_FILE} is present, and that is deliberately left in place."
+fi
 
 # =============================================================================
 # Summary

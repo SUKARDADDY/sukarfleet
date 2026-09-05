@@ -45,7 +45,9 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd -P)"
 
 SUDOERS_FILE="/etc/sudoers.d/sukarfleet-transport"
 DEFAULT_SERVICE="easytier-fleet.service"
-PINS_FILE="$SCRIPT_DIR/easytier-pins.txt"
+# Test seam: the pin file to read. Tests point it at a throwaway copy to walk
+# the duplicate-pin and TODO-pin paths without editing the real one.
+PINS_FILE="${SUKARFLEET_PINS_FILE:-$SCRIPT_DIR/easytier-pins.txt}"
 EASYTIER_DIR="${SUKARFLEET_EASYTIER_DIR:-/opt/easytier}"
 EASYTIER_CONF_DIR="${SUKARFLEET_EASYTIER_CONF_DIR:-/etc/easytier}"
 EASYTIER_TOML="$EASYTIER_CONF_DIR/fleet.toml"
@@ -53,6 +55,15 @@ UNIT_SRC="$REPO_ROOT/systemd/easytier-fleet.service"
 UNIT_DST="${SUKARFLEET_SYSTEM_UNIT_DIR:-/etc/systemd/system}/easytier-fleet.service"
 EASYTIER_URL_BASE="${SUKARFLEET_EASYTIER_URL_BASE:-https://github.com/EasyTier/EasyTier/releases/download}"
 RPC_ADDR="127.0.0.1:15888"
+
+# The exact comments this installer puts on the ufw rules it adds. --remove
+# matches these two strings and nothing else: "any rule mentioning sukarfleet"
+# would delete a rule an operator wrote by hand for something else of ours.
+UFW_COMMENT_LISTENER="sukarfleet mesh listener"
+UFW_COMMENT_NODE="sukarfleet node (mesh subnet only)"
+
+# The EasyTier download's scratch directory, removed by the EXIT trap below.
+DL_TMPDIR=""
 
 SERVICE="$DEFAULT_SERVICE"
 TARGET_USER="${SUDO_USER:-}"
@@ -65,7 +76,9 @@ FORCE_MESH_REINSTALL=0
 EXTRA_PEERS=()
 
 # Test seam: 1 turns every write, download, systemctl, install and rm into a
-# printed line and changes nothing on disk. The control flow is walked in full.
+# printed line and changes nothing on disk. The control flow is walked in full,
+# including the staged-file guard, which is why the refusal paths are testable
+# without root. SUKARFLEET_TARGET_HOME (below) is honoured only in this mode.
 DRY_RUN="${SUKARFLEET_DRY_RUN:-0}"
 
 START_TS="$(date +%s)"
@@ -82,6 +95,10 @@ join_list() {
   esac
 }
 warn() { printf '[install-elevated] WARNING: %s\n' "$*" >&2; }
+# Escapes a literal so it can be dropped into an extended regular expression.
+# The two ufw comments below are matched whole, and they contain parentheses.
+# shellcheck disable=SC2016  # the sed script is a literal charset, not an expansion
+ere_quote() { printf '%s' "$1" | sed -e 's/[][\\.*^$(){}?+|/]/\\&/g'; }
 dry()  { printf '[install-elevated] [dry-run] %s\n' "$*"; }
 die()  { printf '[install-elevated] ERROR: %s\n' "$1" >&2; exit "${2:-2}"; }
 
@@ -172,13 +189,19 @@ if [ "$DO_REMOVE" -eq 1 ]; then
     if [ -d "$d" ]; then act rm -rf "$d"; REMOVED+=("$d"); else LEFT+=("$d (not present)"); fi
   done
   if [ -f "$SUDOERS_FILE" ]; then act rm -f "$SUDOERS_FILE"; REMOVED+=("$SUDOERS_FILE"); else LEFT+=("$SUDOERS_FILE (not present)"); fi
-  # Only the rules this installer created, matched by their comment.
+  # Only the rules this installer created, matched by the WHOLE comment it wrote
+  # and anchored at the end of the line. Matching any rule containing the word
+  # "sukarfleet" would take out a hand-written rule that merely mentions us --
+  # deleting somebody else's firewall rule is not something an uninstaller
+  # gets to do on a guess.
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -n1 | grep -q 'Status: active'; then
     while read -r rulenum; do
       [ -n "$rulenum" ] || continue
       act ufw --force delete "$rulenum"
       REMOVED+=("ufw rule $rulenum")
-    done < <(ufw status numbered 2>/dev/null | grep -i 'sukarfleet' | grep -o '^\[[ 0-9]*\]' | tr -d '[] ' | sort -rn)
+    done < <(ufw status numbered 2>/dev/null \
+      | grep -E "# ($(ere_quote "$UFW_COMMENT_LISTENER")|$(ere_quote "$UFW_COMMENT_NODE"))[[:space:]]*\$" \
+      | grep -o '^\[[ 0-9]*\]' | tr -d '[] ' | sort -rn)
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     log "firewalld is running: any ports this installer opened are listed by 'firewall-cmd --list-ports'. Remove them with --permanent --remove-port=<port>/<proto>, then --reload."
@@ -202,6 +225,12 @@ fi
 TARGET_UID="$(id -u "$TARGET_USER")"
 TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)"
 TARGET_HOME="${TARGET_HOME:-/home/$TARGET_USER}"
+# Test seam, and deliberately only honoured under SUKARFLEET_DRY_RUN=1: which
+# home a ROOT process reads a config out of is not something an environment
+# variable gets to decide on a real run.
+if [ "$DRY_RUN" = "1" ] && [ -n "${SUKARFLEET_TARGET_HOME:-}" ]; then
+  TARGET_HOME="$SUKARFLEET_TARGET_HOME"
+fi
 
 # Both values are interpolated into a sudoers command spec, so each is constrained
 # to a charset that cannot introduce a second command, an extra argument, or a
@@ -227,7 +256,7 @@ esac
 read_staged() {
   local path="$1" secret_out="$2"
   python3 - "$path" "$secret_out" "$TARGET_UID" <<'PY'
-import json, os, stat, sys, shlex
+import json, os, stat, sys
 
 path, secret_out, want_uid = sys.argv[1], sys.argv[2], int(sys.argv[3])
 
@@ -235,8 +264,11 @@ def refuse(msg):
     sys.stderr.write(msg + "\n")
     raise SystemExit(3)
 
+# O_NONBLOCK matters as much as O_NOFOLLOW here: S_ISREG is checked AFTER the
+# open, and open() on a FIFO blocks until a writer appears, so a fifo parked at
+# this path would hang a root process forever instead of being refused.
 try:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
 except OSError as e:
     if e.errno in (40, 62):  # ELOOP on Linux is 40; 62 is ELOOP on some arches
         refuse("it is a symbolic link (expected a regular file owned by you at mode 0600)")
@@ -248,6 +280,7 @@ try:
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):
         refuse("it is not a regular file (expected a regular file owned by you at mode 0600)")
+    identity = (st.st_dev, st.st_ino)
     if st.st_uid != want_uid:
         refuse("it is owned by uid %d, not by you (uid %d)" % (st.st_uid, want_uid))
     if stat.S_IMODE(st.st_mode) != 0o600:
@@ -300,25 +333,59 @@ try:
 finally:
     os.close(out)
 
+# KEY=VALUE lines, one per line, values RAW. Nothing here is shell-quoted,
+# because nothing on the other side evals it: the caller assigns a fixed list of
+# names and takes every value literally. A value carrying a newline or any other
+# control character would split a line, so it is refused here rather than
+# smuggled across.
+def emit(key, val):
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in val):
+        refuse("its %s contains a control character" % key)
+    print("%s=%s" % (key, val))
+
 print("STAGED_SECRET_LEN=%d" % len(secret))
+# The identity of the file this guard just accepted. The shred at the end of the
+# run happens after the EasyTier download, so the NAME is no longer proof of
+# anything by then; these two numbers are.
+print("STAGED_DEV=%d" % identity[0])
+print("STAGED_INO=%d" % identity[1])
 for key, val in fields.items():
-    print("STAGED_%s=%s" % (key.upper(), shlex.quote(val)))
+    emit("STAGED_" + key.upper(), val)
 PY
 }
 
 # Reads identity out of the invoking user's config.json for the fields a bare
-# staged secret does not carry. Not a secret, so a plain read is fine; still
-# O_NOFOLLOW, because it is still a path under somebody else's home.
+# staged secret does not carry. Not a secret, so a plain read is fine -- but it
+# is still a path under somebody else's home, so it gets the same three
+# defences as the staged file: the resolved path must stay inside that home,
+# the open is O_NOFOLLOW|O_NONBLOCK (a fifo here would hang root just as
+# happily), and a non-regular file is refused after the fstat.
+#
+# O_NOFOLLOW alone covers only the LAST component, which is why the realpath
+# check is here: ~/.config or ~/.config/sukarfleet can each be a symlink, and a
+# root read that follows one out of the user's home is the same class of bug.
 read_user_config() {
-  local path="$1"
-  python3 - "$path" <<'PY'
-import json, os, sys, shlex
-path = sys.argv[1]
+  local path="$1" home="$2"
+  python3 - "$path" "$home" <<'PY'
+import json, os, stat, sys
+path, home = sys.argv[1], sys.argv[2]
 try:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    real = os.path.realpath(path)
+    home_real = os.path.realpath(home)
+except OSError:
+    raise SystemExit(0)
+if not (real == home_real or real.startswith(home_real.rstrip(os.sep) + os.sep)):
+    sys.stderr.write("resolves outside %s; ignoring it\n" % home_real)
+    raise SystemExit(0)
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
 except OSError:
     raise SystemExit(0)
 try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        sys.stderr.write("is not a regular file; ignoring it\n")
+        raise SystemExit(0)
     raw = os.read(fd, 1 << 20).decode("utf-8", "replace")
 finally:
     os.close(fd)
@@ -328,26 +395,116 @@ except ValueError:
     raise SystemExit(0)
 if not isinstance(cfg, dict):
     raise SystemExit(0)
+# RAW KEY=VALUE, exactly as the staged guard emits them, and for the same
+# reason: the caller assigns a fixed list of names and never evals a line.
 for key, var in (("machine", "CFG_MACHINE"), ("meshIp", "CFG_MESH_IP"),
                  ("networkName", "CFG_NETWORK_NAME"), ("nodePort", "CFG_NODE_PORT")):
     val = cfg.get(key)
-    if isinstance(val, (str, int)) and str(val).strip():
-        print("%s=%s" % (var, shlex.quote(str(val).strip())))
+    if not isinstance(val, (str, int)) or isinstance(val, bool):
+        continue
+    text = str(val).strip()
+    if not text or any(ord(c) < 0x20 or ord(c) == 0x7F for c in text):
+        continue
+    print("%s=%s" % (var, text))
 PY
+}
+
+# Assigns the KEY=VALUE lines a reader printed, and ONLY the keys named below.
+#
+# This is what replaced `eval`. A root process running `eval` on text built from
+# an unprivileged user's config.json is one quoting bug away from a root shell,
+# and the shell-quoting that made it "safe" was itself the only thing standing
+# between a crafted nodePort and arbitrary code. Here a value is data: it is
+# assigned, never parsed, and an unrecognised key is dropped on the floor.
+assign_reader_vars() {
+  local line key val
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    key="${line%%=*}"
+    val="${line#*=}"
+    case "$key" in
+      STAGED_SECRET_LEN)  STAGED_SECRET_LEN="$val" ;;
+      STAGED_DEV)         STAGED_DEV="$val" ;;
+      STAGED_INO)         STAGED_INO="$val" ;;
+      STAGED_NETWORKNAME) STAGED_NETWORKNAME="$val" ;;
+      STAGED_MESHIP)      STAGED_MESHIP="$val" ;;
+      STAGED_HOSTNAME)    STAGED_HOSTNAME="$val" ;;
+      STAGED_LISTENERS)   STAGED_LISTENERS="$val" ;;
+      STAGED_PEERS)       STAGED_PEERS="$val" ;;
+      CFG_MACHINE)        CFG_MACHINE="$val" ;;
+      CFG_MESH_IP)        CFG_MESH_IP="$val" ;;
+      CFG_NETWORK_NAME)   CFG_NETWORK_NAME="$val" ;;
+      CFG_NODE_PORT)      CFG_NODE_PORT="$val" ;;
+      *) ;;
+    esac
+  done
+}
+
+# =============================================================================
+# Value shapes
+# =============================================================================
+# Everything that arrives from the staged file or from the user's config.json
+# reaches a command line (bun, ufw, firewall-cmd) or the generated TOML, so each
+# one is checked against the shape it is supposed to have before it is used. The
+# charsets match the daemon's own: MACHINE_NAME_RE in src/uiserve.ts is
+# ^[A-Za-z0-9._-]{1,64}$, and the TOML generator quotes these values into
+# double-quoted strings, so a name carrying a quote is a broken TOML as well as
+# a bad argument.
+valid_name() {
+  [ -n "$1" ] || return 1
+  [ "${#1}" -le 64 ] || return 1
+  case "$1" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+}
+valid_port() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+valid_ipv4() {
+  local o
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do [ "$o" -le 255 ] || return 1; done
+}
+# proto://host:port, where host may be a bare IPv4, a bracketed IPv6 or a name.
+valid_endpoint() {
+  case "$1" in
+    tcp://*|udp://*|ws://*|wss://*|wg://*|quic://*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in *[!A-Za-z0-9.:/_\[\]-]*) return 1 ;; esac
+  [ "${#1}" -le 128 ]
 }
 
 # =============================================================================
 # fetch_easytier -- ONE function, so the licence question about fetching versus
 # bundling has exactly one place to change if the answer flips (decision 7).
 # =============================================================================
+# Exit 0 with "version sha asset", 1 for no pin, 2 for a pin file that
+# contradicts itself. Two lines for the same (version, arch, asset-prefix) mean
+# nobody knows which SHA256 this machine is supposed to trust, and picking the
+# first is how a stale pin outlives the line that replaced it. A TODO-S9 line
+# never shadows a real one either, whichever order they sit in: the first VALID
+# pin wins, and TODO is the answer only when there is no valid pin at all.
 pin_lookup() {
   local prefix="$1" arch="$2"
   [ -f "$PINS_FILE" ] || return 1
   awk -v p="$prefix" -v a="$arch" '
     /^[[:space:]]*#/ { next }
     NF < 4 { next }
-    $2 == a && index($4, p) == 1 { print $1 " " $3 " " $4; found = 1; exit }
-    END { if (!found) exit 1 }
+    $2 != a { next }
+    index($4, p) != 1 { next }
+    {
+      key = $1 SUBSEP $2
+      if (key in seen) { dupver = $1; duparch = $2; exit }
+      seen[key] = 1
+      if ($3 != "TODO-S9") { if (!haveval) { haveval = 1; valline = $1 " " $3 " " $4 } }
+      else if (!havetodo) { havetodo = 1; todoline = $1 " " $3 " " $4 }
+    }
+    END {
+      if (dupver != "") { printf("duplicate pin for %s %s\n", dupver, duparch) > "/dev/stderr"; exit 2 }
+      if (haveval) { print valline; exit 0 }
+      if (havetodo) { print todoline; exit 0 }
+      exit 1
+    }
   ' "$PINS_FILE"
 }
 
@@ -360,10 +517,16 @@ easytier_arch() {
 }
 
 fetch_easytier() {
-  local arch pin version sha asset url tmpdir got srcdir
+  local arch pin pin_rc version sha asset url tmpdir got f
   arch="$(easytier_arch)" || die "unsupported architecture '$(uname -m)'. EasyTier ships x86_64 and aarch64 builds for Linux; the manual route is docs/INSTALL-FLOW.md section 9." 2
-  pin="$(pin_lookup 'easytier-linux-' "$arch" || true)"
-  [ -n "$pin" ] || die "no EasyTier pin for $arch in $PINS_FILE. Nothing was installed." 3
+  set +e
+  pin="$(pin_lookup 'easytier-linux-' "$arch" 2>/dev/null)"
+  pin_rc=$?
+  set -e
+  if [ "$pin_rc" -eq 2 ]; then
+    die "$PINS_FILE has more than one EasyTier pin for $arch at the same version, so there is no single SHA256 to trust. Fix the pin file -- one line per version, arch and asset. Nothing was installed." 3
+  fi
+  [ "$pin_rc" -eq 0 ] && [ -n "$pin" ] || die "no EasyTier pin for $arch in $PINS_FILE. Nothing was installed." 3
   read -r version sha asset <<<"$pin"
   if [ "$sha" = "TODO-S9" ]; then
     die "the EasyTier pin for $arch is still TODO-S9, so this download cannot be verified. Nothing was installed. Install EasyTier yourself at ${EASYTIER_DIR}, then re-run with --no-easytier." 3
@@ -384,8 +547,10 @@ fetch_easytier() {
 
   command -v unzip >/dev/null 2>&1 || die "unzip is not installed. Run: sudo apt-get install -y unzip" 2
   tmpdir="$(mktemp -d -t sukarfleet-easytier.XXXXXX)"
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmpdir'" RETURN
+  # Cleaned up by the EXIT trap, not by a RETURN one: a RETURN trap does not fire
+  # when this function calls die(), which is most of the ways it ends, and every
+  # one of those left a downloaded zip behind in /tmp.
+  DL_TMPDIR="$tmpdir"
   log "downloading $asset"
   # curl's own line distinguishes a 404 from a DNS failure from a TLS failure and
   # is the only place that distinction appears, so it is kept -- prefixed, so it
@@ -400,18 +565,26 @@ fetch_easytier() {
     die "SHA256 mismatch for $asset. expected $sha, got $got. Nothing was installed." 5
   fi
   log "SHA256 verified against the pin for EasyTier $version/$arch"
-  unzip -q -o "$tmpdir/$asset" -d "$tmpdir/unpack" || die "$asset unpacked to nothing recognisable. Nothing was installed." 5
-  srcdir="$tmpdir/unpack/easytier-linux-$arch"
-  if [ ! -d "$srcdir" ]; then
-    srcdir="$(find "$tmpdir/unpack" -mindepth 1 -maxdepth 1 -type d | head -n1)"
-  fi
-  [ -n "$srcdir" ] && [ -f "$srcdir/easytier-core" ] || \
-    die "$asset does not contain easytier-core where expected. Nothing was installed." 5
+  # -j junks the archive's directory paths, so every entry lands flat in one
+  # empty directory and there is no tree to walk looking for the right one.
+  # unzip still restores SYMLINK entries, though, and `install` copies through a
+  # symlink: a crafted zip whose easytier-core is a link to /etc/shadow would
+  # otherwise end up as a 0755 copy of it under /opt. So each of the two
+  # programs is checked to be a real regular file before it is installed.
+  install -d -m 0700 "$tmpdir/unpack"
+  unzip -j -q -o "$tmpdir/$asset" -d "$tmpdir/unpack" || die "$asset unpacked to nothing recognisable. Nothing was installed." 5
+  for f in easytier-core easytier-cli; do
+    if [ -L "$tmpdir/unpack/$f" ]; then
+      die "$asset contains $f as a symbolic link rather than a program. Nothing was installed." 5
+    fi
+    [ -f "$tmpdir/unpack/$f" ] || \
+      die "$asset does not contain $f where expected. Nothing was installed." 5
+  done
   # A running easytier-core holds its own image open; stop it before replacing.
   systemctl stop "$SERVICE" >/dev/null 2>&1 || true
   install -d -m 0755 -o root -g root "$EASYTIER_DIR"
-  install -m 0755 -o root -g root "$srcdir/easytier-core" "$EASYTIER_DIR/easytier-core"
-  install -m 0755 -o root -g root "$srcdir/easytier-cli" "$EASYTIER_DIR/easytier-cli"
+  install -m 0755 -o root -g root "$tmpdir/unpack/easytier-core" "$EASYTIER_DIR/easytier-core"
+  install -m 0755 -o root -g root "$tmpdir/unpack/easytier-cli" "$EASYTIER_DIR/easytier-cli"
   log "installed EasyTier $version ($arch) to $EASYTIER_DIR"
 }
 
@@ -421,8 +594,18 @@ fetch_easytier() {
 # wedged mesh without waking a human.
 # =============================================================================
 install_sudoers() {
-  local systemctl_path tmp
-  systemctl_path="$(command -v systemctl)"
+  local systemctl_path tmp c
+  # Pinned by absolute path, not by `command -v`: that resolves against the PATH
+  # this run happens to have, so a systemctl earlier on it would be written into
+  # a permanent passwordless rule. Only the two paths a systemd install actually
+  # uses are accepted, in that order, and anything else is refused rather than
+  # granted.
+  systemctl_path=""
+  for c in /usr/bin/systemctl /bin/systemctl; do
+    if [ -x "$c" ]; then systemctl_path="$c"; break; fi
+  done
+  [ -n "$systemctl_path" ] || \
+    die "systemctl is not at /usr/bin/systemctl or /bin/systemctl on this machine, and this script will not write a passwordless sudo rule naming anything else. Nothing was installed." 2
   tmp="$(mktemp)"
   cat > "$tmp" <<EOF
 # sukarfleet mesh-transport restart grant.
@@ -457,11 +640,25 @@ EOF
 # comes from the ports and a source restriction. NEVER enables a firewall that is
 # not already running.
 # =============================================================================
+# Runs one firewall command as an ARGV, never as a string. The rules are built
+# from the staged mesh IP and the node port, both of which came out of a file in
+# an unprivileged user's home; `eval` on a string containing either of them is a
+# root shell for whoever writes that file. printf '%q' is what puts a readable,
+# re-runnable line in the log without ever handing one to a parser.
+fw_run() {
+  local printed
+  printed="$(printf '%q ' "$@")"
+  printed="${printed% }"
+  log "firewall: $printed"
+  if [ "$DRY_RUN" = "1" ]; then dry "$printed"; return 0; fi
+  "$@" >/dev/null 2>&1 || warn "that $1 rule was refused; add it by hand"
+}
+
 open_firewall() {
   local mesh_ip="$1" node_port="$2"
   shift 2
   local listeners=("$@")
-  local subnet="" rules=()
+  local subnet=""
   # The /24 containing the staged mesh IP. Narrower than "anywhere" and wider
   # than one host, which is what a mesh subnet is.
   if [[ "$mesh_ip" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})\.[0-9]{1,3}$ ]]; then
@@ -480,17 +677,13 @@ open_firewall() {
   if command -v ufw >/dev/null 2>&1; then
     if ufw status 2>/dev/null | head -n1 | grep -q 'Status: active'; then
       for p in "${ports[@]}"; do
-        rules+=("ufw allow ${p} comment 'sukarfleet mesh listener'")
+        fw_run ufw allow "$p" comment "$UFW_COMMENT_LISTENER"
       done
       if [ -n "$subnet" ]; then
-        rules+=("ufw allow from ${subnet} to any port ${node_port} proto tcp comment 'sukarfleet node (mesh subnet only)'")
+        fw_run ufw allow from "$subnet" to any port "$node_port" proto tcp comment "$UFW_COMMENT_NODE"
       else
         warn "the staged mesh IP is not an IPv4 address, so no source-scoped rule was added for ${node_port}/tcp. Add one by hand once the mesh subnet is known."
       fi
-      for r in "${rules[@]}"; do
-        log "firewall: $r"
-        if [ "$DRY_RUN" = "1" ]; then dry "$r"; else eval "$r" >/dev/null 2>&1 || warn "that ufw rule was refused; add it by hand"; fi
-      done
       return 0
     fi
     log "ufw is installed but inactive, so no rule was needed: no firewall is running."
@@ -499,16 +692,13 @@ open_firewall() {
 
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     for p in "${ports[@]}"; do
-      rules+=("firewall-cmd --permanent --add-port=${p}")
+      fw_run firewall-cmd --permanent --add-port="$p"
     done
     if [ -n "$subnet" ]; then
-      rules+=("firewall-cmd --permanent --add-rich-rule=rule family=\"ipv4\" source address=\"${subnet}\" port port=\"${node_port}\" protocol=\"tcp\" accept")
+      fw_run firewall-cmd --permanent \
+        --add-rich-rule="rule family=\"ipv4\" source address=\"${subnet}\" port port=\"${node_port}\" protocol=\"tcp\" accept"
     fi
-    rules+=("firewall-cmd --reload")
-    for r in "${rules[@]}"; do
-      log "firewall: $r"
-      if [ "$DRY_RUN" = "1" ]; then dry "$r"; else eval "$r" >/dev/null 2>&1 || warn "that firewall-cmd was refused; add the rule by hand"; fi
-    done
+    fw_run firewall-cmd --reload
     return 0
   fi
 
@@ -525,8 +715,10 @@ fi
 
 USER_CONFIG="$TARGET_HOME/.config/sukarfleet/config.json"
 CFG_MACHINE=""; CFG_MESH_IP=""; CFG_NETWORK_NAME=""; CFG_NODE_PORT=""
-if [ -f "$USER_CONFIG" ]; then
-  eval "$(read_user_config "$USER_CONFIG" || true)"
+if [ -e "$USER_CONFIG" ]; then
+  CFG_VARS="$(read_user_config "$USER_CONFIG" "$TARGET_HOME" 2>/dev/null || true)"
+  assign_reader_vars <<<"$CFG_VARS"
+  CFG_VARS=""
 fi
 
 if [ "$NO_EASYTIER" = "1" ]; then
@@ -561,8 +753,15 @@ STAGED_MESHIP=""
 STAGED_NETWORKNAME=""
 STAGED_HOSTNAME=""
 STAGED_SECRET_LEN=0
+# The device and inode the guard accepted, so the shred at the end can prove it
+# is overwriting the same file rather than whatever the name points at by then.
+STAGED_DEV=""
+STAGED_INO=""
 
 cleanup_work() {
+  # The EasyTier download's scratch directory belongs to this trap too: a RETURN
+  # trap inside fetch_easytier never fires when that function dies.
+  [ -n "${DL_TMPDIR:-}" ] && rm -rf "$DL_TMPDIR" 2>/dev/null
   [ -n "${WORK:-}" ] || return 0
   # The scratch copy of the secret is overwritten, not just unlinked, on every
   # exit path including a refusal and a dry run. Inlined rather than calling
@@ -578,7 +777,7 @@ cleanup_work() {
 trap cleanup_work EXIT
 
 if [ "$DRY_RUN" = "1" ]; then
-  dry "read $PENDING under O_NOFOLLOW; refuse unless regular file, uid $TARGET_UID, mode 0600"
+  dry "read $PENDING under O_NOFOLLOW|O_NONBLOCK; refuse unless regular file, uid $TARGET_UID, mode 0600"
   dry "write the secret to a 0600 file inside $WORK, then into $EASYTIER_CONF_DIR"
   # A dry run walks the guard for REAL -- it is the whole reason the refusal paths
   # are testable without root and without a live fleet. The only thing it writes
@@ -593,7 +792,7 @@ if [ "$DRY_RUN" = "1" ]; then
       esac
     fi
     rm -f "$GUARD_ERR"
-    eval "$STAGED_VARS"
+    assign_reader_vars <<<"$STAGED_VARS"
     STAGED_VARS=""
     dry "the staged file passed the guard"
   fi
@@ -607,7 +806,7 @@ else
     esac
   fi
   rm -f "$GUARD_ERR"
-  eval "$STAGED_VARS"
+  assign_reader_vars <<<"$STAGED_VARS"
   STAGED_VARS=""
 fi
 
@@ -631,6 +830,29 @@ PEERS=()
 if [ -z "$MESH_IP" ]; then
   die "no mesh IP: the staged file does not carry one and $USER_CONFIG has meshIp empty. Set this machine's mesh address on the console's Identity card, then run this command again. Nothing was written." 3
 fi
+
+# Every value above came out of a file an unprivileged user owns, and every one
+# of them ends up on a command line or inside the generated TOML. They are
+# checked against their shape here, once, before the first of those uses --
+# there is no second place that can be relied on to notice.
+valid_ipv4 "$MESH_IP" || \
+  die "refusing the mesh IP '$MESH_IP': it is not an IPv4 address. Fix it on the console's Identity card, then run this command again. Nothing was written." 3
+valid_name "$MACHINE" || \
+  die "refusing the machine name '$MACHINE': it must be 1-64 characters of letters, digits, dot, dash or underscore. Fix it on the console's Identity card, then run this command again. Nothing was written." 3
+valid_name "$NETWORK_NAME" || \
+  die "refusing the network name '$NETWORK_NAME': it must be 1-64 characters of letters, digits, dot, dash or underscore. Fix it on the console's Identity card, then run this command again. Nothing was written." 3
+valid_port "$NODE_PORT" || \
+  die "refusing the node port '$NODE_PORT' from $USER_CONFIG: it must be a whole number between 1 and 65535. Nothing was written." 3
+for l in "${LISTENERS[@]}"; do
+  valid_endpoint "$l" || \
+    die "refusing the staged listener '$l': it must be proto://host:port, for example tcp://0.0.0.0:11010. Nothing was written." 3
+done
+for p in "${PEERS[@]:-}"; do
+  [ -n "$p" ] || continue
+  valid_endpoint "$p" || \
+    die "refusing the peer '$p': it must be proto://host:port, for example tcp://192.0.2.4:11010. Nothing was written." 3
+done
+
 log "adopting the staged mesh details for $MACHINE ($MESH_IP, network '$NETWORK_NAME', ${STAGED_SECRET_LEN}-character secret)"
 
 # --- EasyTier -----------------------------------------------------------------
@@ -651,14 +873,20 @@ fi
 [ -n "$BUN_BIN" ] && [ -x "$BUN_BIN" ] || [ "$DRY_RUN" = "1" ] || \
   die "could not find the invoking user's bun. Pass --bun=/path/to/bun. Nothing was written to $EASYTIER_CONF_DIR." 2
 
+# --flag=VALUE, one token per flag. The CLI takes both spellings now, and the
+# test in tests/install-scripts.test.ts feeds it exactly the tokens built here
+# so the two files cannot drift apart again: this pair is what shipped broken,
+# with the script writing `--mesh-ip 192.0.2.3` and the parser reading only
+# `--mesh-ip=192.0.2.3`, and every real elevated run died at the TOML step after
+# EasyTier was already installed.
 TOML_ARGS=(run "$REPO_ROOT/src/cli.ts" easytier-toml
-  --secret-file "$SECRET_TMP"
-  --mesh-ip "$MESH_IP"
-  --network-name "$NETWORK_NAME"
-  --hostname "$MACHINE"
-  --rpc-addr "$RPC_ADDR")
-for l in "${LISTENERS[@]}"; do TOML_ARGS+=(--listener "$l"); done
-for p in "${PEERS[@]:-}"; do [ -n "$p" ] && TOML_ARGS+=(--peer "$p"); done
+  "--secret-file=$SECRET_TMP"
+  "--mesh-ip=$MESH_IP"
+  "--network-name=$NETWORK_NAME"
+  "--hostname=$MACHINE"
+  "--rpc-addr=$RPC_ADDR")
+for l in "${LISTENERS[@]}"; do TOML_ARGS+=("--listener=$l"); done
+for p in "${PEERS[@]:-}"; do [ -n "$p" ] && TOML_ARGS+=("--peer=$p"); done
 
 # 0700 root. That mode is load-bearing beyond privacy: the daemon reads mesh state
 # from the service rather than from this file precisely because an unprivileged
@@ -683,6 +911,13 @@ log "wrote $EASYTIER_TOML (0600 root; it holds the network secret in plaintext)"
 # Overwrite before delete, with the same honesty about what it buys as the
 # Windows path: no guarantee on a copy-on-write filesystem or a wear-levelling
 # SSD, but it does keep the secret out of a trivially undeleted file.
+#
+# Two functions, because the two files are not the same problem. SECRET_TMP is
+# ours: it lives in a root-owned 0700 directory this run created, so a name is
+# proof enough. PENDING is the user's, and the guard that accepted it ran
+# BEFORE the EasyTier download -- a window of tens of seconds in a directory the
+# attacker owns. `shred -u -z` follows symlinks and so does the dd fallback, so
+# re-resolving that name here is how root ends up zeroing an arbitrary file.
 shred_file() {
   local f="$1"
   if [ "$DRY_RUN" = "1" ]; then dry "overwrite $f with zeroes to its own length, then unlink it"; return 0; fi
@@ -695,8 +930,59 @@ shred_file() {
   dd if=/dev/zero of="$f" bs=1 count="$size" conv=notrunc >/dev/null 2>&1 || true
   rm -f "$f"
 }
+
+# Overwrites through a freshly opened fd and only after fstat says it is the
+# same file the guard read: same st_dev, same st_ino, still a regular file. If
+# the name now points anywhere else, nothing is written and the run says so.
+# The unlink afterwards never follows a final symlink, so at worst it removes
+# the link somebody just parked there.
+shred_verified() {
+  local f="$1" dev="$2" ino="$3"
+  if [ "$DRY_RUN" = "1" ]; then
+    dry "overwrite $f through the fd the guard verified (dev $dev, inode $ino), then unlink it"
+    return 0
+  fi
+  if [ -z "$dev" ] || [ -z "$ino" ]; then
+    warn "the staged file at $f was never identified by the guard, so it was NOT shredded. Remove it by hand."
+    return 0
+  fi
+  python3 - "$f" "$dev" "$ino" <<'PY' || warn "the staged secret at $f was left in place; remove it by hand."
+import os, stat, sys
+
+path, want_dev, want_ino = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+
+try:
+    fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except OSError as e:
+    sys.stderr.write("[install-elevated] WARNING: could not re-open the staged file to shred it (%s)\n" % e.strerror)
+    raise SystemExit(1)
+try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_dev != want_dev or st.st_ino != want_ino:
+        sys.stderr.write(
+            "[install-elevated] WARNING: the staged file is no longer the one that passed the guard; "
+            "it was NOT overwritten.\n"
+        )
+        raise SystemExit(2)
+    remaining = st.st_size
+    os.lseek(fd, 0, os.SEEK_SET)
+    zeroes = b"\0" * 65536
+    while remaining > 0:
+        remaining -= os.write(fd, zeroes[: min(len(zeroes), remaining)])
+    os.fsync(fd)
+finally:
+    os.close(fd)
+
+try:
+    os.unlink(path)
+except OSError as e:
+    sys.stderr.write("[install-elevated] WARNING: could not unlink the staged file (%s)\n" % e.strerror)
+    raise SystemExit(3)
+PY
+}
+
 shred_file "$SECRET_TMP"
-shred_file "$PENDING"
+shred_verified "$PENDING" "$STAGED_DEV" "$STAGED_INO"
 log "adopted and shredded the staged secret"
 
 
