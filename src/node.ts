@@ -265,9 +265,10 @@ export function shouldPushThisTick(
 //
 // originMovedByOther === true -- origin's main moved under a push this machine did not make. That
 // is direct evidence of another live pusher, and it is the veto that actually bounds the two-pusher
-// window (see shouldPushThisTick's honesty note). node.ts computes it from
-// derive.originMainMovedByOther after the cycle's fetch, for roamers only and only on a tick that
-// would otherwise push, and resets the takeover streak at the call site.
+// window (see shouldPushThisTick's honesty note). node.ts samples derive.originMainMovedByOther
+// after the cycle's fetch on every roamer tick, latches a sighting made while the anchor reads
+// offline, and hands it in here on the tick that would otherwise push, resetting the takeover
+// streak at the call site.
 //
 // Why the ORIGIN fetch and not the fleet-peer fetch: during a genuine anchor outage the
 // fleet-<anchor> fetch fails by construction (the anchor's git server lives inside the daemon that
@@ -450,6 +451,12 @@ async function main(): Promise<void> {
   // P3 single-pusher takeover debounce (nextAnchorDownStreak); consulted for the roamer role only,
   // stays 0 and unused on the anchor.
   let anchorDownStreak = 0;
+  // Per-repo latch for the yield rule: a foreign push sighted on a tick that was not going to push
+  // must not be forgotten by the time the streak makes this roamer a pusher, or a mesh-only
+  // partition in which the anchor pushes on the "wrong" tick slips past the rule. Latched only
+  // while the anchor reads offline in gossip and cleared the moment it reads online, so a push the
+  // anchor made during a healthy period can never surface later as a false yield.
+  const foreignPushSeen = new Map<string, boolean>();
   // P4 watchdog suspend-awareness. watchdogLoop keeps its OWN mono/wall baseline -- deliberately
   // separate from clockSentinel's, which only resets on a detected jump -- so it always measures
   // drift since the immediately preceding tick, not since the last resume. graceUntilMs is 0 until
@@ -1370,13 +1377,18 @@ async function main(): Promise<void> {
       let originMovedByOther = false;
       if (cfg.role === 'roamer') {
         const moved = await derive.originMainMovedByOther(repo.path);
-        if (moved && push) {
+        let seen = foreignPushSeen.get(repo.name) ?? false;
+        if (anchorDaemonOnlineNow !== false) seen = false;
+        else if (moved) seen = true;
+        if (seen && push) {
           originMovedByOther = true;
+          seen = false;
           log('info', 'derive: main on origin moved by another pusher, yielding takeover', {
             repo: repo.name,
           });
           anchorDownStreak = 0;
         }
+        foreignPushSeen.set(repo.name, seen);
       }
       // Per-repo veto on the tick's decision. One line per repo per tick when it fires, at info --
       // a refused takeover is the difference between one pusher and two, so it must be visible in
