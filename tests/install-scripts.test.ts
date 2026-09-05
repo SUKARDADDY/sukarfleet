@@ -98,6 +98,61 @@ describe('the elevated stage and the easytier-toml parser cannot drift apart', (
     if (!parsed.ok) return;
     expect(parsed.value.peers).toEqual(['tcp://192.0.2.4:11010']);
   });
+
+  // Launch item 2. The second machine of a fleet reaches the first one over the mesh and nowhere
+  // else -- /pair/hello is a mesh route -- so the address has to be in fleet.toml before pairing
+  // is a thing that can happen. Until the console could stage it, the ONLY way in was a --peer=
+  // flag on a sudo line no screen ever printed. This is the console's half of that path arriving
+  // at the same argv the flag does.
+  test('a peer the console staged reaches the TOML the same way the flag does', async () => {
+    writeFileSync(
+      pending,
+      `${JSON.stringify({
+        networkName: STAGED.networkName,
+        networkSecret: STAGED.secret,
+        meshIp: STAGED.meshIp,
+        hostname: STAGED.hostname,
+        peers: ['tcp://192.0.2.1:11010'],
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const run = await elevated();
+    expect(run.code).toBe(0);
+
+    const argv = easytierTomlArgv(run.output);
+    expect(argv).toContain('--peer=tcp://192.0.2.1:11010');
+
+    const parsed = parseEasytierTomlArgs(argv);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.peers).toEqual(['tcp://192.0.2.1:11010']);
+    expect(parsed.value.meshIp).toBe(STAGED.meshIp);
+    // The console stages no listeners, and that is deliberate: they stay the default pair.
+    expect(parsed.value.listeners).toEqual(STAGED.listeners);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The node restart, and the address it is restarted for
+// ---------------------------------------------------------------------------
+//
+// "easytier-fleet.service is active" is not "the mesh address is on an interface": the TUN device
+// is configured a moment later. Restarting into that gap put the node straight back on the 0.0.0.0
+// fallback (chooseBindHost in src/node.ts), where it stayed until something else restarted it --
+// and on a fresh machine nothing else ever does.
+
+describe('the node is restarted only once its address exists', () => {
+  test('the stage waits for the mesh address, then restarts', async () => {
+    const run = await elevated();
+    expect(run.code).toBe(0);
+
+    const lines = run.output.split('\n');
+    const waited = lines.findIndex((l) => l.includes(`wait up to 15s for the mesh address ${STAGED.meshIp} to come up`));
+    const restarted = lines.findIndex((l) => l.includes('systemctl --user restart sukarfleet.service'));
+    expect(waited).toBeGreaterThanOrEqual(0);
+    // Order is the whole assertion: a wait printed after the restart buys nothing.
+    expect(restarted).toBeGreaterThan(waited);
+  });
 });
 
 // ---------------------------------------------------------------------------

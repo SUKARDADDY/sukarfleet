@@ -47,6 +47,10 @@ The secret never appears in an argument. You type it in the unelevated stage, it
 only you can read, the elevated stage consumes that file and overwrites it. Same reason the
 Linux GUI stages a secret for `install-elevated.sh` instead of passing it on a command line.
 
+A file you wrote yourself and passed with `-MeshSecretFile` is not that file, and the installer
+leaves it alone rather than deleting something you named. It says so when it does, because that
+file still holds your fleet's secret in plaintext. Delete it once the mesh is up.
+
 Re-running is safe and is the upgrade path. Add `-Restart` to bounce the node.
 
 ## What it deliberately leaves undone

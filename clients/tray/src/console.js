@@ -45,7 +45,7 @@ const COPY = {
   identityUnchanged: 'Nothing changed.',
   meshStateNone: 'No mesh secret staged on this machine.',
   meshStatePending: 'A secret is staged and waiting for the one root step below.',
-  meshStateInstalled: 'The mesh secret is installed. Nothing to do here.',
+  meshStateInstalled: 'Installed. To change the secret or the peer, stage again here and re-run the same sudo line.',
   // setup.meshBindFallback: the mesh address is saved on the Identity card but is not on any
   // interface yet, so the daemon is listening on all of them until the sudo step below brings
   // the mesh up. Says which step closes it rather than leaving a warning with no exit.
@@ -926,12 +926,18 @@ function wireSetup() {
   $('mesh-form').addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const input = $('mesh-secret');
+    const peerInput = $('mesh-peer');
     const secret = input.value.trim();
+    // Empty on the first machine of a fleet, which is the whole point of it being optional. Given,
+    // it is what the daemon stages as a `peers` entry -- without it the second machine has no way
+    // onto the mesh, because pairing travels over the mesh it has not joined yet.
+    const peer = peerInput.value.trim();
     input.value = '';
     if (!secret) return;
     try {
-      await api('/api/ui/setup/network-secret', { method: 'POST', body: { action: 'stage', secret } });
+      await api('/api/ui/setup/network-secret', { method: 'POST', body: { action: 'stage', secret, peer } });
       result('mesh-result', COPY.meshStaged, 'ok');
+      peerInput.value = '';
       $('mesh-form').hidden = true;
       await loadMeshSecret();
       await pollState();

@@ -306,6 +306,37 @@ function Remove-SecretFile {
   Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
 }
 
+# Two spellings of the same file compare unequal as strings: a trailing slash, a quoted
+# argument, mixed case, a relative path. Normalise both sides before deciding to delete
+# something. A path that will not normalise is returned as typed, which can only make the
+# comparison below fail, and failing means "leave the file alone".
+function ConvertTo-ComparablePath {
+  param([string] $Path = '')
+  if (-not $Path) { return '' }
+  # Windows accepts both separators, and SUKARFLEET_STATE could be set with either, so fold
+  # them here rather than trusting GetFullPath to have done it.
+  $p = $Path.Trim().Trim('"').Replace('/', '\')
+  if (-not $p) { return '' }
+  try { $p = [IO.Path]::GetFullPath($p) } catch { }
+  return $p.TrimEnd('\')
+}
+
+# Is this the secret file the installer staged for itself, or one the operator wrote by hand?
+# Only the first gets shredded once it has been consumed. Deleting a file the operator created
+# and named is not tidiness, it is destroying someone else's data on a guess, so anything that
+# is not demonstrably ours is left where it is and reported.
+function Test-StagedSecretPath {
+  param([string] $Path = '')
+  if (-not $Path) { return $false }
+  $full = ConvertTo-ComparablePath -Path $Path
+  if (-not $full) { return $false }
+  if ($full -eq (ConvertTo-ComparablePath -Path $PendingSecret)) { return $true }
+  # Anything inside the installer's own state directory is the installer's to clean up.
+  $stateFull = ConvertTo-ComparablePath -Path $StateDir
+  if ($stateFull -and $full.StartsWith(($stateFull + '\'), [StringComparison]::OrdinalIgnoreCase)) { return $true }
+  return $false
+}
+
 function ConvertTo-TomlString { param([string] $s) return (ConvertTo-Json -InputObject $s -Compress) }
 
 # ---------------------------------------------------------------------------
@@ -382,12 +413,15 @@ function Invoke-ElevatedStage {
   # --- the network secret ---------------------------------------------------
   $secret = $null
   $secretSource = ''
+  $secretFile = ''   # empty when the secret was typed, so there is nothing on disk to clean up
   if ($MeshSecretFile) {
     if (-not (Test-Path -LiteralPath $MeshSecretFile)) { Write-Die "no such file: $MeshSecretFile" }
     $secret = (Get-Content -LiteralPath $MeshSecretFile -Raw).Trim()
+    $secretFile = $MeshSecretFile
     $secretSource = $MeshSecretFile
   } elseif (Test-Path -LiteralPath $PendingSecret) {
     $secret = (Get-Content -LiteralPath $PendingSecret -Raw).Trim()
+    $secretFile = $PendingSecret
     $secretSource = $PendingSecret
   }
   if (-not $secret) {
@@ -473,7 +507,19 @@ function Invoke-ElevatedStage {
   [IO.File]::WriteAllText($MeshToml, $toml, $utf8)
   $secret = $null
   Write-Step "wrote $MeshToml (Administrators and SYSTEM only; secret from $secretSource)"
-  if ($secretSource -eq $PendingSecret) { Remove-SecretFile -Path $PendingSecret; Write-Step 'adopted and shredded the staged secret' }
+  # The secret is now in the TOML, so the staged copy has served its purpose and goes here,
+  # before service registration. Everything below this line can fail, and none of those
+  # failures should leave the plaintext secret sitting in the user's profile. This runs on the
+  # explicit -Stage Elevated path too, not only when the unelevated stage staged the file: the
+  # child never knew which of the two launched it, and the file is consumed either way.
+  if ($secretFile) {
+    if (Test-StagedSecretPath -Path $secretFile) {
+      Remove-SecretFile -Path $secretFile
+      Write-Step 'adopted and shredded the staged secret'
+    } else {
+      Write-Step "left $secretFile in place: it is not the installer's staged file. Delete it yourself when the mesh is up."
+    }
+  }
 
   # --- service --------------------------------------------------------------
   $existing = Get-Service -Name $MeshServiceName -ErrorAction SilentlyContinue
@@ -1077,6 +1123,10 @@ if (-not $meshReady) {
     $plain = $null
     $secretPath = $PendingSecret
   }
+  # Whose file is it? Ours to shred if we staged it (or found our own leftover); the operator's
+  # to keep if -MeshSecretFile named something else. The elevated child answers the same
+  # question with the same function, so the two stages cannot disagree about it.
+  $secretIsOurs = Test-StagedSecretPath -Path $secretPath
 
   $childArgs = @(
     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"",
@@ -1105,8 +1155,9 @@ if (-not $meshReady) {
   try {
     $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList $childArgs -Verb RunAs -Wait -PassThru
   } catch {
-    Remove-SecretFile -Path $PendingSecret
-    Write-Die "elevation was refused or failed: $($_.Exception.Message)`nThe staged secret was shredded. Re-run when you can accept the prompt, or pass -SkipMesh if this machine already has the mesh."
+    if ($secretIsOurs) { Remove-SecretFile -Path $secretPath }
+    $shredNote = if ($secretIsOurs) { 'The staged secret was shredded. ' } else { '' }
+    Write-Die "elevation was refused or failed: $($_.Exception.Message)`n$($shredNote)Re-run when you can accept the prompt, or pass -SkipMesh if this machine already has the mesh."
   }
   # Start-Process -Verb RunAs goes through ShellExecute, which does not always populate
   # ExitCode. Rather than trust a field that may be null, ask the question the exit code was
@@ -1114,13 +1165,17 @@ if (-not $meshReady) {
   $exit = Get-Prop -Object $proc -Name 'ExitCode'
   $svcNow = Get-Service -Name $MeshServiceName -ErrorAction SilentlyContinue
   if (-not $svcNow) {
-    Remove-SecretFile -Path $PendingSecret
+    if ($secretIsOurs) { Remove-SecretFile -Path $secretPath }
     Write-Die "the elevated stage did not leave a '$MeshServiceName' service behind$(if ($null -ne $exit) { " (exit $exit)" }). Nothing user-level was changed. Scroll up in the elevated window for the reason."
   }
   if ($null -ne $exit -and $exit -ne 0) {
     Write-Warn "the elevated stage reported exit $exit, but the '$MeshServiceName' service does exist. Carrying on; check the mesh before you rely on it."
   }
-  Remove-SecretFile -Path $PendingSecret
+  # Belt and braces. The elevated stage shreds the staged file the moment it has consumed it,
+  # so by now this is normally a no-op; it still covers the runs that ended before that point.
+  # Remove-SecretFile returns quietly when the file is already gone, which is the usual case,
+  # so nothing here announces a shred that did not happen.
+  if ($secretIsOurs) { Remove-SecretFile -Path $secretPath }
 }
 
 Invoke-UserStage

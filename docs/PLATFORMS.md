@@ -114,6 +114,18 @@ from `node:os` rather than `ip -json addr` and vets its clock with `w32tm /query
 than `timedatectl`, reporting a stopped or unreadable time service as unknown, which holds
 auto-commit and logs the reason instead of stopping the daemon.
 
+**Observed on a Windows 11 Pro VM, 2026-09-05.** `Install-Sukarfleet.ps1` completed both its user
+stage and its elevated stage under Windows PowerShell 5.1.26100 and under pwsh 7.6.5, as the real
+user and as that user's elevated token: Bun 1.3.14 bootstrapped, the fleet key generated, the DPAPI
+probe passed, the node task registered and started, EasyTier 2.6.4 fetched and checksum-verified
+into `C:\Program Files\EasyTier`, the mesh service running with a mesh address on the guest, two
+firewall rules scoped to the transport binary, the staged secret shredded. The daemon booted and
+served `/health` and the console state; its one fault was "clock not vetted" at low urgency.
+Storing a sudo credential answered `not-private` and the daemon stayed healthy, which is item 6 of
+the launch checklist observed rather than reasoned. Not exercised: the Auto flow's UAC prompt (the
+stages were driven separately, since the VM had no interactive session) and mesh traffic between
+the Windows guest and another machine.
+
 ### Anything else — unsupported
 
 Every seam refuses by name. Sync may well work, since it is plain git over HTTP.

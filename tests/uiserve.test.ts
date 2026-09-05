@@ -59,6 +59,7 @@ interface Calls {
   listRuns: number[];
   auditLimit: number[];
   stage: string[];
+  stagePeer: (string | undefined)[];
   generate: number;
   restart: number;
   hello: number;
@@ -115,6 +116,7 @@ function makeHarness(over: Partial<UiRoutesDeps> = {}): {
     listRuns: [],
     auditLimit: [],
     stage: [],
+    stagePeer: [],
     generate: 0,
     restart: 0,
     hello: 0,
@@ -187,8 +189,9 @@ function makeHarness(over: Partial<UiRoutesDeps> = {}): {
     },
     networkSecret: {
       reveal: async () => 'mesh-secret-value',
-      stage: async (s) => {
+      stage: async (s, peer) => {
         calls.stage.push(s);
+        calls.stagePeer.push(peer);
       },
       generate: async () => {
         calls.generate += 1;
@@ -809,6 +812,71 @@ describe('api routes', () => {
     for (const bad of [{ action: 'nope' }, { action: 'stage' }, { action: 'stage', secret: '' }, { action: 'stage', secret: 'a\nb' }]) {
       expect((await local(guiPost('/api/ui/setup/network-secret', bad)))!.status).toBe(400);
     }
+  });
+
+  // Launch item 2, "two fresh machines pair with no terminal". /pair/hello travels over the mesh,
+  // so the mesh has to form before the Pair screen does anything -- and the only thing that forms
+  // it on machine two is a `peers` entry naming machine one. Before this field the address could
+  // be given exactly one way: a `--peer=` flag on a sudo line no screen ever printed.
+  test('the Mesh card can name a machine already in the fleet, and it is normalized to one endpoint', async () => {
+    const good: [string, string][] = [
+      ['192.0.2.1', 'tcp://192.0.2.1:11010'],
+      ['  192.0.2.1  ', 'tcp://192.0.2.1:11010'],
+      ['192.0.2.1:11011', 'tcp://192.0.2.1:11011'],
+      ['alpha', 'tcp://alpha:11010'],
+      ['alpha.local:11010', 'tcp://alpha.local:11010'],
+      // A bare IPv6 literal carries no port of its own, and gets the brackets EasyTier's peer
+      // list needs to tell the address from the port.
+      ['2001:db8::1', 'tcp://[2001:db8::1]:11010'],
+      ['[2001:db8::1]:11010', 'tcp://[2001:db8::1]:11010'],
+    ];
+    for (const [typed, endpoint] of good) {
+      const h = makeHarness();
+      const res = (await h.routes.handle(guiPost('/api/ui/setup/network-secret', { action: 'stage', secret: 's3cret', peer: typed }), server('127.0.0.1')))!;
+      expect(res.status).toBe(200);
+      expect(h.calls.stage).toEqual(['s3cret']);
+      expect(h.calls.stagePeer).toEqual([endpoint]);
+    }
+  });
+
+  test('an empty peer field is the first machine of a fleet, and still stages the bare secret', async () => {
+    for (const body of [
+      { action: 'stage', secret: 's3cret' },
+      { action: 'stage', secret: 's3cret', peer: '' },
+      { action: 'stage', secret: 's3cret', peer: '   ' },
+    ]) {
+      const h = makeHarness();
+      expect((await h.routes.handle(guiPost('/api/ui/setup/network-secret', body), server('127.0.0.1')))!.status).toBe(200);
+      // undefined, not '' -- node.ts branches on it to choose the bare file over the JSON one, and
+      // the bare path is what every machine already staged is still reading.
+      expect(h.calls.stagePeer).toEqual([undefined]);
+    }
+  });
+
+  test('a peer that would not survive the root stage is refused here, while the operator is looking at it', async () => {
+    const bad = [
+      'http://192.0.2.1',            // a scheme is not an address; the slash is not in the charset
+      '192.0.2.1:0',                 // port 0
+      '192.0.2.1:70000',             // out of range
+      '192.0.2.1:11010:11010',       // two ports
+      '192.0.2.1:not-a-port',
+      'alpha local',                 // a space
+      '[2001:db8::1',                // unterminated bracket
+      '[alpha]:11010',               // brackets are for IPv6 literals, not for names
+      '...',                         // passes the charset, names nothing
+      `${'a'.repeat(200)}.local`,    // the endpoint would exceed valid_endpoint's 128-char cap
+      'alpha\u0000',
+    ];
+    for (const peer of bad) {
+      const h = makeHarness();
+      const res = (await h.routes.handle(guiPost('/api/ui/setup/network-secret', { action: 'stage', secret: 's3cret', peer }), server('127.0.0.1')))!;
+      expect(res.status).toBe(400);
+      expect(h.calls.stage).toEqual([]);
+    }
+    // Not a string at all.
+    const h = makeHarness();
+    expect((await h.routes.handle(guiPost('/api/ui/setup/network-secret', { action: 'stage', secret: 's3cret', peer: 11010 }), server('127.0.0.1')))!.status).toBe(400);
+    expect(h.calls.stage).toEqual([]);
   });
 
   test('pair code mint/read/cancel all answer with the code state', async () => {

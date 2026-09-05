@@ -48,6 +48,7 @@
 //     degrades to a logged 500, never to a rejected promise inside node.ts's fetch handler.
 
 import { join } from 'node:path';
+import { isIPv6 } from 'node:net';
 import type {
   AdminRunRequest,
   AdminRunView,
@@ -147,6 +148,14 @@ const MESH_IP_RE = /^[0-9A-Fa-f.:]{1,45}$/;
 const NETWORK_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const HOST_RE = /^[A-Za-z0-9._:\[\]-]{1,255}$/;
 
+// The mesh listener port install-elevated.sh binds when nothing overrides it (its default
+// LISTENERS pair, tcp:// and udp:// on 11010). The Mesh card's peer field takes a bare address in
+// the common case, so this is what a missing ":port" means.
+const MESH_PEER_DEFAULT_PORT = 11010;
+// install-elevated.sh's valid_endpoint refuses anything longer than this, so an endpoint that would
+// die there is refused here instead -- while the operator is still looking at the field.
+const MAX_PEER_ENDPOINT_CHARS = 128;
+
 // The only reasons secrets.setSudoPassword can report, restated here as a closed vocabulary. The
 // response is built from THIS map, never from the store's own strings, so no value that passed
 // through the credential path can reach a response body even if a future refactor puts one in an
@@ -217,7 +226,10 @@ export interface UiNetworkSecretPort {
   // Returns the staged mesh secret so the operator can copy it to the other machine; null when
   // nothing is staged. Loopback-only, like every other /api/ui route.
   reveal: () => Promise<string | null>;
-  stage: (s: string) => Promise<void>;
+  // `peer` is one `tcp://host:port` endpoint, already normalized by parseMeshPeer. Given, it is
+  // the address of a machine already in the fleet and the staged file becomes the JSON shape the
+  // elevated stage reads; omitted, the staged file stays the bare secret it has always been.
+  stage: (s: string, peer?: string) => Promise<void>;
   generate: () => Promise<string>;
   state: () => Promise<MeshSecretState>;
 }
@@ -289,6 +301,70 @@ const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/;
 
 function isCleanText(s: string, max: number): boolean {
   return s.length > 0 && s.length <= max && !CONTROL_CHARS_RE.test(s);
+}
+
+// "a machine already in the fleet", as the Mesh card asks for it, turned into the one endpoint
+// shape EasyTier's `peers` list takes: `tcp://host:port`.
+//
+// This is the second machine's only way onto the mesh, and it has to be typed before the mesh
+// exists -- pairing travels over the mesh, so nothing the console can reach is available yet. The
+// field therefore accepts what a person has to hand: `192.0.2.1`, `192.0.2.1:11010`, `alpha`,
+// `alpha.local:11010`, `[2001:db8::1]:11010`, `2001:db8::1`. A missing port means the mesh
+// listener port, which is the one the other machine's own install opened.
+//
+// Returns null for anything else. The value ends up inside a file a root process reads, so the
+// charset is the same closed one the pair screen's host field uses (HOST_RE) and the length is the
+// one the root stage will accept -- a value that passes here cannot be one install-elevated.sh
+// refuses later, when the operator is no longer at the console.
+function parseMeshPeer(raw: string): string | null {
+  const value = raw.trim();
+  if (!isCleanText(value, MAX_HOST_CHARS)) return null;
+
+  let host = value;
+  let port = MESH_PEER_DEFAULT_PORT;
+
+  if (value.startsWith('[')) {
+    // Bracketed form. Brackets exist to disambiguate an IPv6 literal from a host:port, so a
+    // bracketed value that is not an IPv6 literal is a value being written two ways.
+    const end = value.indexOf(']');
+    if (end < 0) return null;
+    host = value.slice(1, end);
+    if (!isIPv6(host)) return null;
+    const rest = value.slice(end + 1);
+    if (rest.length > 0) {
+      if (!rest.startsWith(':')) return null;
+      const parsed = parsePort(rest.slice(1));
+      if (parsed === null) return null;
+      port = parsed;
+    }
+  } else {
+    const first = value.indexOf(':');
+    // Exactly one colon is host:port. Two or more can only be a bare IPv6 literal, which carries
+    // no port of its own -- it gets the default and the brackets it needs below. `192.0.2.1:1:2`
+    // is neither, and isIPv6 is what says so: a charset check cannot tell it from an address.
+    if (first >= 0 && first === value.lastIndexOf(':')) {
+      const parsed = parsePort(value.slice(first + 1));
+      if (parsed === null) return null;
+      host = value.slice(0, first);
+      port = parsed;
+    } else if (first >= 0 && !isIPv6(value)) {
+      return null;
+    }
+  }
+
+  if (!HOST_RE.test(host)) return null;
+  if (host.includes('[') || host.includes(']')) return null;
+  // `...` and `--` pass the charset. A host has to name something.
+  if (!/[A-Za-z0-9]/.test(host)) return null;
+
+  const endpoint = `tcp://${host.includes(':') ? `[${host}]` : host}:${port}`;
+  return endpoint.length <= MAX_PEER_ENDPOINT_CHARS ? endpoint : null;
+}
+
+function parsePort(s: string): number | null {
+  if (!/^[0-9]{1,5}$/.test(s)) return null;
+  const n = Number(s);
+  return n >= 1 && n <= 65535 ? n : null;
 }
 
 function clampLimit(raw: string | null, fallback: number, max: number): number {
@@ -723,7 +799,21 @@ export class UiRoutes {
       if (typeof secret !== 'string' || !isCleanText(secret.trim(), MAX_MESH_SECRET_CHARS)) {
         return badRequest('that does not look like a mesh secret');
       }
-      await this.deps.networkSecret.stage(secret.trim());
+      // Optional, and absent on the first machine of a fleet: an empty field is "this is the first
+      // one", not a bad value. Anything else that is present has to parse, because the alternative
+      // is a second machine that stages, runs the sudo line, and finds it still cannot reach the
+      // first one -- with nothing on screen having said no.
+      const rawPeer = body.value.peer;
+      let peer: string | undefined;
+      if (rawPeer !== undefined && rawPeer !== null) {
+        if (typeof rawPeer !== 'string') return badRequest('that address is not valid');
+        if (rawPeer.trim() !== '') {
+          const parsed = parseMeshPeer(rawPeer);
+          if (parsed === null) return badRequest('that address is not valid');
+          peer = parsed;
+        }
+      }
+      await this.deps.networkSecret.stage(secret.trim(), peer);
       return jsonResponse({ ok: true });
     }
     return badRequest('action must be generate or stage');
