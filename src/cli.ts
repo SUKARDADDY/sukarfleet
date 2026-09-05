@@ -13,9 +13,10 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { isatty, ReadStream as TtyReadStream } from 'node:tty';
 import { AuditLog } from './audit';
-import { loadConfig, stateDir } from './config';
+import { defaultConfig, loadConfig, stateDir } from './config';
 import { loadOrCreateMachineKey } from './keys';
 import { SshAdmin } from './sshadmin';
+import { generateEasytierToml } from './transport';
 import type {
   AdminRunView,
   AdminStatusEntry,
@@ -816,6 +817,111 @@ export async function cmdAdminExecLocal(deps: AdminExecLocalDeps = {}): Promise<
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// easytier-toml
+//
+// A thin CLI over generateEasytierToml, so install/install-elevated.sh does not
+// re-implement the TOML layout in bash. src/transport.ts stays the single source
+// of the key layout and of the two constraints that make hand-writing it
+// dangerous: every top-level key must precede the first table header, and
+// rpc_portal is a unit CLI flag rather than a file key.
+//
+// The secret arrives as a FILE, never as an argument: a secret on argv reaches
+// ps output and, through the shell that built the command, shell history. The
+// caller is the elevated stage, which has already copied it out of the staged
+// file into a 0600 root-owned scratch file.
+// ---------------------------------------------------------------------------
+
+export const EASYTIER_TOML_USAGE =
+  'usage: sukarfleet-cli easytier-toml --secret-file PATH --mesh-ip A.B.C.D [--hostname NAME]\n' +
+  '                                    [--network-name NAME] [--listener URI]... [--peer URI]...\n' +
+  '                                    [--rpc-addr HOST:PORT]';
+
+export interface EasytierTomlArgs {
+  secretFile: string;
+  meshIp: string;
+  hostname: string;
+  networkName: string;
+  listeners: string[];
+  peers: string[];
+  rpcAddr: string;
+}
+
+// Repeated flags accumulate; everything else is last-wins. Unknown flags are an
+// error rather than a shrug, because a typo'd --listener would silently produce
+// a TOML that listens nowhere.
+export function parseEasytierTomlArgs(args: string[]): { ok: true; value: EasytierTomlArgs } | { ok: false; message: string } {
+  const out: EasytierTomlArgs = {
+    secretFile: '',
+    meshIp: '',
+    hostname: '',
+    networkName: 'sukarfleet',
+    listeners: [],
+    peers: [],
+    rpcAddr: '127.0.0.1:15888',
+  };
+  for (const arg of args) {
+    const eq = arg.indexOf('=');
+    const [flag, value] = eq === -1 ? [arg, null] : [arg.slice(0, eq), arg.slice(eq + 1)];
+    if (value === null) return { ok: false, message: `easytier-toml: ${flag} needs a value, as ${flag}=VALUE` };
+    switch (flag) {
+      case '--secret-file': out.secretFile = value; break;
+      case '--mesh-ip': out.meshIp = value; break;
+      case '--hostname': out.hostname = value; break;
+      case '--network-name': out.networkName = value; break;
+      case '--rpc-addr': out.rpcAddr = value; break;
+      case '--listener': out.listeners.push(value); break;
+      case '--peer': out.peers.push(value); break;
+      default: return { ok: false, message: `easytier-toml: unknown argument ${flag}` };
+    }
+  }
+  if (!out.secretFile) return { ok: false, message: 'easytier-toml: --secret-file is required' };
+  if (!out.meshIp) return { ok: false, message: 'easytier-toml: --mesh-ip is required' };
+  if (!out.hostname) return { ok: false, message: 'easytier-toml: --hostname is required' };
+  if (out.listeners.length === 0) out.listeners = ['tcp://0.0.0.0:11010', 'udp://0.0.0.0:11010'];
+  return { ok: true, value: out };
+}
+
+// Split from the IO so a test can prove the CLI's output equals the generator's
+// for the same inputs without touching the filesystem.
+export function renderEasytierToml(args: EasytierTomlArgs, secret: string): string {
+  const cfg = defaultConfig(args.hostname);
+  cfg.networkName = args.networkName;
+  cfg.easytier.rpcAddr = args.rpcAddr;
+  return generateEasytierToml(cfg, {
+    secret,
+    listeners: args.listeners,
+    peerUris: args.peers,
+    hostname: args.hostname,
+    ipv4: args.meshIp,
+  });
+}
+
+export async function cmdEasytierToml(args: string[]): Promise<number> {
+  const parsed = parseEasytierTomlArgs(args);
+  if (!parsed.ok) {
+    console.error(parsed.message);
+    console.error(EASYTIER_TOML_USAGE);
+    return 2;
+  }
+  let secret: string;
+  try {
+    secret = (await Bun.file(parsed.value.secretFile).text()).trim();
+  } catch {
+    // The path, never the contents: this runs as root against a file the console
+    // wrote, and an error message is the one thing here that gets printed.
+    console.error(`easytier-toml: could not read the secret file at ${parsed.value.secretFile}`);
+    return 2;
+  }
+  if (secret === '') {
+    console.error(`easytier-toml: the secret file at ${parsed.value.secretFile} is empty; nothing was written`);
+    return 2;
+  }
+  process.stdout.write(renderEasytierToml(parsed.value, secret));
+  return 0;
+}
+
 function printUsage(): void {
   console.log('usage: sukarfleet-cli [status|peers|self|version]');
   console.log('       sukarfleet-cli audit tail [n]');
@@ -823,6 +929,7 @@ function printUsage(): void {
   console.log('       sukarfleet-cli admin status');
   console.log('       sukarfleet-cli admin trust');
   console.log('       sukarfleet-cli admin exec-local   (SSH forced command; refuses without SSH_ORIGINAL_COMMAND)');
+  console.log(`       ${EASYTIER_TOML_USAGE.replace('usage: ', '')}`);
 }
 
 async function main(): Promise<number> {
@@ -837,6 +944,8 @@ async function main(): Promise<number> {
       return cmdSelf();
     case 'version':
       return cmdVersion();
+    case 'easytier-toml':
+      return cmdEasytierToml(args.slice(1));
     case 'audit':
       if (args[1] === 'tail') return cmdAuditTail(args.slice(2));
       console.error(`unknown audit subcommand: ${args[1] ?? '(none)'}`);

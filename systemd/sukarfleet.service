@@ -30,7 +30,12 @@ WatchdogSec=120
 WatchdogSignal=SIGTERM
 KillMode=mixed
 WorkingDirectory=__SUKARFLEET_REPO__
-ExecStart=%h/.bun/bin/bun run src/node.ts
+# Both placeholders are substituted by install/quickstart.sh; this file is a
+# template and is never installed verbatim. __SUKARFLEET_BUN__ is the resolved
+# bun the installer actually found, not %h/.bun/bin/bun: the installer accepts a
+# bun anywhere on PATH, so a machine with bun at /usr/local/bin/bun would
+# otherwise pass preflight and get a unit that cannot start.
+ExecStart=__SUKARFLEET_BUN__ run src/node.ts
 Restart=always
 RestartSec=3
 

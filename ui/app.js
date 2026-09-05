@@ -427,6 +427,14 @@ function renderSetupCards() {
     adminPaired.length ? 'dot-ok' : 'dot-warn',
   );
 
+  // The one root step, as this daemon resolves it. Sent by the daemon rather than
+  // composed here: the console does not know where get.sh put the checkout, and a
+  // printed command naming a directory nobody has is worse than no command.
+  // setText writes textContent, so nothing in it can be markup.
+  if (typeof setup.elevatedCommand === 'string' && setup.elevatedCommand) {
+    setText('mesh-command', setup.elevatedCommand);
+  }
+
   const meshState = setup.meshSecret;
   statusLine(
     'mesh-state',

@@ -41,7 +41,7 @@ import * as secrets from '../src/secrets';
 import type { SealScope } from '../src/secrets';
 import { SshAdmin } from '../src/sshadmin';
 import type { SudoBroker } from '../src/sshadmin';
-import { UiRoutes } from '../src/uiserve';
+import { UiRoutes, elevatedInstallCommand } from '../src/uiserve';
 import type { UiRoutesDeps } from '../src/uiserve';
 import type {
   AdminRunRequest,
@@ -456,6 +456,7 @@ function uiDeps(ctx: NodeCtx): UiRoutesDeps {
           meshSecret: 'installed',
           credential: false,
           paired: ctx.cfg.peers.length > 0,
+          elevatedCommand: elevatedInstallCommand('/opt/sukarfleet', '/var/lib/sukarfleet'),
         },
         pairing: ctx.pairing.codeState(),
       };

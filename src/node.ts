@@ -56,7 +56,7 @@ import { readCappedBody, DEFAULT_MAX_BODY_BYTES, BODY_READ_TIMEOUT_MS } from './
 import { randomBytes } from 'node:crypto';
 import { SshAdmin } from './sshadmin';
 import { Pairing } from './pairing';
-import { UiRoutes, type UiRoutesDeps } from './uiserve';
+import { UiRoutes, elevatedInstallCommand, type UiRoutesDeps } from './uiserve';
 import * as secrets from './secrets';
 
 const LOOPBACK_ADDRS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
@@ -1011,6 +1011,10 @@ async function main(): Promise<void> {
         meshSecret,
         credential: credentialReady,
         paired,
+        // import.meta.dir is src/, so its parent is the checkout get.sh made --
+        // and it survives the daemon being started from any cwd, or from none,
+        // which is what a systemd unit does.
+        elevatedCommand: elevatedInstallCommand(join(import.meta.dir, '..'), stateDir()),
       },
       pairing: pairing.codeState(),
     };

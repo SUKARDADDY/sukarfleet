@@ -10,7 +10,7 @@ Support levels here are claims about **testing**, not promises about behaviour.
 
 | Seam | Linux | macOS | Windows |
 |---|---|---|---|
-| Sync, gossip, pairing, GUI, MCP | supported | experimental | experimental |
+| Sync, gossip, pairing, console, MCP | supported | experimental | experimental |
 | Service manager | `systemctl --user` — supported | `launchctl kickstart` — experimental | `Restart-Service` — experimental |
 | Desktop notification | gdbus (freedesktop, GTK fallback) — supported | `osascript` — experimental | WinRT toast — experimental |
 | Credential store | `systemd-creds` — supported | login Keychain — experimental | DPAPI CurrentUser — experimental |
@@ -37,6 +37,26 @@ never, ever appears to succeed.
 
 ### Linux — supported
 
+**Installing.** One command on Debian or Ubuntu:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SUKARDADDY/sukarfleet/v0.1.0/install/get.sh | sh
+```
+
+It clones the tag into `~/.local/share/sukarfleet/app` and runs `install/quickstart.sh`, which
+installs Bun if it is missing, writes the config and the systemd user unit, starts the daemon, and
+opens the console: a native tray window on a desktop, the printed `http://127.0.0.1:7710/ui/` on a
+headless box or wherever the tray's two shared libraries are absent. Then the console prints **one**
+command that needs root, and it is the only password moment: it adopts the staged mesh secret,
+installs a SHA256-pinned EasyTier, starts the mesh transport, and opens the listener ports if a
+firewall is already running. Removal is `./install/uninstall.sh` plus `sudo ./install/uninstall.sh
+--elevated`.
+
+Debian and Ubuntu family only, read from `/etc/os-release`. Every other distro is refused by name
+rather than attempted: the daemon has no distro dependency, but the installer's dependency handling
+does. `docs/INSTALL-FLOW.md` section 9 is the manual route, and
+`SUKARFLEET_SKIP_DISTRO_CHECK=1` is how someone takes it.
+
 The reference platform. `systemd-creds --user` seals the admin credential; TPM scope is attempted
 first and normally loses, because system-scope sealing needs `/var/lib/systemd/credential.secret`
 (0400 root:root) and this daemon has neither root nor an interactive polkit prompt.
@@ -47,7 +67,7 @@ credential-store locations for exactly that reason.
 
 ### macOS — experimental
 
-Everything except privilege elevation is implemented and expected to work. **No maintainer owns a
+Everything except privilege elevation is implemented and expected to work. There is no `get.sh` path: `install/quickstart.sh` is systemd-specific, so a Mac is a manual install. **No maintainer owns a
 Mac**, so "experimental" here genuinely means untried until a stranger tries it.
 
 Two specific unknowns:
@@ -61,7 +81,7 @@ Two specific unknowns:
 
 ### Windows — experimental, with one honest gap
 
-Sync, gossip, pairing, the GUI and the MCP surface are implemented and should work.
+Sync, gossip, pairing, the console and the MCP surface are implemented and should work.
 
 **The admin lane cannot elevate on Windows.** There is no `sudo`. The lane's entire design is
 "pipe one password line to a privilege-elevation tool that reads stdin", and Windows has no such

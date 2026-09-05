@@ -26,33 +26,51 @@ untried — see [`docs/PLATFORMS.md`](docs/PLATFORMS.md), which is specific abou
 
 ## Install
 
-Requires [Bun](https://bun.sh) and a mesh network between your machines (the daemon does not create
-one; it uses one you have).
+One command, on Debian or Ubuntu:
 
 ```bash
-git clone <repo-url> sukarfleet && cd sukarfleet && ./install/quickstart.sh
+curl -fsSL https://raw.githubusercontent.com/SUKARDADDY/sukarfleet/v0.1.0/install/get.sh | sh
 ```
 
-That is the whole user-level install: it writes a config, generates this machine's identity and SSH
-key, installs a systemd user unit, starts the daemon, and opens the setup GUI. It is idempotent —
-re-running it is the upgrade path.
+It clones this repository at that tag into `~/.local/share/sukarfleet/app` and runs
+[`install/quickstart.sh`](install/quickstart.sh) from the checkout, so the thing that installs you
+is a repository at a tag you can read first. Never `sudo curl ... | sh`: nothing in that stage needs
+root.
 
-There is exactly **one** step that needs root, kept separate and optional:
+The stage installs Bun if it is missing, writes a config, generates this machine's identity and SSH
+key, installs a systemd user unit, starts the daemon, and opens the console. On a desktop the
+console is a native tray window; headless, it prints `http://127.0.0.1:7710/ui/`. It is idempotent,
+and re-running it with a newer tag is the upgrade path.
+
+Then the console's setup screen takes your machine name and the mesh secret, and prints **one**
+command that needs root. It is the only password moment in the whole install:
 
 ```bash
-sudo ./install/install-elevated.sh
+sudo ~/.local/share/sukarfleet/app/install/install-elevated.sh \
+     --adopt-pending-secret --pending="$HOME/.local/state/sukarfleet/pending-easytier-secret"
 ```
 
-It installs the mesh transport and grants the daemon permission to restart that one service. It
-never installs a passwordless rule for anything else.
+Copy it from the console rather than from here: both paths are printed there already resolved, and
+the daemon honours `SUKARFLEET_STATE`, so the second one is not always under `$HOME`.
 
-On Windows, double-click [`install/windows/Add-To-Fleet.cmd`](install/windows/README.md) instead.
-It does the same two stages in one file, behind one UAC prompt, and is specific about the two
-things a Windows node cannot do.
+That step adopts the staged mesh secret, installs a SHA256-pinned EasyTier, writes
+`/etc/easytier/fleet.toml`, starts the mesh transport, opens the listener ports if a firewall is
+already running, and grants the daemon permission to restart that one service. Nothing else.
+
+To remove it: `./install/uninstall.sh`, then `sudo ./install/uninstall.sh --elevated` for the
+root-owned half. It leaves your repositories, your config and your SSH keys alone.
+
+The whole flow, including every failure message and its exit code, is
+[`docs/INSTALL-FLOW.md`](docs/INSTALL-FLOW.md). Other distros are refused by name with the manual
+steps in its appendix.
+
+On Windows, double-click [`install/windows/Add-To-Fleet.cmd`](install/windows/README.md) instead. It
+does the same two stages in one file, behind one UAC prompt, and is specific about the two things a
+Windows node cannot do.
 
 ## Pair two machines
 
-Open the GUI on both (`http://127.0.0.1:7710/ui/`), click **Pair** on one, and type the code it
+Open the console on both (`http://127.0.0.1:7710/ui/`, or the tray window), click **Pair** on one, and type the code it
 shows into the other. Mutual trust is established in one round trip: mesh identity and SSH identity
 are exchanged together. No terminal required.
 
@@ -73,7 +91,7 @@ plainly what the credential sealing does and does not protect you from.
 
 ## Configuration
 
-`~/.config/sukarfleet/config.json`, mode 0600. The GUI writes most of it. The parts you will touch:
+`~/.config/sukarfleet/config.json`, mode 0600. The console writes most of it. The parts you will touch:
 
 ```jsonc
 {

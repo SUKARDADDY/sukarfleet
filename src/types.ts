@@ -416,6 +416,11 @@ export interface UiSetupState {
   meshSecret: MeshSecretState;
   credential: boolean;
   paired: boolean;
+  // The one root step, built by elevatedInstallCommand() in uiserve.ts from this
+  // daemon's own checkout and state directory. The console prints it verbatim
+  // rather than composing a path of its own: a printed command that names a
+  // directory nobody has is worse than no command at all.
+  elevatedCommand: string;
 }
 
 export interface UiPairingState {

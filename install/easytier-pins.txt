@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Content pins for every binary the installer downloads. Four whitespace-separated
+# columns, '#' comments and blank lines ignored:
+#
+#   version   arch   sha256   asset
+#
+#   version  upstream version string, no leading 'v'
+#   arch     the `uname -m` token this line is for
+#   sha256   lowercase hex, 64 characters, of the asset as downloaded
+#   asset    the exact release asset filename
+#
+# The asset name is what tells the two consumers apart. install-elevated.sh's
+# fetch_easytier reads the lines whose asset starts with 'easytier-linux-';
+# quickstart.sh's tray fetch reads the ones starting 'sukarfleet-tray-'.
+#
+# A sha256 of TODO-S9 means "no pin exists yet". Nothing is downloaded against a
+# TODO pin: quickstart treats a TODO tray line as "no tray available" and prints
+# the web console URL instead, and install-elevated refuses an EasyTier line it
+# cannot verify. An unverified download is worse than no download.
+#
+# The fleet's wire compatibility IS the EasyTier version, so a silent bump is a
+# silent fleet split. Bumping a version here means bumping it on every machine.
+# The Windows installer mirrors these values in its own $MeshHashes table
+# (install/windows/Install-Sukarfleet.ps1); the two are kept in step by hand.
+
+# EasyTier. URL shape:
+#   https://github.com/EasyTier/EasyTier/releases/download/v<version>/<asset>
+# `uname -m` maps x86_64 -> x86_64 and aarch64/arm64 -> aarch64. Anything else is
+# refused by name. Computed 2026-09-05 against the real v2.6.4 release.
+2.6.4  x86_64   61b659eaedba658fa66fe47d17e1426cdd77e5d02fa15fed447bb4357c09dfd6  easytier-linux-x86_64-v2.6.4.zip
+2.6.4  aarch64  f533ec25a7ea714e09f645615012200278058525795cc3bb690ff011aec1a70f  easytier-linux-aarch64-v2.6.4.zip
+
+# The native tray console. URL shape:
+#   $SUKARFLEET_RELEASE_BASE/<asset>
+# which defaults to this project's GitHub release for the tag being installed.
+# There is no release yet, so both values are TODO-S9 and no machine installs a
+# tray: quickstart prints the web console URL and the install still succeeds.
+# S9 cuts the tag, uploads the binaries and replaces these two lines. The version
+# column is the sukarfleet release tag without its leading 'v'.
+0.1.0  x86_64   TODO-S9  sukarfleet-tray-linux-x86_64
+0.1.0  aarch64  TODO-S9  sukarfleet-tray-linux-aarch64
