@@ -37,7 +37,10 @@ const golden = JSON.parse(goldenRaw, reviveNonFinite) as Golden;
 
 // Digest of the recorded file, so it cannot be quietly regenerated to make a failing test pass.
 // See README.md for the (rare, deliberate) circumstances under which this may change.
-const EXPECTED_GOLDEN_SHA256 = 'd96f5b46d3374114c4e2d4388699a7e00d02a94974bfb61728eca97f3524453e';
+// Re-pinned when auditEntry.note was corrected: the old note called the log "hash-chained"
+// before any chain existed. The note is prose ONLY -- no canonical, signature or payload byte
+// of this file moved, and every assertion above still runs against the same recorded bytes.
+const EXPECTED_GOLDEN_SHA256 = '0db22eacbd365f614067ff7b4d174c902b1006b522408149065e68b73bbedf1d';
 
 interface CanonicalCase {
   name: string;

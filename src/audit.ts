@@ -3,7 +3,11 @@
 //
 //  - AuditLog: local append. State-dir-persisted (mirrors gossip.ts's seq-file pattern), a
 //    strictly monotonic per-machine `seq` minted before every entry, every entry signed via
-//    trust.ts's signAuditEntry (house pattern #2 -- nobody reimplements JSON signing here).
+//    trust.ts's signAuditEntry (house pattern #2 -- nobody reimplements JSON signing here), and
+//    every entry carrying `prev` -- the sha256 of the previous local entry -- so a machine's run
+//    is a hash chain from its genesis forward. Mint, sign and append all happen under ONE hold of
+//    the seq lock, because a chain cannot tolerate two processes minting n and n+1 and then
+//    appending them in the other order.
 //
 //  - regenerateUnionLog: the canonical regenerator. syncer.ts's postMerge / derive.ts's
 //    postMerge-in-worktree machinery (see both files' `postMerge: string[][]` contract) is
@@ -83,6 +87,12 @@ export const AUDIT_KIND_CREDENTIAL_STALE = 'credential-stale';
 // crossCheckAuditLog reads exactly these fields out of `detail`; entries from lanes that don't
 // populate them are simply invisible to the job-matching checks (seq-gap and signature checks
 // still apply to every entry regardless of kind).
+
+// The `prev` a machine's very first chained entry carries when its local log was empty. A literal
+// rather than an absent field, so "this is a genesis entry" is a positive, SIGNED statement: an
+// entry that simply lacks `prev` after the genesis is a break, not a second genesis. 'genesis' can
+// never collide with a real link, which is always 64 hex characters.
+export const GENESIS_PREV = 'genesis';
 
 function localLogPath(): string {
   return join(stateDir(), 'audit-log.jsonl');
@@ -242,38 +252,65 @@ export class AuditLog {
     private readonly key: MachineKey,
   ) {}
 
-  // Re-reads the counter under an exclusive lock on EVERY mint. Caching it in memory was a
-  // lost update: the daemon kept a stale value while the forced-command process advanced the
-  // file, then re-minted a seq that was already taken. The two entries reached the union file
-  // sharing one (machine, seq) -- indistinguishable from a stolen key signing a second entry,
-  // which is precisely the condition regenerateUnionLog exists to alarm on. 33 such pairs
-  // accumulated on the live fleet before anyone read the journal.
-  private async nextSeq(): Promise<number> {
-    return await withSeqLock(async () => {
-      // The in-memory value is a floor, never the source of truth: it only defends against a
-      // counter file truncated or rolled back underneath a running process.
-      const next = Math.max(await readSeqFile(), this.seqValue) + 1;
-      await atomicWrite(seqPath(), canonicalJson({ seq: next }));
-      this.seqValue = next;
-      return next;
-    });
+  // Re-reads the counter on EVERY mint. Caching it in memory was a lost update: the daemon kept a
+  // stale value while the forced-command process advanced the file, then re-minted a seq that was
+  // already taken. The two entries reached the union file sharing one (machine, seq) --
+  // indistinguishable from a stolen key signing a second entry, which is precisely the condition
+  // regenerateUnionLog exists to alarm on. 33 such pairs accumulated on the live fleet before
+  // anyone read the journal.
+  //
+  // The CALLER holds the seq lock. withSeqLock is an O_EXCL lock file, so taking it again in here
+  // would deadlock against append's own hold, not nest.
+  private async nextSeqLocked(): Promise<number> {
+    // The in-memory value is a floor, never the source of truth: it only defends against a
+    // counter file truncated or rolled back underneath a running process.
+    const next = Math.max(await readSeqFile(), this.seqValue) + 1;
+    await atomicWrite(seqPath(), canonicalJson({ seq: next }));
+    this.seqValue = next;
+    return next;
   }
 
-  // Mints the next per-machine seq, signs, and durably appends a new AuditEntry. `tsMsArg` is an
-  // injectable-clock test seam; production callers omit it and get nowMs().
+  // The `prev` link for the entry about to be minted: the digest of the last entry currently in
+  // this machine's local log, or GENESIS_PREV when the log is empty. Also caller-holds-the-lock --
+  // reading it outside the lock is the whole bug the widened hold closes, since the other writer
+  // could append between this read and ours and both entries would then claim the same parent.
+  //
+  // "Last" is by seq, not by file position, and the two agree because everything that appends here
+  // does so under this lock. If the seq counter is ever AHEAD of the log (a log file lost while
+  // audit-seq.json survived), the link points at a seq that is not seq-1 and the cross-check flags
+  // both a seq-gap and a chain-broken -- which is the truth: entries really are missing.
+  private async prevDigestLocked(): Promise<string> {
+    const { entries } = await readJsonlFile(localLogPath());
+    let last: AuditEntry | null = null;
+    for (const e of entries) if (last === null || e.seq >= last.seq) last = e;
+    return last === null ? GENESIS_PREV : entryDigest(canonicalJson(last));
+  }
+
+  // Mints the next per-machine seq, links, signs, and durably appends a new AuditEntry. `tsMsArg`
+  // is an injectable-clock test seam; production callers omit it and get nowMs().
+  //
+  // ONE hold of the seq lock covers mint, link, sign AND append. It used to cover only the mint,
+  // which was enough for uniqueness but not for a chain: two processes could mint n and n+1, then
+  // append in the other order, so n+1's `prev` named an entry that was not yet its predecessor.
+  // The two writers are separate PROCESSES (this daemon and cli.ts's SSH forced command), so the
+  // lock file is the only thing that can order them.
   async append(kind: string, detail: Record<string, unknown>, tsMsArg?: number): Promise<AuditEntry> {
-    const seq = await this.nextSeq();
-    const unsigned: Omit<AuditEntry, 'sigB64'> = {
-      v: 1,
-      machine: this.machine,
-      seq,
-      tsMs: tsMsArg ?? nowMs(),
-      kind,
-      detail,
-    };
-    const entry = await signAuditEntry(unsigned, this.key);
-    await appendLineAtomic(localLogPath(), canonicalJson(entry));
-    return entry;
+    return await withSeqLock(async () => {
+      const seq = await this.nextSeqLocked();
+      const prev = await this.prevDigestLocked();
+      const unsigned: Omit<AuditEntry, 'sigB64'> = {
+        v: 1,
+        machine: this.machine,
+        seq,
+        tsMs: tsMsArg ?? nowMs(),
+        kind,
+        detail,
+        prev,
+      };
+      const entry = await signAuditEntry(unsigned, this.key);
+      await appendLineAtomic(localLogPath(), canonicalJson(entry));
+      return entry;
+    });
   }
 
   // Every entry this machine has locally appended, in seq order (a single machine's own log is
@@ -455,6 +492,7 @@ export type CrossCheckFlagKind =
   | 'unverifiable-signer'
   | 'seq-gap'
   | 'seq-fork'
+  | 'chain-broken'
   | 'issuance-silent'
   | 'execution-unissued';
 
@@ -536,6 +574,18 @@ function entryDigest(canonicalBytes: string): string {
 //   (f) seq-fork -- two or more entries from the same machine share the same seq but are NOT
 //       byte-identical (a compromised/forked key signing conflicting history at a seq that an
 //       honest appender only ever mints once).
+//   (g) chain-broken -- from a machine's GENESIS forward (the lowest seq of that machine carrying
+//       `prev`), an entry either lacks `prev` or carries one that is not the digest of the entry
+//       at seq-1. This catches the INTERIOR EDIT that seq alone cannot: replacing one entry with
+//       another the same key signed at the same seq leaves the seq run contiguous and every
+//       signature valid, but orphans the link the next entry carries. Read over verified entries
+//       only, so a forged line cannot move a machine's genesis or stand in as anyone's parent.
+//       Reordering is not on this list and never was: regenerateUnionLog sorts every entry by
+//       (machine, seq, bytes) before any of this runs, so line order in the file carries no
+//       information to attack. What it does NOT catch is TRAILING truncation -- lopping the newest
+//       entries off a machine's run moves the observable end of the chain and leaves the remainder
+//       internally consistent. Nothing in a pure reader over one entry set can see that (see (c));
+//       do not read a chained log as tamper-evident for its tail.
 export async function crossCheckAuditLog(entries: AuditEntry[], opts: CrossCheckOptions): Promise<CrossCheckReport> {
   const flags: CrossCheckFlag[] = [];
   const defaultTtlSec = opts.defaultTtlSec ?? 3600;
@@ -553,6 +603,15 @@ export async function crossCheckAuditLog(entries: AuditEntry[], opts: CrossCheck
   for (const entry of entries) bytesOf.set(entry, canonicalJson(entry));
 
   const trustedForMatching = new Set<AuditEntry>();
+  // Entries whose signature actually VERIFIED against an enrolled key -- a strictly smaller set
+  // than trustedForMatching, which deliberately keeps tampered entries in for the (a)/(b) passes.
+  // The chain pass (g) below uses this one instead, because a link is a claim about history and an
+  // unverified entry has no standing to make one. Letting one in was a denial-of-forensics hole:
+  // anyone with write access to the synced union file could append an UNSIGNED line at seq 0
+  // carrying prev:'genesis', which lowered the whole machine's genesis to 0 and turned every
+  // legitimate pre-chain entry above it into a chain-broken flag. One injected line, six alarms,
+  // and the one true finding -- the invalid signature -- buried under them.
+  const verifiedEntries = new Set<AuditEntry>();
   for (const entry of entries) {
     const pub = opts.publicKeyJwkByMachine[entry.machine];
     if (!pub) {
@@ -567,11 +626,13 @@ export async function crossCheckAuditLog(entries: AuditEntry[], opts: CrossCheck
     const digest = entryDigest(bytesOf.get(entry)!);
     if (opts.verifiedDigests?.has(digest)) {
       trustedForMatching.add(entry);
+      verifiedEntries.add(entry);
       continue;
     }
     const ok = await verifyAuditEntry(entry, pub);
     if (ok) {
       opts.verifiedDigests?.add(digest);
+      verifiedEntries.add(entry);
     } else {
       flags.push({
         kind: 'signature-invalid',
@@ -609,6 +670,66 @@ export async function crossCheckAuditLog(entries: AuditEntry[], opts: CrossCheck
           entry: group[0],
           detail: `${machine}#${seq}: ${distinctBytes.size} conflicting signed entries share the same seq (possible key compromise/forked log)`,
         });
+      }
+    }
+
+    // (g) hash chain, from this machine's genesis forward.
+    //
+    // The genesis is read out of the log itself -- the lowest seq this machine signed a `prev`
+    // into -- so no machine-local state file is needed and every other machine reaches the same
+    // verdict from the same bytes. Everything below it predates the chain and is left alone: those
+    // entries are signed and can never be rewritten to add a link.
+    //
+    // Over VERIFIED entries only, both for the genesis and for the links. An entry that failed
+    // verification, or that claims a machine with no enrolled key, is already flagged by name in
+    // (d)/(e); letting it also set this machine's genesis or stand in as somebody's parent would
+    // let one forged line rewrite the verdict for every honest entry around it. Its own flag is
+    // the finding; a pile of derived chain-broken flags is noise on top of it.
+    const chainEntries = machineEntries.filter((e) => verifiedEntries.has(e));
+    const chainBySeq = new Map<number, AuditEntry[]>();
+    for (const e of chainEntries) {
+      const list = chainBySeq.get(e.seq);
+      if (list) list.push(e);
+      else chainBySeq.set(e.seq, [e]);
+    }
+    let genesisSeq: number | null = null;
+    for (const e of chainEntries) {
+      if (typeof e.prev === 'string' && (genesisSeq === null || e.seq < genesisSeq)) genesisSeq = e.seq;
+    }
+    if (genesisSeq !== null) {
+      for (const e of chainEntries) {
+        // The genesis entry's own link points at pre-chain history that the caller may not have
+        // handed us, so only its successors are checked.
+        if (e.seq <= genesisSeq) continue;
+        const prevGroup = chainBySeq.get(e.seq - 1);
+        // No VERIFIED entry at seq-1, either because none was handed to us or because the one that
+        // was did not verify. Both are already flagged by name -- (c) as a gap, (d)/(e) as a bad
+        // or unvouched signature -- and a second flag derived from the first would just double
+        // every hole.
+        if (!prevGroup) continue;
+        if (typeof e.prev !== 'string') {
+          flags.push({
+            kind: 'chain-broken',
+            machine,
+            entry: e,
+            detail: `${machine}#${e.seq} (kind=${e.kind}) carries no prev although this machine's chain starts at seq ${genesisSeq}`,
+          });
+          continue;
+        }
+        // Compared against the whole same-seq SET, not one chosen entry: seq-1 may be one of the
+        // historical accepted forks (two signed entries at one seq, which can never be renumbered
+        // away), and an honest successor links to whichever of them its appender actually saw.
+        // Accepting any member is the only rule that does not turn a permanent, already-accepted
+        // fork into a permanent chain alarm.
+        const linkTargets = new Set(prevGroup.map((x) => entryDigest(bytesOf.get(x) ?? canonicalJson(x))));
+        if (!linkTargets.has(e.prev)) {
+          flags.push({
+            kind: 'chain-broken',
+            machine,
+            entry: e,
+            detail: `${machine}#${e.seq} (kind=${e.kind}) links to a parent that is not the entry at seq ${e.seq - 1} -- an entry was edited or replaced after this machine's genesis`,
+          });
+        }
       }
     }
 

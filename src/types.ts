@@ -135,6 +135,16 @@ export interface AuditEntry {
   tsMs: number;
   kind: string;
   detail: Record<string, unknown>;
+  // Hash chain, per machine. Hex sha256 over the canonicalJson of the previous entry this machine
+  // appended (the FULL signed line, sigB64 included), or the literal 'genesis' when this machine's
+  // local log was empty at the time. Just another signed field: it is inside the canonicalJson
+  // sigB64 covers, so nothing in trust.ts changes and an entry cannot be relinked without the key.
+  //
+  // OPTIONAL, and permanently so. Every entry minted before the chain existed lacks it and must go
+  // on verifying byte for byte -- a signed entry can never be rewritten to add a field. A machine's
+  // GENESIS is therefore discoverable from the log itself: the lowest seq of that machine carrying
+  // `prev`. Entries below it are not chain-checked; from it forward, every entry must carry one.
+  prev?: string;
   sigB64: string; // sig over canonicalJson of every field above
 }
 

@@ -3,6 +3,7 @@
 // config.ts) and the trust kernel (src/trust.ts) only.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +16,7 @@ import {
   AUDIT_KIND_JOB_EXPIRED,
   AUDIT_KIND_JOB_ISSUED,
   AuditLog,
+  GENESIS_PREV,
   crossCheckAuditLog,
   flushLocalToUnion,
   loadForkBaseline,
@@ -50,9 +52,17 @@ async function makeEntry(
   kind: string,
   detail: Record<string, unknown>,
   tsMs = 1_000_000,
+  prev?: string,
 ): Promise<AuditEntry> {
-  const unsigned: Omit<AuditEntry, 'sigB64'> = { v: 1, machine, seq, tsMs, kind, detail };
+  const unsigned: Omit<AuditEntry, 'sigB64'> = { v: 1, machine, seq, tsMs, kind, detail, ...(prev ? { prev } : {}) };
   return signAuditEntry(unsigned, key);
+}
+
+// The link an entry's successor must carry: sha256 over the canonicalJson of the FULL signed line.
+// Spelled out here rather than imported, so a change to how audit.ts computes it has to be made
+// twice on purpose.
+function digestOf(entry: AuditEntry): string {
+  return createHash('sha256').update(canonicalJson(entry)).digest('hex');
 }
 
 describe('AuditLog.append / readAll', () => {
@@ -141,6 +151,265 @@ describe('AuditLog.append / readAll', () => {
     );
     const seqs = minted.map((e) => e.seq).sort((x, y) => x - y);
     expect(seqs).toEqual(Array.from({ length: 12 }, (_, i) => i + 1));
+
+    // And the chain survives the contention, which is the whole reason the seq lock now covers
+    // sign-and-append and not just the mint: with only the mint inside it, two writers could take
+    // n and n+1 and then append in the other order, leaving n+1's prev naming an entry that was
+    // not yet its parent.
+    const all = (await logs[0]!.readAll()).sort((a, b) => a.seq - b.seq);
+    for (let i = 1; i < all.length; i++) expect(all[i]!.prev).toBe(digestOf(all[i - 1]!));
+    const report = await crossCheckAuditLog(all, {
+      nowMs: 2_000_000,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+    });
+    expect(report.flags).toEqual([]);
+  });
+});
+
+describe('AuditLog: the per-machine hash chain', () => {
+  test('the first entry declares genesis and every later one links to its predecessor', async () => {
+    const key = await freshKey('alpha');
+    const alog = new AuditLog('alpha', key);
+
+    const e1 = await alog.append('probe', { i: 1 });
+    const e2 = await alog.append('probe', { i: 2 });
+    const e3 = await alog.append('probe', { i: 3 });
+
+    expect(e1.prev).toBe(GENESIS_PREV);
+    expect(e2.prev).toBe(digestOf(e1));
+    expect(e3.prev).toBe(digestOf(e2));
+
+    const report = await crossCheckAuditLog(await alog.readAll(), {
+      nowMs: 2_000_000,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+    });
+    expect(report.flags).toEqual([]);
+  });
+
+  test('the first chained entry over unchained history links back into it, not to genesis', async () => {
+    // The real upgrade shape: this machine already has entries from before the chain existed.
+    const key = await freshKey('alpha');
+    const old1 = await makeEntry('alpha', key, 1, 'probe', { i: 1 });
+    const old2 = await makeEntry('alpha', key, 2, 'probe', { i: 2 });
+    await Bun.write(join(stateRoot, 'audit-log.jsonl'), `${canonicalJson(old1)}\n${canonicalJson(old2)}\n`);
+    await Bun.write(join(stateRoot, 'audit-seq.json'), canonicalJson({ seq: 2 }));
+
+    const e3 = await new AuditLog('alpha', key).append('probe', { i: 3 });
+    expect(e3.seq).toBe(3);
+    expect(e3.prev).toBe(digestOf(old2));
+
+    // Genesis is seq 3, so the two unchained entries below it are not chain-checked and the whole
+    // run reads clean -- an upgrade must not turn every pre-chain entry into an alarm.
+    const report = await crossCheckAuditLog([old1, old2, e3], {
+      nowMs: 2_000_000,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+    });
+    expect(report.flags).toEqual([]);
+  });
+});
+
+describe('crossCheckAuditLog: the hash chain from genesis forward', () => {
+  const NOW = 2_000_000;
+
+  async function chainedRun(machine: string, key: MachineKey, length: number): Promise<AuditEntry[]> {
+    const alog = new AuditLog(machine, key);
+    const out: AuditEntry[] = [];
+    for (let i = 1; i <= length; i++) out.push(await alog.append('probe', { i }));
+    return out;
+  }
+
+  test('an interior entry swapped for another the same key signed is caught as chain-broken', async () => {
+    // The attack seq alone cannot see: a stolen key re-signs entry 2 at the SAME seq and the
+    // original line is removed, so the run stays contiguous and every signature verifies. Only
+    // entry 3's link, which still names the entry that was there before, disagrees.
+    const key = await freshKey('alpha');
+    const [e1, e2, e3] = await chainedRun('alpha', key, 3);
+    const forged = await makeEntry('alpha', key, 2, 'probe', { i: 'rewritten' }, e2!.tsMs, e2!.prev);
+
+    const report = await crossCheckAuditLog([e1!, forged, e3!], {
+      nowMs: NOW,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+    });
+
+    expect(report.flags.filter((f) => f.kind === 'signature-invalid')).toEqual([]);
+    expect(report.flags.filter((f) => f.kind === 'seq-gap')).toEqual([]);
+    const broken = report.flags.filter((f) => f.kind === 'chain-broken');
+    expect(broken).toHaveLength(1);
+    expect(broken[0]!.entry!.seq).toBe(3);
+    expect(broken[0]!.machine).toBe('alpha');
+  });
+
+  test('an entry appended after genesis with no prev at all is caught', async () => {
+    const key = await freshKey('alpha');
+    const [e1, e2] = await chainedRun('alpha', key, 2);
+    const unlinked = await makeEntry('alpha', key, 3, 'probe', { i: 3 });
+
+    const report = await crossCheckAuditLog([e1!, e2!, unlinked], {
+      nowMs: NOW,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+    });
+    const broken = report.flags.filter((f) => f.kind === 'chain-broken');
+    expect(broken).toHaveLength(1);
+    expect(broken[0]!.entry!.seq).toBe(3);
+    expect(broken[0]!.detail).toContain('no prev');
+  });
+
+  test('a clean run is silent, and reordering it does not change the verdict', async () => {
+    const key = await freshKey('alpha');
+    const run = await chainedRun('alpha', key, 4);
+    const shuffled = [run[2]!, run[0]!, run[3]!, run[1]!];
+    const report = await crossCheckAuditLog(shuffled, {
+      nowMs: NOW,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+    });
+    expect(report.flags).toEqual([]);
+  });
+
+  test('history below genesis is never chain-checked, accepted forks and all', async () => {
+    // The live fleet's shape: 33 same-seq forks from the old seq-minting race, signed and
+    // therefore impossible to renumber, sitting under entries that DO carry a link.
+    const key = await freshKey('alpha');
+    const old1 = await makeEntry('alpha', key, 1, 'probe', { i: 1 });
+    const forkA = await makeEntry('alpha', key, 2, 'probe', { i: '2a' });
+    const forkB = await makeEntry('alpha', key, 2, 'probe', { i: '2b' });
+    // Chained from here on, linking to whichever side of the fork this machine actually appended
+    // after. Either side must be accepted: the appender saw one of them, and neither can be
+    // withdrawn.
+    const e3 = await makeEntry('alpha', key, 3, 'probe', { i: 3 }, 1_000_000, digestOf(forkB));
+    const e4 = await makeEntry('alpha', key, 4, 'probe', { i: 4 }, 1_000_000, digestOf(e3));
+
+    const dir = await mkdtemp(join(tmpdir(), 'sukarfleet-audit-chainfork-'));
+    const path = join(dir, 'union.jsonl');
+    await Bun.write(path, `${canonicalJson(forkA)}\n${canonicalJson(forkB)}\n`);
+    const fingerprints = (await regenerateUnionLog(path)).forks.map((f) => f.fingerprint);
+    await rm(dir, { recursive: true, force: true });
+
+    const report = await crossCheckAuditLog([old1, forkA, forkB, e3, e4], {
+      nowMs: NOW,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+      acceptedForkFingerprints: new Set(fingerprints),
+    });
+    expect(report.flags).toEqual([]);
+
+    // The genesis entry itself (seq 3 here) is not link-checked -- what it points at may predate
+    // anything the caller was handed -- but its successor is: point seq 4 somewhere else and the
+    // break shows up even though every signature still verifies.
+    const forged = await makeEntry('alpha', key, 4, 'probe', { i: 4 }, 1_000_000, digestOf(old1));
+    const bad = await crossCheckAuditLog([old1, forkA, forkB, e3, forged], {
+      nowMs: NOW,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+      acceptedForkFingerprints: new Set(fingerprints),
+    });
+    expect(bad.flags.filter((f) => f.kind === 'chain-broken')).toHaveLength(1);
+    expect(bad.flags.filter((f) => f.kind === 'signature-invalid')).toEqual([]);
+  });
+
+  test('after genesis, a successor of a same-seq fork may link to EITHER side of it', async () => {
+    // A fork that happened after the chain existed: both variants carry a link, so both are
+    // legitimate parents as far as the reader can tell, and whichever one the appender saw must
+    // be accepted. Rejecting one side would turn a permanent, already-accepted fork into a
+    // permanent chain alarm.
+    const key = await freshKey('alpha');
+    const e1 = await makeEntry('alpha', key, 1, 'probe', { i: 1 }, 1_000_000, GENESIS_PREV);
+    const forkA = await makeEntry('alpha', key, 2, 'probe', { i: '2a' }, 1_000_000, digestOf(e1));
+    const forkB = await makeEntry('alpha', key, 2, 'probe', { i: '2b' }, 1_000_000, digestOf(e1));
+
+    const dir = await mkdtemp(join(tmpdir(), 'sukarfleet-audit-chainfork2-'));
+    const path = join(dir, 'union.jsonl');
+    await Bun.write(path, `${canonicalJson(forkA)}\n${canonicalJson(forkB)}\n`);
+    const accepted = new Set((await regenerateUnionLog(path)).forks.map((f) => f.fingerprint));
+    await rm(dir, { recursive: true, force: true });
+
+    for (const parent of [forkA, forkB]) {
+      const e3 = await makeEntry('alpha', key, 3, 'probe', { i: 3 }, 1_000_000, digestOf(parent));
+      const report = await crossCheckAuditLog([e1, forkA, forkB, e3], {
+        nowMs: NOW,
+        publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+        acceptedForkFingerprints: accepted,
+      });
+      expect(report.flags).toEqual([]);
+    }
+
+    // A third parent that is neither side is still a break.
+    const orphan = await makeEntry('alpha', key, 3, 'probe', { i: 3 }, 1_000_000, digestOf(e1));
+    const bad = await crossCheckAuditLog([e1, forkA, forkB, orphan], {
+      nowMs: NOW,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+      acceptedForkFingerprints: accepted,
+    });
+    expect(bad.flags.filter((f) => f.kind === 'chain-broken')).toHaveLength(1);
+  });
+
+  // DENIAL OF FORENSICS, and the reason the chain pass runs over verified entries only. The union
+  // file is git-synced, so anyone who can write the shared repo can append a line to it -- they
+  // just cannot sign one. Before the fix, an UNSIGNED line at seq 0 carrying prev:'genesis' set
+  // this machine's genesis to 0, and every honest pre-chain entry above it was then "missing" the
+  // link it was never supposed to have: six alarms from one injected line, with the single true
+  // finding buried among them. Six is not a magic number; it is however many entries the machine
+  // happens to have, so the flood scales with the honest log.
+  test('an unsigned entry injected below genesis cannot flood the pre-chain run with alarms', async () => {
+    const key = await freshKey('alpha');
+    const run: AuditEntry[] = [];
+    for (let i = 1; i <= 6; i++) run.push(await makeEntry('alpha', key, i, 'probe', { i }));
+
+    // Not signed, and it does not need to be: the whole point is that an attacker who can only
+    // append cannot produce a signature this machine's enrolled key would verify.
+    const injected: AuditEntry = {
+      v: 1,
+      machine: 'alpha',
+      seq: 0,
+      tsMs: 1_000_000,
+      kind: 'probe',
+      detail: { i: 0 },
+      prev: GENESIS_PREV,
+      sigB64: '',
+    };
+
+    const report = await crossCheckAuditLog([injected, ...run], {
+      nowMs: NOW,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+    });
+
+    expect(report.flags.filter((f) => f.kind === 'chain-broken')).toEqual([]);
+    const invalid = report.flags.filter((f) => f.kind === 'signature-invalid');
+    expect(invalid).toHaveLength(1);
+    expect(invalid[0]!.entry!.seq).toBe(0);
+    // And nothing else: the one line that was tampered with is the whole verdict.
+    expect(report.flags).toHaveLength(1);
+  });
+
+  test('an unsigned entry cannot stand in as somebody\'s parent either', async () => {
+    // The same rule on the link side. Replace a chained entry with an unsigned line at its seq:
+    // the signature check names it, and its successor is NOT additionally flagged for linking to
+    // the entry that was really there. One tamper, one finding. A forgery signed by a STOLEN key
+    // still verifies and is still caught as chain-broken -- that is the test above.
+    const key = await freshKey('alpha');
+    const [e1, e2, e3] = await chainedRun('alpha', key, 3);
+    const unsigned: AuditEntry = { ...e2!, detail: { i: 'rewritten' }, sigB64: '' };
+
+    const report = await crossCheckAuditLog([e1!, unsigned, e3!], {
+      nowMs: NOW,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+    });
+    expect(report.flags.filter((f) => f.kind === 'chain-broken')).toEqual([]);
+    expect(report.flags.filter((f) => f.kind === 'signature-invalid')).toHaveLength(1);
+  });
+
+  // THE HONEST LIMIT, and it is not small. A chain links each entry to the one before it, so it
+  // proves nothing about where the chain ENDS: lop the newest entries off a machine's run and what
+  // remains is internally perfect. Detecting that needs a per-machine high-water mark the checker
+  // is given from outside (see crossCheckAuditLog's (c)), which this pure reader does not have.
+  // What the chain adds over seq alone is the interior edit -- an entry replaced by another the
+  // same key signed at the same seq -- from genesis forward, and nothing about the tail.
+  test('trailing truncation is STILL undetectable -- the chain does not close that hole', async () => {
+    const key = await freshKey('alpha');
+    const run = await chainedRun('alpha', key, 4);
+    const truncated = run.slice(0, 2);
+    const report = await crossCheckAuditLog(truncated, {
+      nowMs: NOW,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+    });
+    expect(report.flags).toEqual([]);
   });
 });
 

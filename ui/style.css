@@ -195,8 +195,12 @@ button.quiet.danger { color: var(--bad); }
 .parsed .bad { color: var(--bad); }
 
 /* ── pairing code ───────────────────────────────────────────────────── */
+/* Sized so all fourteen characters of XXXX-XXXX-XXXX stay on ONE line at 360px, the narrowest
+   phone this console is read on: at the 1.5rem floor a monospace character plus its tracking is
+   about 17px, so the line is ~242px inside the ~283px a 360px viewport leaves after the main and
+   card padding. word-break stays as the last resort for a narrower screen than that. */
 .code-display {
-  font-family: var(--mono); font-size: clamp(1.8rem, 7vw, 3rem); font-weight: 700;
+  font-family: var(--mono); font-size: clamp(1.5rem, 5.4vw, 2.6rem); font-weight: 700;
   letter-spacing: .12em; margin: .4rem 0; word-break: break-all;
 }
 

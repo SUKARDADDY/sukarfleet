@@ -99,7 +99,7 @@ describe('Health.evaluate: audit integrity', () => {
     const { calls, notifier } = fakeNotifier();
     const health = new Health(healthyCfg({}), notifier);
     const self = healthySelf();
-    self.auditIntegrity = { invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0 };
+    self.auditIntegrity = { invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0, chainBreaks: 0 };
     await health.evaluate(t0, self, []);
     expect(calls.filter((c) => c.title.includes('audit'))).toHaveLength(0);
   });
@@ -108,7 +108,7 @@ describe('Health.evaluate: audit integrity', () => {
     const { calls, notifier } = fakeNotifier();
     const health = new Health(healthyCfg({}), notifier);
     const self = healthySelf();
-    self.auditIntegrity = { invalidSignatures: 2, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0 };
+    self.auditIntegrity = { invalidSignatures: 2, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0, chainBreaks: 0 };
     await health.evaluate(t0, self, []);
     const audit = calls.filter((c) => c.title.includes('audit'));
     expect(audit).toHaveLength(1);
@@ -116,16 +116,58 @@ describe('Health.evaluate: audit integrity', () => {
     expect(audit[0]!.body).toContain('2 audit entries failed signature verification');
   });
 
+  test('a broken chain link is critical, and does not blame the signature', async () => {
+    // The condition every signature check passes: entries verify, sequence numbers are contiguous,
+    // and an entry has still been swapped for another the same key signed at the same number. It
+    // used to be counted nowhere and reported as an all-zeros verdict, so a detected rewrite
+    // raised no alarm at all while a plain bad signature raised critical.
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(healthyCfg({}), notifier);
+    const self = healthySelf();
+    self.auditIntegrity = { invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0, chainBreaks: 1 };
+    await health.evaluate(t0, self, []);
+    const audit = calls.filter((c) => c.title.includes('audit'));
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.urgency).toBe('critical');
+    expect(audit[0]!.body).toContain('1 broken link(s) in an audit chain');
+    // An operator reading this must go looking for a rewritten entry, not a forged signature.
+    expect(audit[0]!.body).not.toContain('signature');
+  });
+
+  test('chainBreaks: 0 raises nothing, so the chain fault is the break and not the check running', async () => {
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(healthyCfg({}), notifier);
+    const self = healthySelf();
+    self.auditIntegrity = { invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0, chainBreaks: 0 };
+    await health.evaluate(t0, self, []);
+    expect(calls.filter((c) => c.title.includes('audit'))).toHaveLength(0);
+  });
+
+  test('chain and signature faults latch separately, so neither hides the other', async () => {
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(healthyCfg({}), notifier);
+    const self = healthySelf();
+    self.auditIntegrity = { invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0, chainBreaks: 1 };
+    await health.evaluate(t0, self, []);
+    expect(calls.filter((c) => c.title.includes('audit'))).toHaveLength(1);
+
+    self.auditIntegrity = { invalidSignatures: 1, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0, chainBreaks: 1 };
+    await health.evaluate(t0 + 1000, self, []);
+    const audit = calls.filter((c) => c.title.includes('audit'));
+    expect(audit).toHaveLength(2);
+    expect(audit[1]!.body).toContain('failed signature verification');
+  });
+
   test('signature and gap faults latch separately, so a forgery is not hidden behind a gap', async () => {
     const { calls, notifier } = fakeNotifier();
     const health = new Health(healthyCfg({}), notifier);
     const self = healthySelf();
-    self.auditIntegrity = { invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 1 };
+    self.auditIntegrity = { invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 1, chainBreaks: 0 };
     await health.evaluate(t0, self, []);
     expect(calls.filter((c) => c.title.includes('audit'))).toHaveLength(1);
 
     // A real forgery now appears while the gap fault is still latched: it must still notify.
-    self.auditIntegrity = { invalidSignatures: 1, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 1 };
+    self.auditIntegrity = { invalidSignatures: 1, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 1, chainBreaks: 0 };
     await health.evaluate(t0 + 1000, self, []);
     const audit = calls.filter((c) => c.title.includes('audit'));
     expect(audit).toHaveLength(2);

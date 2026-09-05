@@ -9,12 +9,16 @@
 // machine rebuilt.
 
 import { afterEach, describe, expect, test } from 'bun:test';
+import { createHash, scryptSync } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   Pairing,
   constantTimeEqual,
   deriveCodeKey,
   formatCode,
   generateCode,
+  macInput,
   macRequest,
   macResponse,
   normalizeCode,
@@ -72,7 +76,11 @@ interface Harness {
 function harness(
   machine: string,
   local: PairBundle,
-  opts: { applyPeer?: (p: PairBundle) => Promise<void>; rand?: (n: number) => Uint8Array } = {},
+  opts: {
+    applyPeer?: (p: PairBundle) => Promise<void>;
+    rand?: (n: number) => Uint8Array;
+    deriveKey?: (code: string) => Promise<CryptoKey>;
+  } = {},
 ): Harness {
   const cfg = defaultConfig(machine);
   const applied: PairBundle[] = [];
@@ -93,6 +101,7 @@ function harness(
       }),
     now: () => clock,
     ...(opts.rand ? { rand: opts.rand } : {}),
+    ...(opts.deriveKey ? { deriveKey: opts.deriveKey } : {}),
   };
 
   return {
@@ -125,7 +134,7 @@ function helloRequest(body: string): Request {
 }
 
 // The single code every handleHello test mints, so the harness's rand seam stays deterministic.
-const FIXED_CODE = 'ZZZZZZZZ';
+const FIXED_CODE = 'ZZZZZZZZZZZZ';
 const fixedRand = (n: number): Uint8Array => new Uint8Array(n).fill(0xff);
 
 const servers: ReturnType<typeof Bun.serve>[] = [];
@@ -142,12 +151,28 @@ function serve(handler: (req: Request) => Promise<Response>): { port: number } {
 // ---------------------------------------------------------------------------
 
 describe('code encoding', () => {
-  test('generateCode emits exactly 8 Crockford characters and spans the full 40 bits', () => {
-    expect(generateCode(() => new Uint8Array(5))).toBe('00000000');
-    expect(generateCode(() => new Uint8Array(5).fill(0xff))).toBe('ZZZZZZZZ');
+  test('generateCode emits exactly 12 Crockford characters and spans the full 60 bits', () => {
+    expect(generateCode(() => new Uint8Array(8))).toBe('000000000000');
+    expect(generateCode(() => new Uint8Array(8).fill(0xff))).toBe('ZZZZZZZZZZZZ');
     const code = generateCode();
-    expect(code).toHaveLength(8);
-    expect(code).toMatch(/^[0-9A-HJKMNP-TV-Z]{8}$/);
+    expect(code).toHaveLength(12);
+    expect(code).toMatch(/^[0-9A-HJKMNP-TV-Z]{12}$/);
+  });
+
+  // 2^60 exceeds 2^53, so an encoder that folds the eight random bytes into one JS number loses the
+  // low bits and silently mints a code space smaller than the one this module advertises. These
+  // vectors pin the bit arithmetic: every 5-bit group must land where big-endian says it does.
+  test('the 60 bits are read big-endian, with no precision lost at the low end', () => {
+    // The last four of the sixty-four bits are discarded (64 - 60), so 0x01 must NOT reach the
+    // code and 0x10 -- the lowest bit that survives -- must land in the last character.
+    expect(generateCode(() => Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 0x01]))).toBe('000000000000');
+    expect(generateCode(() => Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 0x10]))).toBe('000000000001');
+    // Top byte first: 0xf8 is the leading five bits, so only the first character moves.
+    expect(generateCode(() => Uint8Array.from([0xf8, 0, 0, 0, 0, 0, 0, 0]))).toBe('Z00000000000');
+    // A byte in the middle straddles character boundaries rather than sitting inside one: the
+    // fourth byte is bits 24..31, which is the last bit of character 5, all of character 6, and
+    // the first two bits of character 7.
+    expect(generateCode(() => Uint8Array.from([0, 0, 0, 0xff, 0, 0, 0, 0]))).toBe('00001ZR00000');
   });
 
   test('generateCode is uniform enough to not be a constant', () => {
@@ -157,16 +182,16 @@ describe('code encoding', () => {
   });
 
   test('a short rand() is a hard error, never a shortened code', () => {
-    expect(() => generateCode(() => new Uint8Array(2))).toThrow(/fewer than 5 bytes/);
+    expect(() => generateCode(() => new Uint8Array(2))).toThrow(/fewer than 8 bytes/);
   });
 
   test('formatCode/normalizeCode round-trip and fold the confusable characters', () => {
-    expect(formatCode('K7QP4M2X')).toBe('K7QP-4M2X');
-    expect(normalizeCode(formatCode('K7QP4M2X'))).toBe('K7QP4M2X');
-    expect(normalizeCode(' k7qp - 4m2x ')).toBe('K7QP4M2X');
+    expect(formatCode('K7QP4M2XR9TV')).toBe('K7QP-4M2X-R9TV');
+    expect(normalizeCode(formatCode('K7QP4M2XR9TV'))).toBe('K7QP4M2XR9TV');
+    expect(normalizeCode(' k7qp - 4m2x - r9tv ')).toBe('K7QP4M2XR9TV');
     // O/I/L are absent from the encode alphabet, so folding them can never collide with a real code.
-    expect(normalizeCode('oil00000')).toBe('01100000');
-    expect(normalizeCode('OIL00000')).toBe('01100000');
+    expect(normalizeCode('oil000000000')).toBe('011000000000');
+    expect(normalizeCode('OIL000000000')).toBe('011000000000');
   });
 
   test('constantTimeEqual matches only on identical bytes', () => {
@@ -177,16 +202,165 @@ describe('code encoding', () => {
   });
 });
 
+// The frozen pairing vectors. golden.json records the exact bytes the pre-extraction daemon MACs
+// over; while one machine runs each codebase, these may not change.
+const golden = JSON.parse(readFileSync(join(import.meta.dir, 'freeze', 'golden.json'), 'utf8')) as {
+  fixedTimestampMs: number;
+  pairing: { bundle: unknown; helloRequestMacInput: string; helloResponseMacInput: string };
+};
+
+const V1_DOMAIN = 'sukarfleet-pair-v1|';
+const V2_DOMAIN = 'sukarfleet-pair-v2|';
+const SCRYPT = { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 } as const;
+
+async function importHmacKey(material: Uint8Array): Promise<CryptoKey> {
+  return crypto.subtle.importKey('raw', material as BufferSource, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+}
+
+// What the wire bytes are, not just that both sides agree on them. Everything else in this file
+// checks the two halves against each other, which would stay green if the MAC input silently
+// changed shape on both sides at once -- and that is precisely the change that breaks pairing
+// against a machine still running the pre-extraction daemon.
+describe('the bytes the MACs are taken over are frozen', () => {
+  test('a hello request MACs over exactly the recorded string', () => {
+    const payload = { v: 1, from: golden.pairing.bundle, tsMs: golden.fixedTimestampMs };
+    expect(macInput('req|', payload)).toBe(golden.pairing.helloRequestMacInput);
+  });
+
+  test('a hello response MACs over exactly the recorded string, request digest bound in', () => {
+    const payload = {
+      v: 1,
+      from: golden.pairing.bundle,
+      tsMs: golden.fixedTimestampMs,
+      reqSha256: 'c'.repeat(64),
+    };
+    expect(macInput('res|', payload)).toBe(golden.pairing.helloResponseMacInput);
+  });
+
+  test("the 'req|'/'res|' prefixes are what separates the two, byte for byte", () => {
+    const payload = { v: 1, tsMs: 1 };
+    expect(macInput('res|', payload)).toBe(`res|${macInput('req|', payload).slice(4)}`);
+  });
+});
+
+describe('the code-derived key', () => {
+  // The offline oracle this KDF exists to defeat gets slower in exact proportion to N: a future
+  // hand tempted to speed the GUI up by dropping it has to change this vector to do it.
+  test('is scrypt(N=2^15, r=8, p=1) over the v2 domain, not a hash', async () => {
+    const payload = { v: 1, tsMs: 1 };
+    const pinned = await importHmacKey(scryptSync(FIXED_CODE, V2_DOMAIN, 32, SCRYPT));
+    expect(await macRequest(await deriveCodeKey(FIXED_CODE), payload)).toBe(await macRequest(pinned, payload));
+  });
+
+  test('is deterministic: the same code derives the same key every time', async () => {
+    const payload = { v: 1, tsMs: 1 };
+    const a = await macRequest(await deriveCodeKey(FIXED_CODE), payload);
+    const b = await macRequest(await deriveCodeKey(FIXED_CODE), payload);
+    expect(a).toBe(b);
+    expect(a).not.toBe(await macRequest(await deriveCodeKey('AAAAAAAAAAAA'), payload));
+  });
+
+  // The domain bump is what stops a v1 code and a v2 code that share characters from deriving one
+  // key: a machine still on v1 fails to pair rather than half-agreeing on the weaker derivation.
+  test('a v1 code and a v2 code can never derive the same key', async () => {
+    const payload = { v: 1, tsMs: 1 };
+    const v2 = await macRequest(await deriveCodeKey(FIXED_CODE), payload);
+
+    // v1 as it actually shipped: one sha256 over domain + code.
+    const v1Sha = await importHmacKey(createHash('sha256').update(V1_DOMAIN + FIXED_CODE).digest());
+    expect(await macRequest(v1Sha, payload)).not.toBe(v2);
+
+    // And the domain alone separates them, so a future version that keeps scrypt but forgets to
+    // bump the string would still not collide with v2 by accident.
+    const v1Scrypt = await importHmacKey(scryptSync(FIXED_CODE, V1_DOMAIN, 32, SCRYPT));
+    expect(await macRequest(v1Scrypt, payload)).not.toBe(v2);
+  });
+
+  // scryptSync would hold this daemon's ONE event loop for the whole derivation, and a loop that
+  // stops for ~50 ms is a clock an on-mesh party can read: poll any cheap route and the stall tells
+  // them a code was just minted. A 5 ms timer must get its turn while the KDF is running, which it
+  // cannot do if the derivation is sitting on the loop.
+  test('runs off the event loop, so a mint is not a stall anyone can time', async () => {
+    let firedDuringDerivation = false;
+    const timer = setTimeout(() => {
+      firedDuringDerivation = true;
+    }, 5);
+    await deriveCodeKey(FIXED_CODE);
+    clearTimeout(timer);
+    expect(firedDuringDerivation).toBe(true);
+  });
+});
+
+// The failure this daemon must survive rather than reason about: a platform that will not do
+// scrypt at all (an OpenSSL in FIPS mode refuses it outright; a machine under memory pressure can
+// fail the 32 MiB allocation). mintCode is synchronous and parks the derivation's promise, so
+// before the fix that rejection had nobody to catch it, and nothing in src/ installs an
+// unhandledRejection handler -- the daemon exited 1 because an operator clicked "mint code".
+describe('a KDF that refuses to derive', () => {
+  const kdfDown = async (): Promise<CryptoKey> => {
+    throw new Error('digital envelope routines::unsupported');
+  };
+
+  test('mintCode still returns a code, and its parked promise never rejects', async () => {
+    const h = harness(SELF, await bundle(SELF), { rand: fixedRand, deriveKey: kdfDown });
+    expect(() => h.pairing.mintCode()).not.toThrow();
+    expect(h.pairing.codeState().active).toBe(true);
+
+    // Reaching into the private field on purpose. That parked promise IS the finding: nothing
+    // awaits it until a hello arrives, which may be never, so it is the object that has to be
+    // proved settled rather than rejected. Asserting it through the hello route instead (the next
+    // test) proves the response but not this. It must RESOLVE, to the null "key unusable" state.
+    const parked = (h.pairing as unknown as { active: { key: Promise<CryptoKey | null> } }).active.key;
+    await expect(parked).resolves.toBeNull();
+
+    // And a couple of full loop turns later there is still nothing pending to blow up: with the
+    // rejection absorbed at mint, the daemon has no reason to reach an unhandledRejection it does
+    // not install a handler for.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.pairing.codeState().active).toBe(true);
+  });
+
+  test('a hello against that code gets the byte-identical 401, not a 500', async () => {
+    const peerBundle = await bundle(PEER);
+    const body = await helloBody(FIXED_CODE, peerBundle, 1_700_000_000_000);
+
+    // The reference refusal: the same request against a machine with no code minted at all.
+    const control = harness(SELF, await bundle(SELF), { rand: fixedRand });
+    const expected = await control.pairing.handleHello(helloRequest(body));
+    expect(expected.status).toBe(401);
+
+    const h = harness(SELF, await bundle(SELF), { rand: fixedRand, deriveKey: kdfDown });
+    h.pairing.mintCode();
+    // The code is RIGHT -- this is the correct MAC for the code that was minted. Only the local
+    // key is missing, and the caller must not be able to tell that from a wrong code.
+    const res = await h.pairing.handleHello(helloRequest(body));
+    expect(res.status).toBe(401);
+    expect(await res.text()).toBe(await expected.text());
+    expect(res.headers.get('content-type')).toBe(expected.headers.get('content-type'));
+    expect(h.applied).toHaveLength(0);
+    expect(h.audits).toHaveLength(0);
+  });
+
+  test('the redeem half reports a local failure rather than throwing out of the route', async () => {
+    const initiator = harness(PEER, await bundle(PEER), { deriveKey: kdfDown });
+    const out = await initiator.pairing.redeem({ code: 'ZZZZ-ZZZZ-ZZZZ', host: '127.0.0.1', port: 7710 });
+    expect(out.ok).toBe(false);
+    // Not 'bad-code': the operator typed a fine code and must not be sent to re-read the screen.
+    expect(out.reason).toBe('bad-response');
+    expect(initiator.applied).toHaveLength(0);
+  });
+});
+
 describe('MAC domain separation', () => {
   test('request and response MACs over the same payload differ', async () => {
-    const key = await deriveCodeKey('ZZZZZZZZ');
+    const key = await deriveCodeKey('ZZZZZZZZZZZZ');
     const payload = { v: 1, tsMs: 1 };
     expect(await macRequest(key, payload)).not.toBe(await macResponse(key, payload));
   });
 
   test('different codes produce different MACs over the same payload', async () => {
     const payload = { v: 1, tsMs: 1 };
-    const a = await macRequest(await deriveCodeKey('AAAAAAAA'), payload);
+    const a = await macRequest(await deriveCodeKey('AAAAAAAAAAAA'), payload);
     const b = await macRequest(await deriveCodeKey('AAAAAAAB'), payload);
     expect(a).not.toBe(b);
   });
@@ -197,7 +371,7 @@ describe('handleHello — happy path', () => {
     const local = await bundle(SELF);
     const h = harness(SELF, local, { rand: fixedRand });
     const minted = h.pairing.mintCode();
-    expect(minted.display).toBe('ZZZZ-ZZZZ');
+    expect(minted.display).toBe('ZZZZ-ZZZZ-ZZZZ');
 
     const peerBundle = await bundle(PEER);
     const body = await helloBody(FIXED_CODE, peerBundle, 1_700_000_000_000);
@@ -243,7 +417,7 @@ describe('handleHello — refusals are uniform and fail closed', () => {
 
     h.pairing.mintCode();
     const wrong = await h.pairing.handleHello(
-      helloRequest(await helloBody('AAAAAAAA', peerBundle, 1_700_000_000_000)),
+      helloRequest(await helloBody('AAAAAAAAAAAA', peerBundle, 1_700_000_000_000)),
     );
     expect(wrong.status).toBe(401);
     expect(await refusalBody(wrong)).toBe(await refusalBody(noCode));
@@ -320,7 +494,7 @@ describe('handleHello — refusals are uniform and fail closed', () => {
 
     for (let i = 0; i < 5; i++) {
       const res = await h.pairing.handleHello(
-        helloRequest(await helloBody('AAAAAAAA', peerBundle, 1_700_000_000_000)),
+        helloRequest(await helloBody('AAAAAAAAAAAA', peerBundle, 1_700_000_000_000)),
       );
       expect(res.status).toBe(401);
     }
@@ -337,7 +511,7 @@ describe('handleHello — refusals are uniform and fail closed', () => {
     const h = harness(SELF, await bundle(SELF), { rand: fixedRand });
     h.pairing.mintCode();
     expect(h.pairing.codeState().attemptsLeft).toBe(5);
-    await h.pairing.handleHello(helloRequest(await helloBody('AAAAAAAA', await bundle(PEER), 1_700_000_000_000)));
+    await h.pairing.handleHello(helloRequest(await helloBody('AAAAAAAAAAAA', await bundle(PEER), 1_700_000_000_000)));
     expect(h.pairing.codeState().attemptsLeft).toBe(4);
   });
 
@@ -526,7 +700,7 @@ describe('redeem — the initiator half, over real HTTP', () => {
     const { h: target, port } = await responder();
     target.pairing.mintCode();
     const initiator = harness(PEER, await bundle(PEER));
-    const out = await initiator.pairing.redeem({ code: ' zzzz-zzzz ', host: '127.0.0.1', port });
+    const out = await initiator.pairing.redeem({ code: ' zzzz-zzzz-zzzz ', host: '127.0.0.1', port });
     expect(out.ok).toBe(true);
   });
 
@@ -535,7 +709,7 @@ describe('redeem — the initiator half, over real HTTP', () => {
     target.pairing.mintCode();
 
     const initiator = harness(PEER, await bundle(PEER));
-    const out = await initiator.pairing.redeem({ code: 'AAAA-AAAA', host: '127.0.0.1', port });
+    const out = await initiator.pairing.redeem({ code: 'AAAA-AAAA-AAAA', host: '127.0.0.1', port });
 
     expect(out.ok).toBe(false);
     expect(out.reason).toBe('bad-code');
@@ -578,10 +752,10 @@ describe('redeem — the initiator half, over real HTTP', () => {
 
   test('an unusable address is reported as unreachable, not as a bad code', async () => {
     const initiator = harness(PEER, await bundle(PEER));
-    expect((await initiator.pairing.redeem({ code: 'ZZZZ-ZZZZ', host: 'a b c', port: 7710 })).reason).toBe(
+    expect((await initiator.pairing.redeem({ code: 'ZZZZ-ZZZZ-ZZZZ', host: 'a b c', port: 7710 })).reason).toBe(
       'unreachable',
     );
-    expect((await initiator.pairing.redeem({ code: 'ZZZZ-ZZZZ', host: '127.0.0.1', port: 0 })).reason).toBe(
+    expect((await initiator.pairing.redeem({ code: 'ZZZZ-ZZZZ-ZZZZ', host: '127.0.0.1', port: 0 })).reason).toBe(
       'unreachable',
     );
   });
@@ -591,7 +765,7 @@ describe('redeem — the initiator half, over real HTTP', () => {
     const rogue = await bundle(SELF);
     const { port } = serve(async (req) => {
       const req_ = (await req.json()) as { payload: unknown };
-      const key = await deriveCodeKey('AAAAAAAA');
+      const key = await deriveCodeKey('AAAAAAAAAAAA');
       const payload = {
         v: 1 as const,
         from: rogue,
@@ -602,7 +776,7 @@ describe('redeem — the initiator half, over real HTTP', () => {
     });
 
     const initiator = harness(PEER, await bundle(PEER));
-    const out = await initiator.pairing.redeem({ code: 'ZZZZ-ZZZZ', host: '127.0.0.1', port });
+    const out = await initiator.pairing.redeem({ code: 'ZZZZ-ZZZZ-ZZZZ', host: '127.0.0.1', port });
     expect(out.reason).toBe('bad-response');
     expect(initiator.applied).toHaveLength(0);
   });
@@ -610,7 +784,7 @@ describe('redeem — the initiator half, over real HTTP', () => {
   test('a response not bound to this request is refused (transcript splice)', async () => {
     const rogue = await bundle(SELF);
     const { port } = serve(async () => {
-      const key = await deriveCodeKey('ZZZZZZZZ');
+      const key = await deriveCodeKey('ZZZZZZZZZZZZ');
       // Correct key, correct shape, but reqSha256 is from some other exchange.
       const payload = {
         v: 1 as const,
@@ -622,7 +796,7 @@ describe('redeem — the initiator half, over real HTTP', () => {
     });
 
     const initiator = harness(PEER, await bundle(PEER));
-    const out = await initiator.pairing.redeem({ code: 'ZZZZ-ZZZZ', host: '127.0.0.1', port });
+    const out = await initiator.pairing.redeem({ code: 'ZZZZ-ZZZZ-ZZZZ', host: '127.0.0.1', port });
     expect(out.reason).toBe('bad-response');
     expect(initiator.applied).toHaveLength(0);
   });
@@ -631,7 +805,7 @@ describe('redeem — the initiator half, over real HTTP', () => {
     const poisoned = await bundle(SELF, { sshPublicKey: `restrict,command="bash" ${sshEd25519(0x11)}` });
     const { port } = serve(async (req) => {
       const req_ = (await req.json()) as { payload: unknown };
-      const key = await deriveCodeKey('ZZZZZZZZ');
+      const key = await deriveCodeKey('ZZZZZZZZZZZZ');
       const payload = {
         v: 1 as const,
         from: poisoned,
@@ -642,7 +816,7 @@ describe('redeem — the initiator half, over real HTTP', () => {
     });
 
     const initiator = harness(PEER, await bundle(PEER));
-    const out = await initiator.pairing.redeem({ code: 'ZZZZ-ZZZZ', host: '127.0.0.1', port });
+    const out = await initiator.pairing.redeem({ code: 'ZZZZ-ZZZZ-ZZZZ', host: '127.0.0.1', port });
     expect(out.reason).toBe('bad-response');
     expect(initiator.applied).toHaveLength(0);
   });
@@ -701,7 +875,7 @@ describe('the module never records secret material', () => {
     const h = harness(SELF, await bundle(SELF), { rand: fixedRand });
     h.pairing.mintCode();
     const res = await h.pairing.handleHello(
-      helloRequest(await helloBody('AAAAAAAA', await bundle(PEER), 1_700_000_000_000)),
+      helloRequest(await helloBody('AAAAAAAAAAAA', await bundle(PEER), 1_700_000_000_000)),
     );
     const text = await res.text();
     expect(text).toBe(JSON.stringify({ error: 'unauthorized' }));

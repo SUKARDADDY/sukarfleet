@@ -56,6 +56,7 @@ export interface HealthSelf {
     unverifiableSigners: number; // entries claiming a machine with no enrolled key
     unacceptedForks: number; // same-seq conflicts not in this machine's fork baseline
     seqGaps: number; // missing entries in some machine's sequence
+    chainBreaks: number; // entries after a machine's genesis whose `prev` does not name their predecessor
   };
 }
 
@@ -320,10 +321,11 @@ function computeActiveFaults(cfg: FleetConfig, self: HealthSelf, peers: PeerView
     }
   }
 
-  // Audit-log integrity. A signature that does not verify is the one condition here that means
-  // somebody edited the replicated log: the entries are signed by the machine that minted them,
-  // so a bad signature is not drift, it is a rewrite. Separate keys per condition, so a real
-  // forgery is not hidden behind an already-firing gap alarm.
+  // Audit-log integrity. Two conditions here mean somebody edited the replicated log rather than
+  // that it drifted: a signature that does not verify, and a chain link that does not name its
+  // predecessor. Entries are signed by the machine that minted them, so neither is an accident.
+  // Separate keys per condition, so a real forgery is not hidden behind an already-firing gap
+  // alarm.
   const audit = self.auditIntegrity;
   if (audit) {
     if (audit.invalidSignatures > 0) {
@@ -332,6 +334,19 @@ function computeActiveFaults(cfg: FleetConfig, self: HealthSelf, peers: PeerView
         faultClass: 'audit-integrity',
         urgency: 'critical',
         message: `${audit.invalidSignatures} audit entr${audit.invalidSignatures === 1 ? 'y' : 'ies'} failed signature verification — the replicated log has been edited`,
+      });
+    }
+    // A broken chain link is the same class of finding as a bad signature and gets the same
+    // urgency: every signature can verify and every sequence number can be contiguous while an
+    // entry has still been swapped for another the same key signed at the same number. Its own
+    // key, so it neither hides behind nor hides a signature fault. Deliberately does not say
+    // "signature" -- an operator reading this must look for a rewritten entry, not a forged one.
+    if (audit.chainBreaks > 0) {
+      faults.push({
+        key: 'audit-integrity:chain',
+        faultClass: 'audit-integrity',
+        urgency: 'critical',
+        message: `${audit.chainBreaks} broken link(s) in an audit chain — an entry was edited or replaced after that machine's genesis`,
       });
     }
     if (audit.unacceptedForks > 0) {

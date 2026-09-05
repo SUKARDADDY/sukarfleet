@@ -20,7 +20,13 @@ The two halves have very different risk profiles and are documented separately b
 
 - **Machines are peers, and each machine trusts every machine it is paired with.** There is no
   central authority and no hierarchy. Pairing is mutual and explicit: a code shown on one machine,
-  typed on the other.
+  typed on the other. The code is 12 Crockford base32 characters, 60 bits, live for 300 seconds,
+  and burned by five bad attempts or by one good one. Both sides stretch it with scrypt
+  (N=2^15, r=8, p=1: 32 MiB and tens of milliseconds per guess) before it keys the handshake HMAC.
+  That cost is the defence that matters, because `/pair/hello` is the one unauthenticated route on
+  the daemon and a captured request is a complete offline oracle: an attacker who has it guesses on
+  their own hardware, where the five-attempt burn cannot reach them. Online guessing is still
+  bounded by the burn, at five tries against 2^60 codes per code minted.
 - **Identity is an ECDSA P-256 keypair per machine**, generated locally and never transmitted. The
   private key lives at `~/.config/sukarfleet/machine-key.json`, mode 0600.
 - **Every peer-to-peer message is signed** — gossip envelopes, endpoint files, audit entries — and
@@ -115,11 +121,23 @@ machine. Each entry is signed individually and carries a per-machine monotonic s
   Two signed entries claiming one sequence number, and gaps in a machine's sequence, are reported
   too. The check reads and never repairs — deleting a bad line would propagate that deletion to
   every machine, and a tampered log that is loudly flagged is worth more than a quietly fixed one.
-- **The entries are not chained.** There is no `prevHash` linking one entry to the last. Sequence
-  numbers make an interior deletion visible as a gap, but **truncating the newest entries of a
-  machine's run leaves no evidence at all**, and ordering is not authenticated. This is the real
-  remaining limit: verification proves each surviving entry is genuine, not that you are looking at
-  all of them.
+- **Entries are chained per machine, from that machine's genesis forward.** Each entry carries
+  `prev`, the SHA-256 of the previous entry that machine appended, inside the signed body. A
+  machine's genesis is the lowest sequence number it ever signed a `prev` into, so it is readable
+  out of the log itself; entries below it predate the chain, can never be rewritten to add a link,
+  and are checked by signature and sequence only. From genesis forward the chain catches the one
+  thing sequence numbers alone cannot: an interior entry swapped for another that the same key
+  signed at the same number, which leaves the run contiguous and every signature verifying. A
+  removed interior entry is caught too, but by the sequence gap rather than by the link. Line order
+  in the file is not an attack surface either way — the regenerator sorts every entry by machine,
+  sequence and bytes before any check runs. A broken link is checked over verified entries only, so
+  an unsigned line cannot move a machine's genesis, and it raises a critical health fault of its
+  own, separate from the signature one.
+- **Truncating the newest entries of a machine's run still leaves no evidence.** A chain proves
+  each entry follows the one before it. It says nothing about where the chain is supposed to end,
+  so lopping off the tail leaves a remainder that verifies perfectly. **Do not read this log as
+  tamper-evident for its tail.** Closing that needs a per-machine high-water mark kept outside the
+  log, which does not exist yet.
 
 Two content rules are enforced by convention and by review:
 
@@ -166,16 +184,18 @@ Two content rules are enforced by convention and by review:
 - **Request signatures do not cover the request body,** and there is no replay cache inside the
   120-second window. On the read-only git routes this grants a replayer nothing the captured
   header already granted.
-- **The audit log is verified but unchained.** Each surviving entry is proven genuine; a machine
-  truncating its own most recent entries leaves nothing to detect. See "What is recorded" above.
+- **The audit log is chained, but not at its tail.** An entry edited or replaced after a machine's
+  genesis is detected; a machine truncating its own most recent entries still leaves nothing to
+  detect. See "What is recorded" above.
 - **WAN address discovery calls third parties.** Endpoint publication asks `api.ipify.org` and
   `icanhazip.com` for this machine's public address. That module is inert unless you configure a
   fleet-repo remote, but the calls are outbound traffic you did not explicitly ask for.
 
 ## Cryptography
 
-No custom cryptography. ECDSA P-256 with SHA-256 via WebCrypto for signatures; HMAC over a
-code-derived key for the pairing handshake; SHA-256 for digests. Signatures are computed over a
+No custom cryptography. ECDSA P-256 with SHA-256 via WebCrypto for signatures; HMAC-SHA-256 for
+the pairing handshake, over a key stretched from the one-shot code with scrypt (N=2^15, r=8, p=1);
+SHA-256 for digests and for the audit log's per-machine chain. Signatures are computed over a
 canonical JSON encoding whose byte-exactness is pinned by
 [`tests/freeze/`](tests/freeze/README.md) — a change to that encoder silently invalidates every
 signature a peer produces, which is why it is treated as a wire format.

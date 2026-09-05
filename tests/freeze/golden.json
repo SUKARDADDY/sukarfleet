@@ -347,7 +347,7 @@
     "sigB64": "rnPf0AlckWkcxe1nJEi9C3Yjml4q1/U5WEkRnCpfQ9BI5HMbUJpBDsazrZlgKmUuVR0Gl9A1USfl51aVndOQsQ=="
   },
   "auditEntry": {
-    "note": "hash-chained log entry; signed over canonicalJson of every field but sigB64",
+    "note": "log entry, chained from each machine's genesis forward via prev; signed over canonicalJson of every field but sigB64. This recorded entry predates the chain and carries no prev -- a pre-genesis entry, which must keep verifying byte for byte.",
     "unsigned": {
       "v": 1,
       "machine": "alpha",

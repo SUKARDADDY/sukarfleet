@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Mesh pairing for the SSH admin lane (p3-ssh-admin). Owns src/pairing.ts only.
 //
-// One round trip. The operator mints a 40-bit one-shot code on machine A's GUI and types it into
+// One round trip. The operator mints a 60-bit one-shot code on machine A's GUI and types it into
 // machine B's GUI; B POSTs /pair/hello to A carrying B's bundle (mesh pubkey + SSH client pubkey +
 // SSH host keys) MAC'd under a key derived from the code, and A answers with its own bundle MAC'd
 // under the same key with the request's sha256 bound in. Both sides install each other from the
@@ -14,8 +14,11 @@
 //     that single exchange: it proves the party on the other end is the human standing at the other
 //     machine's screen, and its MAC covers both bundles, so a mesh-local attacker cannot substitute
 //     its own SSH key into a legitimate exchange without knowing the code.
-//   - Against an on-mesh guesser it is 40 bits with a 5-attempt burn and a 300 s TTL: ~2^-37.7 per
-//     code minted. That is the number this design actually rests on.
+//   - Against an on-mesh guesser it is 60 bits with a 5-attempt burn and a 300 s TTL: five tries at
+//     2^60 codes, or ~2^-57.7 per code minted. Against a guesser who CAPTURED a /pair/hello off the
+//     mesh -- who therefore needs no further round trips and is not bounded by the burn at all --
+//     it is 60 bits behind a memory-hard KDF; see deriveCodeKey for that number. Those two are what
+//     this design rests on.
 //
 // WHAT IT DOES NOT BUY:
 //   - It is NOT the security boundary for the admin lane. Once a peer is installed, what constrains
@@ -35,9 +38,10 @@
 // Fail-closed posture: wrong code, expired code, burned code and a stale timestamp all return the
 // byte-identical 401 with a 15 ms timing floor, so
 // nothing distinguishes them to a caller. Every shape/validation failure returns one identical 400,
-// so a probe cannot learn WHICH field it got wrong.
+// so a probe cannot learn WHICH field it got wrong. The code-derived key is computed at MINT, not
+// per hello, precisely so the slow KDF cannot reintroduce a timing difference between those 401s.
 
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, scrypt, timingSafeEqual } from 'node:crypto';
 import type { AuditEntry, FleetConfig, PairBundle, PairHelloResponse } from './types';
 import { b64decode, b64encode, canonicalJson, log, nowMs, sleep } from './util';
 import { readCappedBody } from './http';
@@ -80,12 +84,16 @@ const SSH_HOST_KEY_TYPES = [
 
 // Domain separation for the code-derived key: a different protocol version must not be able to
 // reuse a live code, and 'req|'/'res|' below stop a request MAC from being replayed as a response.
-const PAIR_KEY_DOMAIN = 'sukarfleet-pair-v1|';
+// v2 is the 12-character/scrypt code. The bump is not cosmetic: it is what makes a v1 code and a
+// v2 code that happen to share characters derive provably different keys, so a machine still on v1
+// and a machine on v2 simply fail to pair rather than half-agreeing on a weaker key.
+const PAIR_KEY_DOMAIN = 'sukarfleet-pair-v2|';
 
 // Crockford base32: no I, L, O or U, so the alphabet has no character pair a human can confuse on
-// a screen or a phone photo. 8 characters x 5 bits = exactly 40 bits, no padding, no truncation.
+// a screen or a phone photo. 12 characters x 5 bits = exactly 60 bits, no padding, no truncation.
 const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
-const CODE_LEN = 8;
+const CODE_LEN = 12;
+const CODE_BYTES = 8; // 64 random bits, of which the top 60 are encoded.
 
 const BAD_REQUEST_BODY = JSON.stringify({ error: 'bad request' });
 const UNAUTHORIZED_BODY = JSON.stringify({ error: 'unauthorized' });
@@ -104,23 +112,34 @@ function badRequestResponse(): Response {
 // Code minting, formatting, and the MAC key derived from it.
 // ---------------------------------------------------------------------------
 
-// 40 bits from the caller-supplied RNG (crypto.getRandomValues by default), big-endian into 8
-// Crockford digits. 2^40 - 1 is well inside the exact-integer range, so plain integer math is safe.
+// 60 bits from the caller-supplied RNG (crypto.getRandomValues by default), big-endian into 12
+// Crockford digits. Encoded with a bit accumulator rather than one JS number on purpose: 2^60
+// exceeds 2^53, so the old `v * 256 + byte` arithmetic would silently lose low bits -- and a code
+// space quietly smaller than the one this file advertises is the exact bug the width is here to
+// fix. `acc` never holds more than 12 pending bits, so the 32-bit bitwise ops are exact.
 export function generateCode(rand?: (n: number) => Uint8Array): string {
-  const bytes = rand ? rand(5) : crypto.getRandomValues(new Uint8Array(5));
-  if (bytes.length < 5) throw new Error('pairing: rand() returned fewer than 5 bytes');
-  let v = 0;
-  for (let i = 0; i < 5; i++) v = v * 256 + bytes[i]!;
+  const bytes = rand ? rand(CODE_BYTES) : crypto.getRandomValues(new Uint8Array(CODE_BYTES));
+  if (bytes.length < CODE_BYTES) throw new Error(`pairing: rand() returned fewer than ${CODE_BYTES} bytes`);
+  let acc = 0;
+  let bits = 0;
   let out = '';
-  for (let i = CODE_LEN - 1; i >= 0; i--) {
-    out += CROCKFORD[Math.floor(v / 32 ** i) % 32];
+  for (let i = 0; i < CODE_BYTES && out.length < CODE_LEN; i++) {
+    acc = (acc << 8) | bytes[i]!;
+    bits += 8;
+    while (bits >= 5 && out.length < CODE_LEN) {
+      bits -= 5;
+      out += CROCKFORD[(acc >>> bits) & 31];
+      acc &= (1 << bits) - 1;
+    }
   }
   return out;
 }
 
-// Display form only. Never fed back into deriveCodeKey without normalizeCode first.
+// Display form only (XXXX-XXXX-XXXX). Never fed back into deriveCodeKey without normalizeCode
+// first. Groups of four because that is what a human reads aloud across a room without losing
+// their place; normalizeCode strips the dashes back out on the way in.
 export function formatCode(code: string): string {
-  return code.length === CODE_LEN ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+  return code.length === CODE_LEN ? `${code.slice(0, 4)}-${code.slice(4, 8)}-${code.slice(8)}` : code;
 }
 
 // Accepts what a human actually types: any spacing, any dashes, any case. O/I/L are folded to the
@@ -142,8 +161,62 @@ function isWellFormedCode(code: string): boolean {
   return true;
 }
 
+// scrypt, not a single hash. A captured /pair/hello is a COMPLETE OFFLINE ORACLE: it carries the
+// payload and the MAC over it, so an attacker can test a guessed code on their own hardware without
+// ever touching the mesh again. The 5-attempt burn bounds only ONLINE guessing and does nothing
+// here; the cost of one guess is the whole defence.
+//
+// N = 2^15, r = 8, p = 1: 128*N*r = exactly 32 MiB, and roughly 50 ms per guess on one 2025 laptop
+// core (measured: 44 ms async, 58 ms sync, on the machine this was written on). The code
+// space is 32^12 = 2^60 = 1,152,921,504,606,846,976 codes. An attacker who somehow sustained a
+// million guesses per second (that is ~32 TB/s of memory bandwidth, far past any GPU or FPGA farm)
+// would need about 36,000 years to sweep it and about 18,000 to expect a hit; inside one code's
+// 300 s TTL such a rig covers 3 x 10^8 of 1.15 x 10^18 codes, about 2.6 x 10^-10. The v1 scheme --
+// 2^40 codes behind ONE sha256 -- was 1.1 x 10^12 hashes, minutes of GPU time inside that same TTL.
+//
+// The salt is the domain constant, deliberately, not a per-code random: there is no channel to
+// carry a per-code salt before the code itself has been carried, and a precomputed table against a
+// value that exists for 300 seconds and is then destroyed buys an attacker nothing. Cost per guess
+// is the property being bought here, not salt uniqueness.
+//
+// maxmem is passed explicitly because node's default cap is exactly 32 MiB, which N=2^15,r=8 sits
+// ON: without it the call throws ERR_CRYPTO_INVALID_SCRYPT_PARAMS rather than deriving anything.
+const SCRYPT_N = 32768; // 2^15
+const SCRYPT_R = 8;
+const SCRYPT_P = 1;
+const SCRYPT_KEY_BYTES = 32;
+const SCRYPT_MAXMEM = 64 * 1024 * 1024;
+
+// The ASYNC scrypt, never scryptSync. This daemon is one event loop serving the GUI, the mesh sync
+// lane and /pair/hello from the same thread, so a 50 ms synchronous burn is 50 ms in which every
+// other route is late -- and "late by exactly one KDF" is itself a signal: an on-mesh party polling
+// any cheap route learns the moment a code was minted, which is the moment worth attacking. The
+// callback form runs the derivation on libuv's threadpool, so the loop keeps answering. Wrapped by
+// hand rather than through promisify so the resolved type is a Buffer with no cast.
+//
+// A sync throw inside the executor (bad params) becomes a rejection like any other failure, so
+// every caller has exactly one failure shape to handle.
+function scryptBytes(code: string): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    scrypt(
+      code,
+      PAIR_KEY_DOMAIN,
+      SCRYPT_KEY_BYTES,
+      { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxmem: SCRYPT_MAXMEM },
+      (err, derived) => {
+        if (err) reject(err);
+        else resolve(derived);
+      },
+    );
+  });
+}
+
+// REJECTS rather than returning a broken key when the platform will not do scrypt at all (an
+// OpenSSL in FIPS mode disallows it outright, and a machine under memory pressure can fail the
+// 32 MiB allocation). Every caller handles that rejection: see mintCode, which converts it into a
+// code that can never be redeemed, and redeem, which reports a local failure.
 export async function deriveCodeKey(code: string): Promise<CryptoKey> {
-  const material = createHash('sha256').update(PAIR_KEY_DOMAIN + code).digest();
+  const material = await scryptBytes(code);
   return crypto.subtle.importKey(
     'raw',
     new Uint8Array(material) as BufferSource,
@@ -153,8 +226,14 @@ export async function deriveCodeKey(code: string): Promise<CryptoKey> {
   );
 }
 
+// The exact bytes every MAC on this route is taken over. Exported so the freeze test can assert
+// them against the recorded golden strings without reimplementing the concatenation it is checking.
+export function macInput(prefix: string, payload: unknown): string {
+  return prefix + canonicalJson(payload);
+}
+
 async function mac(key: CryptoKey, prefix: string, payload: unknown): Promise<string> {
-  const data = new TextEncoder().encode(prefix + canonicalJson(payload));
+  const data = new TextEncoder().encode(macInput(prefix, payload));
   const sig = await crypto.subtle.sign('HMAC', key, data as BufferSource);
   return b64encode(new Uint8Array(sig));
 }
@@ -382,11 +461,31 @@ export interface PairingDeps {
   applyPeer: (peer: PairBundle) => Promise<void>;
   now?: () => number;
   rand?: (n: number) => Uint8Array;
+  // The code -> HMAC-key derivation. A test seam and nothing else: production callers omit it and
+  // get deriveCodeKey. It exists because the interesting case is the one that cannot be provoked
+  // on a healthy machine -- a platform that refuses scrypt -- and that path has to be exercised
+  // rather than reasoned about.
+  deriveKey?: (code: string) => Promise<CryptoKey>;
 }
 
 interface ActiveCode {
   code: string;
   display: string;
+  // Derived ONCE, at mint, rather than on every hello. deriveCodeKey is deliberately expensive
+  // (32 MiB, ~50 ms), and running it inside handleHello would make a hello that reaches it
+  // measurably slower than one that does not -- handing a caller exactly the "wrong code" vs
+  // "expired/burned code" distinction the identical 401 body and the 15 ms floor exist to deny. It
+  // also keeps the one unauthenticated route on this daemon from being a 32 MiB-per-request CPU
+  // sink. Each side still pays exactly one KDF per exchange; this only moves ours off the request
+  // path.
+  //
+  // `null` is the KDF-FAILED state, and the promise never rejects: mintCode is synchronous and
+  // stores this promise without awaiting it, so a rejection here would be an unhandled rejection,
+  // and nothing in src/ installs an unhandledRejection handler -- the daemon would exit 1 because
+  // an operator clicked "mint code" on a machine whose OpenSSL is in FIPS mode. A code whose key
+  // never materialised simply cannot be redeemed; handleHello answers it with the same 401 as a
+  // wrong code, and the operator re-mints.
+  key: Promise<CryptoKey | null>;
   expiresMs: number;
   attemptsLeft: number;
 }
@@ -398,6 +497,7 @@ export class Pairing {
   private readonly deps: PairingDeps;
   private readonly now: () => number;
   private readonly rand: (n: number) => Uint8Array;
+  private readonly deriveKey: (code: string) => Promise<CryptoKey>;
   private active: ActiveCode | null = null;
   private pairedWith: string | null = null;
 
@@ -406,6 +506,32 @@ export class Pairing {
     this.deps = deps;
     this.now = deps.now ?? nowMs;
     this.rand = deps.rand ?? ((n: number) => crypto.getRandomValues(new Uint8Array(n)));
+    this.deriveKey = deps.deriveKey ?? deriveCodeKey;
+  }
+
+  // Starts the code's key derivation and absorbs its failure, in the one expression, so that the
+  // promise mintCode parks in `active` can NEVER reject. mintCode is synchronous -- uiserve's
+  // UiPairingPort calls it from a route handler and reads codeState() straight back -- so nothing
+  // awaits this promise until a hello arrives, which may be never. An unhandled rejection sitting
+  // in the daemon for five minutes is not a pairing failure, it is process exit 1: nothing in src/
+  // installs an unhandledRejection handler.
+  //
+  // Both failure shapes collapse to the same null: a rejected promise (production's async
+  // deriveCodeKey, e.g. an OpenSSL in FIPS mode refusing scrypt) and a synchronous throw out of an
+  // injected seam. Warn, not error, and exactly once per mint: it is one machine's KDF, the
+  // pairing route stays closed, and the operator's next mint may well succeed.
+  private startKeyDerivation(code: string): Promise<CryptoKey | null> {
+    const unusable = (err: unknown): null => {
+      log('warn', 'pairing: code key derivation failed -- this code can never be redeemed', {
+        error: String(err),
+      });
+      return null;
+    };
+    try {
+      return this.deriveKey(code).catch(unusable);
+    } catch (err) {
+      return Promise.resolve(unusable(err));
+    }
   }
 
   // At most one code is live at a time: minting a second one invalidates the first, so an operator
@@ -413,7 +539,8 @@ export class Pairing {
   mintCode(): { display: string; expiresMs: number } {
     const code = generateCode(this.rand);
     const expiresMs = this.now() + PAIR_CODE_TTL_MS;
-    this.active = { code, display: formatCode(code), expiresMs, attemptsLeft: PAIR_CODE_MAX_ATTEMPTS };
+    const key = this.startKeyDerivation(code);
+    this.active = { code, display: formatCode(code), key, expiresMs, attemptsLeft: PAIR_CODE_MAX_ATTEMPTS };
     log('info', 'pairing: code minted', { expiresMs });
     return { display: this.active.display, expiresMs };
   }
@@ -495,7 +622,16 @@ export class Pairing {
     const live = this.liveCode();
     if (!live) return this.unauthorized(startMs);
 
-    const key = await deriveCodeKey(live.code);
+    // Cannot reject -- startKeyDerivation already turned any failure into null -- so there is no
+    // throw here to turn this route's uniform 401 into a 500. A code whose key never materialised
+    // is answered exactly as a wrong one is: same body, same floor, no hint that the machine
+    // rather than the caller is at fault. Attempts are deliberately NOT burned: no attempt against
+    // this code can ever succeed, so counting them down would only make the GUI's attemptsLeft
+    // tick for a reason the operator cannot act on. The mint-time warn is where that fault is
+    // named.
+    const key = await live.key;
+    if (!key) return this.unauthorized(startMs);
+
     const expected = await macRequest(key, hello.payload);
     const ok = constantTimeEqual(expected, hello.mac);
 
@@ -584,7 +720,18 @@ export class Pairing {
       return { ok: false, reason: 'bad-response', message: 'This machine has no usable SSH identity yet.' };
     }
 
-    const key = await deriveCodeKey(code);
+    // Same fault as the responder's, on the other side of the wire, and it must not escape as a
+    // rejected promise either: uiserve returns this result as a 200 body, so an unhandled throw
+    // here would turn a local KDF failure into a 500 on a loopback route the GUI expects to be
+    // able to read. Reported as a local failure, the way an unusable SSH identity above is -- the
+    // other machine did nothing wrong and the operator must not be sent hunting for a bad code.
+    let key: CryptoKey;
+    try {
+      key = await this.deriveKey(code);
+    } catch (err) {
+      log('error', 'pairing: code key derivation failed, cannot redeem', { error: String(err) });
+      return { ok: false, reason: 'bad-response', message: 'This machine could not prepare the pairing key.' };
+    }
     const payload = { v: 1 as const, from: selfBundle, tsMs: this.now() };
     const reqBody = canonicalJson({ payload, mac: await macRequest(key, payload) });
 

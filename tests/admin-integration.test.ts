@@ -5,7 +5,8 @@
 // a real Bun.serve -- and the two pair each other through the GUI API before any admin call is made.
 // Everything a test box can actually have is real: real ed25519 fleet and host keys from ssh-keygen,
 // real authorized_keys/known_hosts/config.json writes through the real patchConfig, real HMAC pairing
-// over a real socket, real hash-chained audit entries verified by the real crossCheckAuditLog.
+// over a real socket, real audit entries -- hash-chained from each machine's genesis forward --
+// verified by the real crossCheckAuditLog.
 //
 // Four things a test box cannot have, each substituted at a declared seam and nowhere else:
 //
