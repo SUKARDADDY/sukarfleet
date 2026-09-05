@@ -547,10 +547,12 @@ async function main(): Promise<void> {
   await republishEndpoint();
   await clockSentinel.vet();
 
-  // The hash-chained audit log. The admin lane records every call, refusal and pairing into this
-  // chain. Construction touches no disk and opens no port -- AuditLog reads its sequence lazily on
-  // the first append -- so a node that appends nothing is byte-identical to one that never built
-  // it.
+  // The audit log. The admin lane records every call, refusal and pairing into it, and every entry
+  // this machine appends carries `prev`, so its run is hash-chained from its genesis forward: an
+  // entry edited or replaced after that genesis is detectable, trailing truncation of the newest
+  // entries is not (see audit.ts's crossCheckAuditLog). Construction touches no disk and opens no
+  // port -- AuditLog reads its sequence lazily on the first append -- so a node that appends
+  // nothing is byte-identical to one that never built it.
   const auditLog = new AuditLog(cfg.machine, key);
   const auditAppend = (kind: string, detail: Record<string, unknown>): Promise<AuditEntry> =>
     auditLog.append(kind, detail);
@@ -1268,6 +1270,7 @@ async function main(): Promise<void> {
       unverifiableSigners: count('unverifiable-signer'),
       unacceptedForks: count('seq-fork'),
       seqGaps: count('seq-gap'),
+      chainBreaks: count('chain-broken'),
     };
     if (report.flags.length > 0) {
       log('error', 'audit: cross-check found problems in the replicated log', {
