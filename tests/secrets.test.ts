@@ -31,6 +31,11 @@ const SEAL = HAS_SYSTEMD_CREDS ? await sealAvailable() : { ok: false, reason: 's
 // machines) but is opt-out-able, because setSudoPassword deliberately never retries and a locked
 // account is exactly what that rule protects.
 const HAS_SUDO = Bun.which('sudo') !== null && process.env.SUKARFLEET_TEST_NO_SUDO !== '1';
+// The wrong-password test only means something where sudo actually asks for one. On a box whose
+// sudoers grants NOPASSWD (every GitHub Actions runner, many CI images), `sudo -n true` succeeds,
+// a wrong password is never consulted, and the "rejected" expectation is simply false there.
+const SUDO_ASKS_FOR_A_PASSWORD =
+  HAS_SUDO && Bun.spawnSync(['sudo', '-n', 'true'], { stdout: 'ignore', stderr: 'ignore' }).exitCode !== 0;
 
 let tempDir: string;
 
@@ -341,7 +346,7 @@ describe('setSudoPassword / removeSudoPassword', () => {
   });
 
   test('a wrong password is rejected by real sudo and nothing is stored', async () => {
-    if (!HAS_SUDO) return;
+    if (!SUDO_ASKS_FOR_A_PASSWORD) return; // NOPASSWD sudo would accept anything; nothing to test
     // allowPlaintextFallback keeps this test independent of the TPM: the point is that the
     // sudo-rs invocation reads one line from stdin, prints no prompt, and terminates.
     const cfg = cfgWith(storeDir(), { allowPlaintextFallback: true });
