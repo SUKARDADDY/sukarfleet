@@ -46,6 +46,10 @@ sudo ./install/install-elevated.sh
 It installs the mesh transport and grants the daemon permission to restart that one service. It
 never installs a passwordless rule for anything else.
 
+On Windows, double-click [`install/windows/Add-To-Fleet.cmd`](install/windows/README.md) instead.
+It does the same two stages in one file, behind one UAC prompt, and is specific about the two
+things a Windows node cannot do.
+
 ## Pair two machines
 
 Open the GUI on both (`http://127.0.0.1:7710/ui/`), click **Pair** on one, and type the code it

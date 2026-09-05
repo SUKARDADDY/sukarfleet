@@ -20,7 +20,7 @@ const REPO_ROOT = join(import.meta.dir, '..');
 // Never scanned: the live capture is real fleet data by design and is gitignored.
 const EXCLUDED_DIRS = new Set(['node_modules', '.git']);
 const EXCLUDED_FILES = new Set(['live-capture.json', 'no-personal-data.test.ts']);
-const SCANNED_EXTENSIONS = ['.ts', '.js', '.json', '.md', '.sh', '.toml', '.service', '.html', '.css'];
+const SCANNED_EXTENSIONS = ['.ts', '.js', '.json', '.md', '.sh', '.toml', '.service', '.html', '.css', '.ps1', '.cmd'];
 
 // Patterns describing SHAPES of private data, not one person's specifics -- so this keeps working
 // for the next contributor, whose machine is not named the same thing.
