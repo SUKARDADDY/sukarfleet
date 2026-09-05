@@ -1356,17 +1356,22 @@ async function main(): Promise<void> {
       if (!adopted.has(repo.name)) continue; // never sync on main
 
       const sync = await syncer.syncOnce(repo);
-      // Yield check, roamer-only and only on a tick that would otherwise push: a push:false tick
-      // costs nothing new, and the anchor never asks. It reads refs/remotes/origin/main as the
-      // fetch above just left it -- one local rev-parse, no network. A main this machine did not
-      // push means somebody else is pushing, so stand down for this repo and drop the streak, which
-      // makes the roamer wait out another full TAKEOVER_STREAK before it considers taking over
-      // again. The streak lives here, not in the pure gate, which is why the reset is at the call
-      // site.
+      // Yield check, roamer-only. The observer is asked on EVERY roamer tick, not only on a tick
+      // that would push, so its baseline is always "origin's main as of the previous tick". Sampling
+      // only on push ticks let the baseline go stale across the anchor's whole healthy period, and
+      // the next outage then opened with a false "moved by another pusher" for a push the anchor
+      // made minutes earlier -- a wasted takeover tick and a streak reset, seen live. The read is
+      // one local rev-parse of refs/remotes/origin/main as the fetch above just left it; no
+      // network, and the anchor never asks. The answer is acted on only when this tick would
+      // otherwise push: a main this machine did not push means somebody else is pushing, so stand
+      // down for this repo and drop the streak, which makes the roamer wait out another full
+      // TAKEOVER_STREAK before it considers taking over again. The streak lives here, not in the
+      // pure gate, which is why the reset is at the call site.
       let originMovedByOther = false;
-      if (cfg.role === 'roamer' && push) {
-        originMovedByOther = await derive.originMainMovedByOther(repo.path);
-        if (originMovedByOther) {
+      if (cfg.role === 'roamer') {
+        const moved = await derive.originMainMovedByOther(repo.path);
+        if (moved && push) {
+          originMovedByOther = true;
           log('info', 'derive: main on origin moved by another pusher, yielding takeover', {
             repo: repo.name,
           });
@@ -1396,7 +1401,7 @@ async function main(): Promise<void> {
         // racing the anchor -- at one line per repo per sync tick, cheap enough to keep in a
         // normal log. Skipped for 'unchanged-inputs': that tick minted nothing, so there was
         // never anything to suppress.
-        if (cfg.role === 'roamer' && derived.skipped === 'push-suppressed-non-owner') {
+        if (cfg.role === 'roamer' && !originMovedByOther && derived.skipped === 'push-suppressed-non-owner') {
           log('info', 'derive: push suppressed this tick, anchor is the pusher', {
             repo: repo.name,
             sha: derived.sha,

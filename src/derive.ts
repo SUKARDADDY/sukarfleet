@@ -545,7 +545,8 @@ async function pushDerivedMain(repoPath: string, sha: string): Promise<boolean> 
 //     taking over after a real anchor death would yield forever to the dead anchor's last push;
 //   - a value unchanged since the previous observation: a main that is just sitting there is not
 //     evidence of another pusher. This is what lets the roamer take over for good once whoever was
-//     pushing actually stops.
+//     pushing actually stops. node.ts asks on every roamer tick precisely so that "previous
+//     observation" means the previous tick, not the last time a takeover was considered.
 export async function originMainMovedByOther(repoPath: string): Promise<boolean> {
   const r = await git(repoPath, ['rev-parse', '--verify', '--quiet', ORIGIN_MAIN_REF]);
   const current = r.code === 0 ? r.stdout.trim() : '';
