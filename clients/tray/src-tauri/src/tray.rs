@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Tray icon + menu. On Linux (SNI/AppIndicator) the tray carries no click
 //! events — the menu IS the primary readout. Rebuilt only when the model hash
 //! changes (rebuilding an SNI menu every tick makes GNOME blink).

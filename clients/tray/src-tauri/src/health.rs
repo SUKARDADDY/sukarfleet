@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Pure tray-state engine: classification + debounce + resume grace.
 //! Clock-injected (now/wall passed in) so every transition is unit-testable,
 //! same discipline as the daemon's health.ts.

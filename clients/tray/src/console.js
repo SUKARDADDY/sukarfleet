@@ -1,5 +1,6 @@
+// SPDX-License-Identifier: MIT
 // sukarfleet native console. Vanilla ES module, no build step, no dependency.
-// Ported from ~/AI_Agent/OS/Projects/sukarfleet/ui/app.js for the Tauri webview.
+// Ported from ui/app.js, the daemon's web console, for the Tauri webview.
 //
 // Two rules carry the whole file, same as the web console it is ported from:
 //   1. Every request path is root-relative (e.g. '/api/ui/...') and goes through the Rust
@@ -82,7 +83,7 @@ const COPY = {
     'bad-response': 'The other machine answered with something unexpected. Nothing was paired.',
     'half-paired': 'Pairing completed in one direction only. Run it again from the other machine before using the admin lane.',
   },
-  pairBadCodeFormat: 'A pairing code is eight characters, optionally with a dash in the middle.',
+  pairBadCodeFormat: 'A pairing code is twelve characters, optionally grouped with dashes.',
 
   runNeedsCommand: 'Enter a command.',
   runNeedsReason: 'Enter a reason. It is the only thing that makes the audit log readable months from now.',
@@ -965,7 +966,7 @@ function wirePair() {
     const code = $('redeem-code').value.trim().toUpperCase();
     const host = $('redeem-host').value.trim();
     const port = Number($('redeem-port').value);
-    if (code.replace(/[-\s]/g, '').length !== 8) { result('redeem-result', COPY.pairBadCodeFormat, 'bad'); return; }
+    if (code.replace(/[-\s]/g, '').length !== 12) { result('redeem-result', COPY.pairBadCodeFormat, 'bad'); return; }
     result('redeem-result', COPY.pairing);
     try {
       const res = await api('/api/ui/pair/redeem', { method: 'POST', body: { code, host, port } });

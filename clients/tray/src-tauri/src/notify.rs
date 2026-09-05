@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! App-side fault notifications: diff the fault-key set per tick, coalesce
 //! into ONE notification, persist seen keys so a tray restart never
 //! re-announces a latched week-old fault. No repeat cadence — the icon

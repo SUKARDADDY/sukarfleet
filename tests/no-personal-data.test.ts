@@ -17,10 +17,17 @@ import { join, relative } from 'node:path';
 
 const REPO_ROOT = join(import.meta.dir, '..');
 
-// Never scanned: the live capture is real fleet data by design and is gitignored.
-const EXCLUDED_DIRS = new Set(['node_modules', '.git']);
+// Never scanned: the live capture is real fleet data by design and is gitignored, and target/
+// and gen/ are build output -- cargo's and Tauri's codegen -- which is regenerated rather than
+// committed, and can be gigabytes of it.
+// These match on the BARE DIRECTORY NAME at any depth, not on a path: a future source directory
+// named target/ or gen/ anywhere in the tree would go unscanned, so name one something else.
+const EXCLUDED_DIRS = new Set(['node_modules', '.git', 'target', 'gen']);
 const EXCLUDED_FILES = new Set(['live-capture.json', 'no-personal-data.test.ts']);
-const SCANNED_EXTENSIONS = ['.ts', '.js', '.json', '.md', '.sh', '.toml', '.service', '.html', '.css', '.ps1', '.cmd'];
+// .svg because the brand marks and the tray's inline icons are text. .txt and .lock because
+// licence texts and dependency lockfiles are text too, and a lockfile is exactly the sort of
+// generated thing that quietly records a registry URL or a local path.
+const SCANNED_EXTENSIONS = ['.ts', '.js', '.json', '.md', '.sh', '.toml', '.service', '.html', '.css', '.ps1', '.cmd', '.rs', '.py', '.svg', '.txt', '.lock'];
 
 // Patterns describing SHAPES of private data, not one person's specifics -- so this keeps working
 // for the next contributor, whose machine is not named the same thing.
@@ -38,10 +45,15 @@ const FORBIDDEN: { pattern: RegExp; what: string }[] = [
   { pattern: /\bGODFATHER\b/i, what: 'a real machine name' },
   { pattern: /\bsukardaddy\b/i, what: 'a real username' },
   // .local and the reserved example domains are synthetic by definition; anything else that looks
-  // like an address is assumed to belong to a person.
+  // like an address is assumed to belong to a person. The second lookahead spares exactly one
+  // shape and no more: Tauri's bundler mandates icons named `128x128@2x.png`, which reads as an
+  // address and is not one. It fires only when the part before the @ is a size token and the part
+  // after it is a scale token plus an image suffix, so an address parked in a filename stem --
+  // `someone@their-host.png`, `/avatars/someone@their-host.jpeg` -- is still caught. The trailing
+  // lookahead keeps `128x128@2x.png.somebody.com` from hiding behind the prefix.
   {
     pattern:
-      /[a-zA-Z0-9._%+-]+@(?![a-zA-Z0-9.-]*\b(?:example\.(?:com|org|net)|\.?(?:test|invalid|localhost|local))\b)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/,
+      /[a-zA-Z0-9._%+-]+@(?![a-zA-Z0-9.-]*\b(?:example\.(?:com|org|net)|\.?(?:test|invalid|localhost|local))\b)(?!(?<=\b\d+x\d+@)\d+x\.(?:png|jpe?g|gif|svg|webp|ico|icns|bmp|tiff?)(?![a-zA-Z0-9.-]))[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/,
     what: 'a real email address',
   },
   { pattern: /\btrycloudflare\.com\b|\bcfargotunnel\.com\b/, what: 'a real tunnel hostname' },
@@ -89,6 +101,61 @@ describe('the repository carries no personal data', () => {
         }
       }
       expect(hits).toEqual([]);
+    });
+  }
+});
+
+// The scan above proves the tree is clean today. This block proves the patterns still bite: a rule
+// narrowed to spare one false positive is exactly the kind of edit that quietly stops catching the
+// real thing, and nothing in the scan would notice, because a pattern that matches nothing passes.
+// Every address, host and username below is invented. This file is in EXCLUDED_FILES, so the
+// examples cannot trip the scan itself.
+const PATTERN_CASES: { what: string; caught: string[]; spared: string[] }[] = [
+  { what: 'a real mesh address', caught: ['peer 10.44.12.7 is up'], spared: ['10.44.12', '10.8.0.1'] },
+  { what: 'a private 10.x address', caught: ['10.8.0.1'], spared: ['10.44.12.7'] },
+  { what: 'a private 192.168.x address', caught: ['192.168.1.5'], spared: ['192.0.2.5'] },
+  { what: "a real user's home directory", caught: ['/home/jdoe/notes'], spared: ['/home/', '$HOME/.config'] },
+  { what: "a real macOS user's home directory", caught: ['/Users/jdoe/Library'], spared: ['/usr/share/doc'] },
+  { what: "a real machine's mount point", caught: ['/Dev_Drive/repos'], spared: ['/Dev_Drive_backup', '/dev/null'] },
+  { what: 'a real hostname', caught: ['host=pop-os'], spared: ['pop-oscillator'] },
+  { what: 'a real machine name', caught: ['built on sukarlaptop'], spared: ['built on a laptop'] },
+  { what: 'a real machine name', caught: ['GODFATHER', 'godfather'], spared: ['godmother'] },
+  { what: 'a real username', caught: ['sukardaddy'], spared: ['sukarfleet'] },
+  {
+    what: 'a real email address',
+    // The icon-filename exception is the reason this row exists. An address hidden as a filename
+    // stem is still an address, and the suffix must not be a place to hide one.
+    caught: [
+      'jane.doe@fictional-mail.com',
+      'jane.doe@fictional-mail.com.png',
+      '/avatars/someone@fictional-host.jpeg',
+      'someone@fictional-host.png.evil-domain.com',
+      'a@b.svg',
+    ],
+    spared: ['icons/128x128@2x.png', '32x32@2x.png', 'someone@example.com', 'nobody@fixture.local'],
+  },
+  {
+    what: 'a real tunnel hostname',
+    caught: ['https://red-fox-1.trycloudflare.com'],
+    spared: ['https://cloudflare.com'],
+  },
+  {
+    what: 'a real hostname on a registrable domain',
+    caught: ["'https://console.some-host.dev'"],
+    spared: ["'https://api.ipify.org'", "'https://fleet.example.com'", 'https://console.some-host.dev'],
+  },
+];
+
+describe('the forbidden patterns catch what they claim to', () => {
+  test('every pattern brings its own examples, in order', () => {
+    expect(PATTERN_CASES.map((c) => c.what)).toEqual(FORBIDDEN.map((f) => f.what));
+  });
+
+  for (const [i, { what, caught, spared }] of PATTERN_CASES.entries()) {
+    test(`#${i + 1}, ${what}`, () => {
+      const { pattern } = FORBIDDEN[i];
+      expect(caught.filter((s) => !pattern.test(s))).toEqual([]);
+      expect(spared.filter((s) => pattern.test(s))).toEqual([]);
     });
   }
 });

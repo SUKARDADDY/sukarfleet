@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Canned-daemon fixture: exercise the tray + console's full surface — faults,
 // suspend, daemon-down, AND every mutating console flow — WITHOUT touching the
 // real daemon (soak discipline). Synthetic data only.
@@ -177,7 +178,7 @@ Bun.serve({
     // --- pair ---
     if (p === '/api/ui/pair/code') {
       if (m === 'POST') {
-        pairCode = { display: 'FIXT-CODE', expiresMs: Date.now() + 300_000, attemptsLeft: 5 };
+        pairCode = { display: 'F1XT-C0DE-Z3R0', expiresMs: Date.now() + 300_000, attemptsLeft: 5 };
         return json(pairState());
       }
       if (m === 'DELETE') { pairCode = null; return json(pairState()); }

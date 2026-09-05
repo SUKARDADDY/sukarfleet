@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Rust mirror of the daemon's UiState / status wire shapes (sukarfleet src/types.ts).
 //! Every field is defaulted so an additive daemon change never breaks deserialization.
 

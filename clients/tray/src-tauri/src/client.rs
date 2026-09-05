@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Loopback HTTP client for the daemon. Read-only by contract: GET only, v1.
 //! The webview never talks to the daemon (no CORS there) — all HTTP lives here.
 

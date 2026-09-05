@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Endpoint discovery: --endpoint flag > SUKARFLEET_CONFIG/config.json nodePort > 7710.
 //! Reads ONLY nodePort out of the daemon config — no secrets, no peers.
 
