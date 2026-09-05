@@ -43,7 +43,14 @@ const FORBIDDEN: { pattern: RegExp; what: string }[] = [
   { pattern: /\bpop-os\b/i, what: 'a real hostname' },
   { pattern: /\bsukarlaptop\b/i, what: 'a real machine name' },
   { pattern: /\bGODFATHER\b/i, what: 'a real machine name' },
-  { pattern: /\bsukardaddy\b/i, what: 'a real username' },
+  // The one exception is the project's own repository address. `SUKARDADDY` is
+  // the GitHub organisation this repo is published under, so it appears in the
+  // one install command, in `get.sh`'s default clone URL, and in the docs that
+  // quote them. That is the project's address, not a person's -- the same
+  // reasoning that puts ipify.org and icanhazip.com in the hostname allowlist
+  // below. Anywhere else, including a home directory or a config value, it is
+  // still a username and still caught.
+  { pattern: /(?<!\bgithub(?:usercontent)?\.com\/)\bsukardaddy\b/i, what: 'a real username' },
   // .local and the reserved example domains are synthetic by definition; anything else that looks
   // like an address is assumed to belong to a person. The second lookahead spares exactly one
   // shape and no more: Tauri's bundler mandates icons named `128x128@2x.png`, which reads as an
@@ -120,7 +127,15 @@ const PATTERN_CASES: { what: string; caught: string[]; spared: string[] }[] = [
   { what: 'a real hostname', caught: ['host=pop-os'], spared: ['pop-oscillator'] },
   { what: 'a real machine name', caught: ['built on sukarlaptop'], spared: ['built on a laptop'] },
   { what: 'a real machine name', caught: ['GODFATHER', 'godfather'], spared: ['godmother'] },
-  { what: 'a real username', caught: ['sukardaddy'], spared: ['sukarfleet'] },
+  {
+    what: 'a real username',
+    caught: ['sukardaddy', '/home/sukardaddy/notes', 'user=SUKARDADDY', 'gitlab.com/SUKARDADDY/x'],
+    spared: [
+      'sukarfleet',
+      'https://github.com/SUKARDADDY/sukarfleet.git',
+      'https://raw.githubusercontent.com/SUKARDADDY/sukarfleet/v0.1.0/install/get.sh',
+    ],
+  },
   {
     what: 'a real email address',
     // The icon-filename exception is the reason this row exists. An address hidden as a filename

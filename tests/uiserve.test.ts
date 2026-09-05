@@ -15,7 +15,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { UiRoutes, UI_ASSETS, isLoopbackHostHeader, rejectCrossSiteBrowser } from '../src/uiserve';
+import { UiRoutes, UI_ASSETS, elevatedInstallCommand, isLoopbackHostHeader, rejectCrossSiteBrowser } from '../src/uiserve';
 import type { CredentialStatusView, LanePatch, UiRoutesDeps } from '../src/uiserve';
 import { defaultConfig } from '../src/config';
 import type { AdminRunRequest, AdminRunView, AuditEntry, FleetConfig, MinimalServer, UiState } from '../src/types';
@@ -969,5 +969,52 @@ describe('degradation', () => {
 
   test('an unparseable url is not this module of business', async () => {
     expect(await local(req('/api/ui/state?x=%%%'))).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The one root step
+// ---------------------------------------------------------------------------
+//
+// Three surfaces print this command -- the web console's Mesh card, the tray
+// console's Mesh card and install/quickstart.sh's closing banner -- and a
+// stranger copies whichever they read first. Both consoles used to hardcode
+// `sudo ~/sukarfleet/install/install-elevated.sh --adopt-pending-secret`, which
+// names a directory get.sh never creates and omits the flag the script needs, so
+// copying it produced a refusal. What is pinned here is the shape, and that the
+// bash the banner builds agrees with it.
+
+describe('elevatedInstallCommand', () => {
+  const COMMAND = elevatedInstallCommand('/opt/sukarfleet/app', '/var/lib/sukarfleet');
+
+  test('names the checkout, the flag and the real staged path', () => {
+    expect(COMMAND).toBe(
+      'sudo /opt/sukarfleet/app/install/install-elevated.sh --adopt-pending-secret --pending=/var/lib/sukarfleet/pending-easytier-secret',
+    );
+  });
+
+  test('honours a state directory that is not under the app directory', () => {
+    // stateDir() reads SUKARFLEET_STATE, so the two paths vary independently and
+    // the staged file is never assumed to sit beside the checkout.
+    expect(elevatedInstallCommand('/a/app', '/b/state')).toContain('--pending=/b/state/pending-easytier-secret');
+  });
+
+  test('install/quickstart.sh builds the same string in bash', async () => {
+    const script = await readFile(join(import.meta.dir, '..', 'install', 'quickstart.sh'), 'utf8');
+    // The banner's ROOT_STEP assignment, spelled in the script's own variables.
+    expect(script).toContain('ROOT_STEP="sudo $ELEVATED --adopt-pending-secret --pending=$PENDING_SECRET"');
+    expect(script).toContain('ELEVATED="$REPO_ROOT/install/install-elevated.sh"');
+    expect(script).toContain('PENDING_SECRET="$STATE_DIR/pending-easytier-secret"');
+  });
+
+  test('both consoles have somewhere to put it, and neither hardcodes the old path', async () => {
+    for (const page of [
+      join(import.meta.dir, '..', 'ui', 'index.html'),
+      join(import.meta.dir, '..', 'clients', 'tray', 'src', 'index.html'),
+    ]) {
+      const html = await readFile(page, 'utf8');
+      expect(html).toContain('id="mesh-command"');
+      expect(html).not.toContain('~/sukarfleet/install/install-elevated.sh');
+    }
   });
 });

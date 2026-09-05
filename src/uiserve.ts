@@ -70,6 +70,26 @@ import { readCappedBody, BODY_READ_TIMEOUT_MS } from './http';
 
 const UI_DIR = join(import.meta.dir, '..', 'ui');
 
+// ---------------------------------------------------------------------------
+// The one root step
+// ---------------------------------------------------------------------------
+
+// The console's Mesh card, the tray console's Mesh card and the installer's
+// closing banner all print this command, and a stranger copies whichever they
+// read first. So there is one function that builds it, from the two paths that
+// actually vary: where get.sh put the checkout, and where the daemon staged the
+// secret (stateDir(), which honours SUKARFLEET_STATE).
+//
+// Both consoles used to hardcode `sudo ~/sukarfleet/install/install-elevated.sh
+// --adopt-pending-secret`, which is neither where the checkout lives nor, on its
+// own, a command the script accepts -- it refuses without --pending=.
+//
+// install/quickstart.sh builds the same string in bash from the same two paths;
+// the shapes are pinned against each other in tests/uiserve.test.ts.
+export function elevatedInstallCommand(appDir: string, stateDirPath: string): string {
+  return `sudo ${join(appDir, 'install', 'install-elevated.sh')} --adopt-pending-secret --pending=${join(stateDirPath, 'pending-easytier-secret')}`;
+}
+
 const HTML_TYPE = 'text/html; charset=utf-8';
 const CSS_TYPE = 'text/css; charset=utf-8';
 const JS_TYPE = 'text/javascript; charset=utf-8';
