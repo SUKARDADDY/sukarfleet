@@ -1,0 +1,25 @@
+[package]
+name = "sukarfleet-tray"
+version = "0.1.0"
+description = "Tray-first fleet health companion for the sukarfleet daemon"
+edition = "2021"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-notification = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["time", "macros", "sync"] }
+dirs = "6"
+
+[profile.release]
+lto = true
+strip = true
