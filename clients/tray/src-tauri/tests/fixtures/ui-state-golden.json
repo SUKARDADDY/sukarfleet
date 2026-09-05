@@ -1,0 +1,65 @@
+{
+  "v": 1,
+  "nowMs": 1700000600000,
+  "self": {
+    "machine": "alpha",
+    "role": "anchor",
+    "meshIp": "192.0.2.1",
+    "nodePort": 7710,
+    "uptimeSec": 3600
+  },
+  "peers": [
+    {
+      "name": "beta",
+      "meshIp": "192.0.2.2",
+      "nodePort": 7710,
+      "online": false,
+      "lastSeenMs": 1700000000000,
+      "syncStale": true,
+      "paired": true,
+      "sshHost": null,
+      "sshFallbackHost": null
+    }
+  ],
+  "repos": [
+    {
+      "name": "example-repo",
+      "path": "/data/example-repo",
+      "lastSyncOkMs": 1700000500000,
+      "lastCommit": "0000000000000000000000000000000000000000",
+      "syncError": null
+    }
+  ],
+  "faults": [
+    {
+      "key": "peer-offline:beta",
+      "faultClass": "peer-offline",
+      "message": "peer beta offline for 10m",
+      "urgency": "critical",
+      "firstSeenMs": 1700000000000
+    }
+  ],
+  "admin": {
+    "enabled": false,
+    "acceptIncoming": false,
+    "uiEnabled": true,
+    "configured": false,
+    "credentialPresent": false,
+    "credentialStale": false,
+    "credentialSealed": null,
+    "credentialSetAtMs": null,
+    "sshUser": "example",
+    "sshKeyFingerprint": null,
+    "runTimeoutSec": 120,
+    "maxRunTimeoutSec": 900,
+    "ratePerMin": 20
+  },
+  "setup": {
+    "complete": true,
+    "identity": true,
+    "meshSecret": "installed",
+    "credential": true,
+    "paired": true
+  },
+  "pairing": { "active": false }
+}

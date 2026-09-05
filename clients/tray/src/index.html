@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>sukarfleet</title>
+<link rel="stylesheet" href="console.css">
+</head>
+<body>
+<a class="skiplink" href="#main">Skip to content</a>
+
+<p class="banner-offline" id="offline-banner" hidden>daemon not responding · retrying</p>
+
+<header class="top">
+  <div class="brand">
+    <img src="assets/icon-reduced.svg" alt="" width="24" height="24">
+    <span class="wordmark">sukarfleet</span>
+  </div>
+  <div class="ident">
+    <p class="eyebrow">You are viewing</p>
+    <h1 id="self-machine">…</h1>
+    <p class="subline">
+      <span id="self-role">—</span> ·
+      <span id="self-endpoint">—</span> ·
+      up <span id="self-uptime">—</span>
+    </p>
+  </div>
+  <div class="conn">
+    <p class="connline"><span id="conn-dot" class="dot dot-idle" aria-hidden="true"></span> <span id="conn-text">Connecting…</span></p>
+    <p class="hint" id="scope-note">Every action on this page runs on this machine.</p>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs" aria-label="Console sections">
+  <a href="#/fleet" data-screen="fleet">Fleet</a>
+  <a href="#/pair" data-screen="pair">Pair</a>
+  <a href="#/credentials" data-screen="credentials">Credentials</a>
+  <a href="#/admin" data-screen="admin">Admin</a>
+</nav>
+
+<p class="banner" id="setup-banner" hidden>
+  Setup is not finished on this machine. <a href="#/setup">Finish setup</a>
+</p>
+
+<p class="flash" id="flash" role="status" aria-live="polite" hidden></p>
+
+<noscript><p class="flash flash-bad">This console needs JavaScript.</p></noscript>
+
+<main id="main" tabindex="-1">
+
+  <!-- ── setup takeover ─────────────────────────────────────────────── -->
+  <section id="screen-setup" class="screen" hidden aria-labelledby="setup-h">
+    <h2 id="setup-h">Set up this machine</h2>
+    <p class="lede">Four steps, all from this page. Only the mesh secret needs a terminal, and only once.</p>
+
+    <article class="card">
+      <h3><span class="step" id="setup-step-identity" aria-hidden="true">1</span> Identity</h3>
+      <p class="hint">What this machine calls itself on the mesh. Written to <code>~/.config/sukarfleet/config.json</code>.</p>
+      <form id="identity-form" class="grid2">
+        <p class="field">
+          <label for="id-machine">Machine name</label>
+          <input id="id-machine" name="machine" type="text" autocomplete="off" spellcheck="false" required>
+        </p>
+        <p class="field">
+          <label for="id-role">Role</label>
+          <select id="id-role" name="role">
+            <option value="anchor">anchor — always on</option>
+            <option value="roamer">roamer — comes and goes</option>
+          </select>
+        </p>
+        <p class="field">
+          <label for="id-meship">Mesh IP</label>
+          <input id="id-meship" name="meshIp" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="192.0.2.1">
+        </p>
+        <p class="field">
+          <label for="id-port">Node port</label>
+          <input id="id-port" name="nodePort" type="number" min="1" max="65535" autocomplete="off">
+        </p>
+        <p class="field span2">
+          <label for="id-network">Mesh network name</label>
+          <input id="id-network" name="networkName" type="text" autocomplete="off" spellcheck="false">
+        </p>
+        <p class="actions span2">
+          <button type="submit" class="primary">Save identity</button>
+          <span class="result" id="identity-result"></span>
+        </p>
+      </form>
+      <p class="hint">A saved identity needs a daemon restart to take effect.</p>
+      <p class="actions" id="identity-restart-actions"></p>
+      <p class="result" id="identity-restart-result"></p>
+    </article>
+
+    <article class="card">
+      <h3><span class="step" id="setup-step-mesh" aria-hidden="true">2</span> Mesh network</h3>
+      <p class="hint">The shared secret that joins this machine to the mesh. It is staged to a 0600 file and shredded by the installer, so it never appears in a command line or in shell history.</p>
+      <p class="statusline" id="mesh-state">—</p>
+      <p class="actions">
+        <button type="button" id="mesh-generate">Generate a new secret</button>
+        <button type="button" id="mesh-toggle-existing">I already have one</button>
+      </p>
+      <form id="mesh-form" class="stack" hidden>
+        <p class="field">
+          <label for="mesh-secret">Existing mesh secret</label>
+          <input id="mesh-secret" type="text" autocomplete="off" spellcheck="false">
+        </p>
+        <p class="actions"><button type="submit" class="primary">Stage this secret</button></p>
+      </form>
+      <div id="mesh-reveal" hidden>
+        <p class="field">
+          <label for="mesh-value">Staged secret — copy it to the other machines</label>
+          <input id="mesh-value" type="text" readonly spellcheck="false">
+        </p>
+        <p class="hint">Now run this once, in a terminal on this machine. It is the only step in the whole install that asks for a password:</p>
+        <pre class="cmd"><code>sudo ~/sukarfleet/install/install-elevated.sh --adopt-pending-secret</code></pre>
+      </div>
+      <p class="result" id="mesh-result"></p>
+    </article>
+
+    <article class="card">
+      <h3><span class="step" id="setup-step-credential" aria-hidden="true">3</span> Admin credential</h3>
+      <p class="hint">This machine's own sudo password, sealed to this machine and this user. It is what lets the fleet run privileged commands here. It never crosses the network.</p>
+      <p class="statusline" id="setup-credential-state">—</p>
+      <p class="actions"><a class="button" href="#/credentials">Open Credentials</a></p>
+    </article>
+
+    <article class="card">
+      <h3><span class="step" id="setup-step-pair" aria-hidden="true">4</span> Pair</h3>
+      <p class="hint">One round trip over the mesh exchanges both machines' keys. Show a code on one machine, type it on the other.</p>
+      <p class="statusline" id="setup-pair-state">—</p>
+      <p class="actions"><a class="button" href="#/pair">Open Pair</a></p>
+    </article>
+
+    <p class="actions">
+      <button type="button" id="setup-skip" class="quiet">Skip for now and open the console</button>
+    </p>
+  </section>
+
+  <!-- ── fleet ──────────────────────────────────────────────────────── -->
+  <section id="screen-fleet" class="screen" hidden aria-labelledby="fleet-h">
+    <h2 id="fleet-h">Fleet</h2>
+
+    <article class="card">
+      <h3>Admin lane</h3>
+      <p class="statusline" id="lane-state">—</p>
+      <dl class="kv" id="lane-facts"></dl>
+    </article>
+
+    <article class="card">
+      <h3>Alarms</h3>
+      <div id="faults"></div>
+    </article>
+
+    <article class="card">
+      <h3>Peers</h3>
+      <div class="tablewrap"><table id="peers-table">
+        <thead><tr><th scope="col">Machine</th><th scope="col">Mesh</th><th scope="col">State</th><th scope="col">Last seen</th><th scope="col">Paired</th><th scope="col">SSH host</th><th scope="col"><span class="sr">Revoke</span></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </article>
+
+    <article class="card">
+      <h3>Repositories</h3>
+      <div class="tablewrap"><table id="repos-table">
+        <thead><tr><th scope="col">Name</th><th scope="col">Path</th><th scope="col">Last sync</th><th scope="col">Commit</th><th scope="col">Error</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </article>
+
+    <article class="card">
+      <h3>Daemon</h3>
+      <p class="hint">Restarts <code>sukarfleet.service</code> for this user. The console reconnects on its own.</p>
+      <p class="actions" id="restart-actions"></p>
+      <p class="result" id="restart-result"></p>
+    </article>
+  </section>
+
+  <!-- ── pair ───────────────────────────────────────────────────────── -->
+  <section id="screen-pair" class="screen" hidden aria-labelledby="pair-h">
+    <h2 id="pair-h">Pair</h2>
+    <p class="lede">Pairing exchanges mesh keys, SSH public keys and SSH host keys in both directions. Do it once per pair of machines.</p>
+
+    <article class="card">
+      <h3>Show a code on this machine</h3>
+      <p class="hint">Read the code out to the other machine's console. It is single use and expires in five minutes.</p>
+      <p class="code-display" id="pair-code" hidden aria-live="polite"></p>
+      <p class="statusline" id="pair-code-state">No code is active.</p>
+      <p class="actions">
+        <button type="button" id="pair-mint" class="primary">Show pairing code</button>
+        <button type="button" id="pair-cancel" hidden>Cancel the code</button>
+      </p>
+    </article>
+
+    <article class="card">
+      <h3>Enter the other machine's code</h3>
+      <form id="redeem-form" class="grid3">
+        <p class="field">
+          <label for="redeem-code">Pairing code</label>
+          <input id="redeem-code" type="text" autocomplete="off" spellcheck="false" autocapitalize="characters" placeholder="XXXX-XXXX" required>
+        </p>
+        <p class="field">
+          <label for="redeem-host">Address</label>
+          <input id="redeem-host" type="text" autocomplete="off" spellcheck="false" placeholder="192.0.2.1" required>
+        </p>
+        <p class="field">
+          <label for="redeem-port">Port</label>
+          <input id="redeem-port" type="number" min="1" max="65535" value="7710" autocomplete="off" required>
+        </p>
+        <p class="actions span3">
+          <button type="submit" class="primary">Pair now</button>
+          <span class="result" id="redeem-result"></span>
+        </p>
+      </form>
+    </article>
+  </section>
+
+  <!-- ── credentials ────────────────────────────────────────────────── -->
+  <section id="screen-credentials" class="screen" hidden aria-labelledby="cred-h">
+    <h2 id="cred-h">Credentials</h2>
+
+    <article class="card">
+      <h3>What is stored here, exactly</h3>
+      <ul class="plainlist">
+        <li><strong>What:</strong> this machine's own sudo password. Nothing else. No other machine's password is ever stored here, and this one is never sent anywhere.</li>
+        <li><strong>Where:</strong> <code id="cred-path">~/.config/sukarfleet/secrets/sudo.cred</code>, mode 0600 inside a 0700 directory, sealed by <code>systemd-creds</code> so the file is bound to this user on this host.</li>
+        <li><strong>It protects against:</strong> a copy of the file turning up somewhere else — a synced repo, a backup, a directory copied to another machine. The sealed file is inert anywhere but here.</li>
+        <li><strong>It does not protect against:</strong> a process already running as this user on this machine — it can unseal the file exactly the way the daemon does. Nor does it protect a stolen disk.</li>
+      </ul>
+    </article>
+
+    <article class="card">
+      <h3>Sudo password</h3>
+      <p class="statusline" id="cred-state">—</p>
+      <p class="hint" id="cred-seal-note"></p>
+      <form id="sudo-form" class="stack">
+        <p class="field">
+          <label for="sudo-password" id="sudo-password-label">Sudo password on this machine</label>
+          <input id="sudo-password" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+        </p>
+        <p class="hint">It is verified once with <code>sudo -v</code>, then sealed. It is never written to a log, an audit entry, or any response from this daemon.</p>
+        <p class="actions">
+          <button type="submit" class="primary">Save and verify</button>
+          <span id="sudo-remove-slot"></span>
+          <span class="result" id="sudo-result"></span>
+        </p>
+      </form>
+    </article>
+
+    <article class="card">
+      <h3>Admin lane</h3>
+      <p class="hint">Two independent switches. The first decides what this machine may <em>send</em>; the second decides what it will <em>run</em> for others.</p>
+      <p class="actions">
+        <label class="switch"><input type="checkbox" id="lane-enabled"> <span>Admin lane: this machine may send privileged commands</span></label>
+      </p>
+      <p class="hint">Off means no privileged command can be started from this console at all, including one aimed at this machine itself.</p>
+      <p class="actions">
+        <label class="switch"><input type="checkbox" id="lane-accept"> <span>Accept incoming admin commands: other machines may run privileged commands here</span></label>
+      </p>
+      <p class="hint">Off means an admin command sent to this machine is refused before it reaches sudo, whatever it is paired with.</p>
+      <p class="result" id="lane-result"></p>
+    </article>
+
+    <article class="card">
+      <h3>SSH trust</h3>
+      <dl class="kv" id="trust-facts"></dl>
+    </article>
+  </section>
+
+  <!-- ── admin ──────────────────────────────────────────────────────── -->
+  <section id="screen-admin" class="screen" hidden aria-labelledby="admin-h">
+    <h2 id="admin-h">Admin</h2>
+
+    <article class="card">
+      <h3>Run a privileged command</h3>
+      <form id="run-form" class="stack">
+        <p class="field">
+          <label for="run-machine">Target machine</label>
+          <select id="run-machine" required></select>
+        </p>
+        <p class="field">
+          <label for="run-command">Command</label>
+          <input id="run-command" type="text" autocomplete="off" spellcheck="false" placeholder="systemctl is-active easytier-fleet.service" required>
+        </p>
+        <p class="parsed" id="run-parsed" aria-live="polite"></p>
+        <p class="field">
+          <label for="run-reason">Reason</label>
+          <input id="run-reason" type="text" autocomplete="off" required placeholder="why this is being run">
+        </p>
+        <p class="field narrow">
+          <label for="run-timeout">Timeout (seconds)</label>
+          <input id="run-timeout" type="number" min="1" autocomplete="off">
+        </p>
+        <div class="warn" id="run-confirm" hidden>
+          <p id="run-confirm-text"></p>
+          <p class="field">
+            <label for="run-confirm-input">Type the target machine name to confirm</label>
+            <input id="run-confirm-input" type="text" autocomplete="off" spellcheck="false">
+          </p>
+          <p class="hint">This is friction, not a safety check. The daemon on the target machine is what actually enforces the refusal rules.</p>
+        </div>
+        <p class="actions">
+          <button type="submit" class="primary" id="run-submit">Run as root</button>
+          <span class="result" id="run-result"></span>
+        </p>
+      </form>
+    </article>
+
+    <article class="card" id="run-panel" hidden>
+      <h3>Current run</h3>
+      <p class="statusline" id="run-status">—</p>
+      <dl class="kv" id="run-facts"></dl>
+      <h4>stdout</h4>
+      <pre class="out" id="run-stdout" tabindex="0"></pre>
+      <h4>stderr</h4>
+      <pre class="out" id="run-stderr" tabindex="0"></pre>
+    </article>
+
+    <article class="card">
+      <h3>Readiness</h3>
+      <div class="tablewrap"><table id="status-table">
+        <thead><tr><th scope="col">Machine</th><th scope="col">Paired</th><th scope="col">Reachable</th><th scope="col">Credential</th><th scope="col">Lane</th><th scope="col">Last run</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </article>
+
+    <article class="card">
+      <h3>Recent runs</h3>
+      <div class="tablewrap"><table id="runs-table">
+        <thead><tr><th scope="col">Started</th><th scope="col">Machine</th><th scope="col">Command</th><th scope="col">Result</th><th scope="col"><span class="sr">Open</span></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </article>
+
+    <article class="card">
+      <details id="audit-details">
+        <summary><h3>Audit log</h3></summary>
+        <p class="hint">Newest first. Commands are recorded in full; command output never is, only its size in bytes.</p>
+        <div class="tablewrap"><table id="audit-table">
+          <thead><tr><th scope="col">Time</th><th scope="col">Seq</th><th scope="col">Machine</th><th scope="col">Kind</th><th scope="col">Detail</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </details>
+    </article>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <p>sukarfleet · native console</p>
+</footer>
+
+<script type="module" src="console.js"></script>
+</body>
+</html>
