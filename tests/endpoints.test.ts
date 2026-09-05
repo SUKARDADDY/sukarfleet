@@ -15,7 +15,9 @@ import {
   parseLanIpFromIpAddrJson,
   probeUpnpIgd,
   planPeerDial,
+  selectLanIpFromInterfaces,
 } from '../src/endpoints';
+import type { NetworkInterfaceView } from '../src/endpoints';
 
 async function withTmpDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), 'sukarfleet-endpoints-test-'));
@@ -279,9 +281,104 @@ describe('parseLanIpFromIpAddrJson / lanIp', () => {
     expect(await lanIp(runFn)).toBe('192.0.2.42');
   });
 
-  test('lanIp() returns null and logs a warning when the command fails', async () => {
+  test('lanIp() returns null and logs a warning when the command fails and nothing else answers', async () => {
     const runFn = async () => ({ code: 1, stdout: '', stderr: 'ip: command not found' });
-    expect(await lanIp(runFn)).toBeNull();
+    // The fallback reader is injected empty, so this still asserts what it always did: a failed
+    // `ip` with no other source of an address yields null, never a guess.
+    expect(await lanIp(runFn, { platform: 'linux', interfaces: () => ({}) })).toBeNull();
+  });
+
+  test('the ip path skips this machine own mesh address', () => {
+    const withMesh = JSON.stringify([
+      {
+        ifname: 'easytier0',
+        operstate: 'UP',
+        addr_info: [{ family: 'inet', local: '203.0.113.4', scope: 'global' }],
+      },
+      {
+        ifname: 'eth0',
+        operstate: 'UP',
+        addr_info: [{ family: 'inet', local: '192.0.2.42', scope: 'global' }],
+      },
+    ]);
+    expect(parseLanIpFromIpAddrJson(withMesh)).toBe('203.0.113.4');
+    expect(parseLanIpFromIpAddrJson(withMesh, '203.0.113.4')).toBe('192.0.2.42');
+  });
+});
+
+// The second source of the same answer. Windows has no iproute2 -- the first real Windows boot
+// died on `uv_spawn 'ip'` -- so these fabricate what node:os hands back and assert the rule stays
+// the one the `ip` path applies.
+describe('selectLanIpFromInterfaces', () => {
+  const ifaces = (): Record<string, NetworkInterfaceView[]> => ({
+    'Loopback Pseudo-Interface 1': [
+      { address: '127.0.0.1', family: 'IPv4', internal: true },
+      { address: '::1', family: 'IPv6', internal: true },
+    ],
+    'Local Area Connection* 9': [{ address: '169.254.13.7', family: 'IPv4', internal: false }],
+    easytier: [{ address: '198.51.100.4', family: 'IPv4', internal: false }],
+    'Wi-Fi': [
+      { address: 'fe80::1c2b:3d4e:5f60:7a8b', family: 'IPv6', internal: false },
+      { address: '192.0.2.42', family: 'IPv4', internal: false },
+    ],
+  });
+
+  test('picks the first non-internal, non-link-local IPv4 in enumeration order', () => {
+    expect(selectLanIpFromInterfaces(ifaces())).toBe('198.51.100.4');
+  });
+
+  test('skips this machine own mesh address, so the LAN candidate is never the overlay', () => {
+    expect(selectLanIpFromInterfaces(ifaces(), '198.51.100.4')).toBe('192.0.2.42');
+  });
+
+  test('accepts the numeric family shape node has also shipped', () => {
+    expect(
+      selectLanIpFromInterfaces({ eth0: [{ address: '192.0.2.7', family: 4, internal: false }] }),
+    ).toBe('192.0.2.7');
+  });
+
+  test('returns null when only loopback and link-local addresses exist', () => {
+    expect(
+      selectLanIpFromInterfaces({
+        lo: [{ address: '127.0.0.1', family: 'IPv4', internal: true }],
+        eth0: [{ address: '169.254.1.2', family: 'IPv4', internal: false }],
+      }),
+    ).toBeNull();
+  });
+});
+
+describe('lanIp platform fallback', () => {
+  const winIfaces = (): Record<string, NetworkInterfaceView[]> => ({
+    Ethernet: [{ address: '198.51.100.20', family: 'IPv4', internal: false }],
+  });
+
+  test('a spawn that throws ENOENT falls back to networkInterfaces() instead of propagating', async () => {
+    let spawned = 0;
+    const runFn = async (): Promise<never> => {
+      spawned++;
+      throw new Error("ENOENT: no such file or directory, uv_spawn 'ip'");
+    };
+    const ip = await lanIp(runFn, { platform: 'linux', interfaces: winIfaces });
+    expect(ip).toBe('198.51.100.20');
+    expect(spawned).toBe(1);
+  });
+
+  test('windows never spawns ip(8) at all', async () => {
+    let spawned = 0;
+    const runFn = async (): Promise<never> => {
+      spawned++;
+      throw new Error('should not be called');
+    };
+    expect(await lanIp(runFn, { platform: 'windows', interfaces: winIfaces })).toBe('198.51.100.20');
+    expect(spawned).toBe(0);
+  });
+
+  test('linux still prefers the ip path when it works', async () => {
+    const fixture = JSON.stringify([
+      { ifname: 'eth0', operstate: 'UP', addr_info: [{ family: 'inet', local: '192.0.2.42', scope: 'global' }] },
+    ]);
+    const runFn = async () => ({ code: 0, stdout: fixture, stderr: '' });
+    expect(await lanIp(runFn, { platform: 'linux', interfaces: winIfaces })).toBe('192.0.2.42');
   });
 });
 

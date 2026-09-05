@@ -4,7 +4,7 @@
 #
 #   sudo install/install-elevated.sh --adopt-pending-secret --pending=<path>
 #
-# It does exactly four things, all narrow enough to read in full before you run
+# It does exactly five things, all narrow enough to read in full before you run
 # them:
 #
 #   1. reads the mesh details the console staged for it, refusing the file unless
@@ -16,6 +16,8 @@
 #   4. installs and starts easytier-fleet.service, opens the mesh listener ports
 #      if a firewall is already running, and grants the daemon's user permission
 #      to restart that ONE service with no password
+#   5. restarts your own sukarfleet user unit, which has been listening on every
+#      interface because the mesh address did not exist until step 4
 #
 # What it deliberately does NOT do: write anything into your home directory,
 # create a user, touch your SSH configuration, install a privileged helper, or
@@ -45,6 +47,10 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd -P)"
 
 SUDOERS_FILE="/etc/sudoers.d/sukarfleet-transport"
 DEFAULT_SERVICE="easytier-fleet.service"
+# The node's own systemd USER unit, the one quickstart.sh installs. This script
+# never installs or manages it -- it only restarts it at the end, once the mesh
+# address it wants to bind actually exists.
+USER_SERVICE="sukarfleet.service"
 # Test seam: the pin file to read. Tests point it at a throwaway copy to walk
 # the duplicate-pin and TODO-pin paths without editing the real one.
 PINS_FILE="${SUKARFLEET_PINS_FILE:-$SCRIPT_DIR/easytier-pins.txt}"
@@ -635,6 +641,46 @@ EOF
 }
 
 # =============================================================================
+# Restart the invoking user's node, so it binds the mesh address.
+#
+# Ordering, and the whole reason this exists: the console's Identity card writes
+# meshIp, the daemon restarts, and it comes up BEFORE this stage has installed
+# EasyTier -- so the address is on no interface, the peer-facing server falls
+# back to 0.0.0.0 and says so (src/node.ts, chooseBindHost). The mesh is up only
+# now, at the end of this stage, so this is the first moment a restart can
+# actually take the address. Without it the node listens on every interface
+# until the user reboots or restarts it by hand, and nothing on screen says so.
+#
+# Runs as the target user, not as root: sukarfleet is a systemd USER unit, and
+# root's `systemctl --user` talks to root's own manager, not to theirs.
+# XDG_RUNTIME_DIR is what runuser does not set up and the user manager is
+# addressed through. Never fatal -- the mesh is installed and correct by this
+# point, so a restart that cannot be driven from here is a sentence to print,
+# not a reason to fail the install.
+# =============================================================================
+restart_node() {
+  local runtime_dir="/run/user/${TARGET_UID}"
+  local by_hand="systemctl --user restart ${USER_SERVICE}"
+  if [ "$DRY_RUN" = "1" ]; then
+    dry "runuser -u ${TARGET_USER} -- env XDG_RUNTIME_DIR=${runtime_dir} systemctl --user restart ${USER_SERVICE}"
+    return 0
+  fi
+  if ! command -v runuser >/dev/null 2>&1; then
+    warn "runuser is not installed, so the node was not restarted from here. ${TARGET_USER} should run: ${by_hand}"
+    return 0
+  fi
+  if [ ! -d "$runtime_dir" ]; then
+    warn "no user session at ${runtime_dir}, so the node was not restarted from here. ${TARGET_USER} should run: ${by_hand}"
+    return 0
+  fi
+  if runuser -u "$TARGET_USER" -- env "XDG_RUNTIME_DIR=${runtime_dir}" systemctl --user restart "$USER_SERVICE" >/dev/null 2>&1; then
+    log "restarted the node so it listens on the mesh address"
+  else
+    warn "could not restart the node from here. ${TARGET_USER} should run: ${by_hand}"
+  fi
+}
+
+# =============================================================================
 # Firewall. Port-scoped, not binary-scoped: Linux firewall front ends have no
 # equivalent of the -Program scoping the Windows installer uses, so the narrowing
 # comes from the ports and a source restriction. NEVER enables a firewall that is
@@ -1059,6 +1105,11 @@ fi
 # --- sudoers + firewall -------------------------------------------------------
 install_sudoers
 open_firewall "$MESH_IP" "$NODE_PORT" "${LISTENERS[@]}"
+
+# --- and the node, which has been listening on 0.0.0.0 until this moment ------
+# Not on the exit-5 path above: if the mesh service did not start, the address
+# still does not exist and a restart would only put the node back where it is.
+restart_node
 
 log ""
 log "Done. Nothing else on this machine needs root."

@@ -48,6 +48,10 @@ const COPY = {
   meshStateNone: 'No mesh secret staged on this machine.',
   meshStatePending: 'A secret is staged and waiting for the one root step below.',
   meshStateInstalled: 'The mesh secret is installed. Nothing to do here.',
+  // setup.meshBindFallback: the mesh address is saved on the Identity card but is not on any
+  // interface yet, so the daemon is listening on all of them until the sudo step below brings
+  // the mesh up. Says which step closes it rather than leaving a warning with no exit.
+  meshAddressNotUp: 'The mesh address is set but not up on this machine yet, so the node is listening on all interfaces. The root step below is what brings it up.',
   meshGenerated: 'Generated. Copy it to the other machines, then run the command below.',
   meshStaged: 'Staged. Run the command below to install it.',
 
@@ -441,10 +445,13 @@ function renderSetupCards() {
   }
 
   const meshState = setup.meshSecret;
+  const meshText =
+    meshState === 'installed' ? COPY.meshStateInstalled : meshState === 'pending' ? COPY.meshStatePending : COPY.meshStateNone;
+  const meshDot = meshState === 'installed' ? 'dot-ok' : meshState === 'pending' ? 'dot-warn' : 'dot-idle';
   statusLine(
     'mesh-state',
-    meshState === 'installed' ? COPY.meshStateInstalled : meshState === 'pending' ? COPY.meshStatePending : COPY.meshStateNone,
-    meshState === 'installed' ? 'dot-ok' : meshState === 'pending' ? 'dot-warn' : 'dot-idle',
+    setup.meshBindFallback ? `${meshText} ${COPY.meshAddressNotUp}` : meshText,
+    setup.meshBindFallback ? 'dot-warn' : meshDot,
   );
 }
 

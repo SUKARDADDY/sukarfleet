@@ -183,13 +183,15 @@ otherwise it prints this.
            --adopt-pending-secret \
            --pending=$HOME/.local/state/sukarfleet/pending-easytier-secret
 
-  It will do exactly four things, and nothing else:
+  It will do exactly five things, and nothing else:
     1. read the staged mesh details, refusing the file unless it is a
        regular file you own at mode 0600
     2. write /etc/easytier/fleet.toml (0600 root), shred the staged copy
     3. fetch EasyTier, check it against a SHA256 pinned here, install it
     4. if a firewall is running, open the mesh listener ports, and 7710
        from the mesh subnet only
+    5. restart your own sukarfleet daemon, so it listens on the mesh address
+       instead of on every interface
 
   Do the console's "Mesh network" card first. Until you do, this command
   refuses and writes nothing: it has no secret to adopt.
@@ -212,6 +214,22 @@ whether `easytier-fleet.service` is actually running rather than trusting an exi
 the Windows path already paid for (`Install-Sukarfleet.ps1:443-450`), and prints `[install-elevated]
 done in NNs`. The Mesh card flips from `pending` to `installed` within a poll or two, because a
 staged file outranks a running service and the shred is what removes it (`src/node.ts:831-841`).
+
+Then the stage restarts the node itself (**new in S7**), which is what step 5 of the banner is. The
+order matters and it is the reason this step exists at all. The Identity card writes `meshIp` and
+the console restarts the daemon one step earlier, while EasyTier is still not installed, so the
+mesh address is on no interface and the daemon cannot bind it. It listens on `0.0.0.0` instead and
+says so (`chooseBindHost` in `src/node.ts`); before S7 it died at boot on `EADDRNOTAVAIL` and
+systemd restarted it every 3 seconds, which took the console down with it and deadlocked the
+journey on every fresh machine. The mesh only comes up here, at the end of this stage, so this is
+the first moment a restart can take the address. The line is `runuser -u <user> -- env
+XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user restart sukarfleet.service`, run as the target
+user because sukarfleet is a systemd **user** unit and root's `systemctl --user` talks to root's
+own manager. It logs `[install-elevated] restarted the node so it listens on the mesh address`. If
+that user has no runtime directory, the script warns and prints `systemctl --user restart
+sukarfleet.service` for them to run instead of failing an install that is otherwise complete. It
+does not run on the exit-5 path where the mesh service failed to start: the address still does not
+exist there, so a restart would only put the node back where it already is.
 
 ### 2.6 Pairing machine A and machine B
 
@@ -328,6 +346,13 @@ nothing installs today (**new in S7**); and firewall rules, if and only if a fir
 running (**new in S7**). That directory mode is load-bearing: the daemon reads mesh state from the
 service rather than from the file precisely because an unprivileged `stat` there must always answer
 "absent" (`src/node.ts:831-833`).
+
+**Restarts:** the invoking user's own `sukarfleet.service`, last, and only when
+`easytier-fleet.service` came up (**new in S7**). Nothing else re-binds the node: `cfg.meshIp` is
+set one console step before the address exists, so between the Identity card and this stage the
+daemon is listening on `0.0.0.0` with a warning in the log, and it stays there until something
+restarts it. `restart_node()` in `install-elevated.sh` is that something. It never fails the
+install: no `runuser`, or no `/run/user/<uid>`, both warn and name the command by hand.
 
 The sudoers grant is the only passwordless rule this project installs, and it is one command with a
 fixed argument list (`install-elevated.sh:102-111`): `you ALL=(root) NOPASSWD: /usr/bin/systemctl
@@ -542,6 +567,7 @@ describe turns out to be sudo's, not ours.
 | SHA256 mismatch | `[install-elevated] ERROR: SHA256 mismatch for easytier-linux-x86_64-v2.6.4.zip. expected <pin>, got <actual>. Nothing was installed.` (mirrors `Install-Sukarfleet.ps1:371-373`) | 5 | report it; do not retry blindly | yes, download deleted |
 | No `/dev/net/tun` | `[install-elevated] ERROR: easytier-fleet.service failed to start. journalctl says: "Failed to create TUN device: No such file or directory (os error 2)". This VM or container has no /dev/net/tun; the host has to pass it through. The sukarfleet daemon is still running and the console still works.` | 5 | give the container the TUN device, then `sudo systemctl start easytier-fleet.service` | yes, TOML written, daemon up, mesh down |
 | `--no-easytier` chosen (elevated stage only) | `[install-elevated] skipping the mesh transport. Nothing was written to /etc/easytier and the staged secret was left alone. Install EasyTier yourself at /opt/easytier, then re-run this command without the flag.` | 0 | install EasyTier, re-run | yes, sudoers written, no TOML, staged secret intact |
+| Mesh address configured but not up yet (between the Identity card and the sudo step) | The daemon logs `node: mesh address 192.0.2.5 is not on any interface yet -- listening on all interfaces until the mesh is up and the daemon restarts` and the Mesh card says `The mesh address is set but not up on this machine yet, so the node is listening on all interfaces. The root step below is what brings it up.` | 0 | finish the sudo step, which brings the mesh up and restarts the node onto the address | yes, daemon up, console reachable, mesh down |
 | Secret adoption never completed | The Mesh card reports `A secret is staged and waiting for the one root step below.` (`ui/app.js:44`), fed by `meshSecretState()` returning `pending` (`src/node.ts:834-841`) | n/a | run the printed sudo command | yes, daemon runs, mesh down |
 | B cannot reach A when pairing | `Could not reach that address. Check the mesh IP and port, and that the other daemon is running.` (`ui/app.js:82`) | n/a | check the mesh is up on both, and the address is A's mesh IP with port 7710 | yes, nothing paired |
 | Pairing code expired or mistyped | `That code was not accepted. Codes are single use and last five minutes -- show a fresh one and try again.` (`ui/app.js:81`) | n/a | mint a fresh code on A | yes, code burns after 5 bad attempts (`src/pairing.ts:56`) |

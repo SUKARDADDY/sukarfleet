@@ -6,6 +6,9 @@ import { describe, expect, test } from 'bun:test';
 import {
   anchorDaemonOnlineFromGossip,
   buildAdminLaneView,
+  chooseBindHost,
+  classifyBindError,
+  meshBindFallbackWarning,
   nextAnchorDownStreak,
   nextWatchdogGrace,
   pushAllowedForRepo,
@@ -16,6 +19,7 @@ import {
 import { clockDriftMs } from '../src/util';
 import { SUSPEND_JUMP_MS } from '../src/transport';
 import { defaultConfig } from '../src/config';
+import { networkInterfaces } from 'node:os';
 
 describe('shouldPushThisTick (P3 single-pusher policy, Class A: gossip-keyed takeover)', () => {
   test('anchor always pushes, regardless of anchorDaemonOnline or streak', () => {
@@ -379,5 +383,102 @@ describe('buildAdminLaneView (Class G: uiAssets exposed on UiState)', () => {
       ratePerMin: cfg.admin.ratePerMin,
       uiAssets: true,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The peer-facing bind host (Class H: the fresh-machine deadlock)
+// ---------------------------------------------------------------------------
+//
+// The journey that produced this: the Identity card writes meshIp, the console restarts the
+// daemon, and the daemon comes back BEFORE the sudo step has installed EasyTier -- so the mesh
+// address is on no interface, Bun.serve throws "Failed to start server. Is port 7710 in use?",
+// systemd restarts the process every 3s, and the console the user needs in order to reach the
+// sudo step is gone. Every fresh machine deadlocked there.
+//
+// Addresses below are from 192.0.2.0/24 (TEST-NET-1), reserved for documentation and on no
+// interface of any machine that runs these tests.
+
+const HOST_LIST = ['127.0.0.1', '::1', '192.0.2.5', 'FE80::1%eth0'];
+
+describe('chooseBindHost (which host the peer-facing server is offered)', () => {
+  test('no mesh address configured means every interface, and is not a fallback', () => {
+    expect(chooseBindHost('', HOST_LIST)).toEqual({ host: '0.0.0.0', fallback: false });
+  });
+
+  test('a mesh address that is on an interface is bound as asked', () => {
+    expect(chooseBindHost('192.0.2.5', HOST_LIST)).toEqual({ host: '192.0.2.5', fallback: false });
+    expect(chooseBindHost('127.0.0.1', HOST_LIST)).toEqual({ host: '127.0.0.1', fallback: false });
+  });
+
+  test('a mesh address that is on no interface falls back to every interface, and says so', () => {
+    expect(chooseBindHost('192.0.2.6', HOST_LIST)).toEqual({ host: '0.0.0.0', fallback: true });
+    expect(chooseBindHost('192.0.2.1', [])).toEqual({ host: '0.0.0.0', fallback: true });
+  });
+
+  test('case and the %zone suffix networkInterfaces() reports are not a difference', () => {
+    expect(chooseBindHost('fe80::1', HOST_LIST)).toEqual({ host: 'fe80::1', fallback: false });
+  });
+});
+
+describe('classifyBindError (a busy port and an absent address look identical to Bun)', () => {
+  const inUse = { code: 'EADDRINUSE', errno: 0, syscall: 'listen' };
+
+  test('a wildcard bind can only have failed on the port', () => {
+    for (const host of ['0.0.0.0', '::', '']) {
+      expect(classifyBindError(host, inUse, HOST_LIST)).toBe('in-use');
+      expect(classifyBindError(host, new Error('whatever'), HOST_LIST)).toBe('in-use');
+    }
+  });
+
+  test('an address this machine does not have is unavailable, whatever the code says', () => {
+    expect(classifyBindError('192.0.2.1', inUse, HOST_LIST)).toBe('address-unavailable');
+    expect(classifyBindError('192.0.2.1', { code: 'EADDRNOTAVAIL' }, HOST_LIST)).toBe('address-unavailable');
+    expect(classifyBindError('192.0.2.1', new Error('no code at all'), HOST_LIST)).toBe('address-unavailable');
+  });
+
+  test('an address this machine does have, refused as EADDRINUSE, is a busy port', () => {
+    expect(classifyBindError('192.0.2.5', inUse, HOST_LIST)).toBe('in-use');
+  });
+
+  test('an address this machine does have, refused for any other reason, is not a busy port', () => {
+    expect(classifyBindError('192.0.2.5', { code: 'EACCES' }, HOST_LIST)).toBe('address-unavailable');
+    expect(classifyBindError('192.0.2.5', new Error('unlabelled'), HOST_LIST)).toBe('address-unavailable');
+  });
+});
+
+describe('the real Bun.serve failure this fix reads', () => {
+  // The finding the classifier is built on, pinned against the runtime rather than assumed: Bun
+  // (1.3.14) reports code EADDRINUSE, errno 0 and "Is port N in use?" for EADDRNOTAVAIL too, so a
+  // fix that switched on the code alone would fall back on a genuinely busy port and refuse to
+  // start on a fresh machine -- exactly backwards.
+  test('binding an address that is on no interface throws, and the code lies', () => {
+    const local = Object.values(networkInterfaces()).flatMap((addrs) => (addrs ?? []).map((a) => a.address));
+    expect(local).not.toContain('192.0.2.1');
+
+    let thrown: unknown = null;
+    try {
+      Bun.serve({ hostname: '192.0.2.1', port: 0, fetch: () => new Response('never') }).stop(true);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).not.toBeNull();
+    // The lie, in writing. If this ever starts reporting EADDRNOTAVAIL, the classifier still
+    // answers correctly -- it consults the address list first.
+    expect((thrown as { code?: string }).code).toBe('EADDRINUSE');
+
+    expect(classifyBindError('192.0.2.1', thrown, local)).toBe('address-unavailable');
+    expect(chooseBindHost('192.0.2.1', local)).toEqual({ host: '0.0.0.0', fallback: true });
+
+    // And the host the fallback names is one this machine can actually bind.
+    const server = Bun.serve({ hostname: '0.0.0.0', port: 0, fetch: () => new Response('ok') });
+    expect(server.port).toBeGreaterThan(0);
+    server.stop(true);
+  });
+
+  test('the warning names the address and the step that clears it', () => {
+    expect(meshBindFallbackWarning('192.0.2.5')).toBe(
+      'node: mesh address 192.0.2.5 is not on any interface yet -- listening on all interfaces until the mesh is up and the daemon restarts',
+    );
   });
 });

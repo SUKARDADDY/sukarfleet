@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Endpoint file publish/consume + UPnP probe (lane: endpoints).
-// Owns src/endpoints.ts only. Depends solely on the shared layer (types/config/util).
+// Owns src/endpoints.ts only. Depends on the shared layer (types/config/util) and on the platform
+// boundary (platform.ts) for "which OS is this", nothing else.
 
+import { networkInterfaces } from 'node:os';
 import { join } from 'node:path';
+import { currentPlatform } from './platform';
+import type { PlatformId } from './platform';
 import type { EndpointFile, FleetConfig, MachineKey } from './types';
 import { atomicWrite, b64decode, b64encode, canonicalJson, log, nowMs, readJsonFile, run } from './util';
 import type { RunOptions, RunResult } from './util';
@@ -99,6 +103,20 @@ export async function probeWanIp(fetcher: Fetcher = fetch): Promise<string | nul
 }
 
 // --- LAN IP detection ---------------------------------------------------------
+//
+// Two sources for one answer, and they must land on the same address on the same box.
+//
+// Linux asks `ip -json addr` first, because it carries per-address SCOPE: that is how a loopback
+// or link-local address is excluded by what the kernel says it is rather than by pattern-matching
+// the digits. Windows and macOS have no iproute2 -- the first real Windows boot died on
+// `uv_spawn 'ip'` -- so they read node:os networkInterfaces() directly, and a Linux box whose
+// spawn fails falls back to the same reader. The selection rule is re-expressed there against what
+// that API exposes: enumeration order, non-internal, IPv4, not 169.254/16, and never this
+// machine's own mesh address.
+//
+// The mesh address matters because publishing it as `lanIp` would hand every peer a LAN dial
+// candidate pointing at the overlay it is trying to establish. `ip -json addr` does not exclude it
+// either, so both paths take the same exclusion and stay in step.
 
 interface IpAddrInfoEntry {
   family?: string;
@@ -112,8 +130,18 @@ interface IpAddrInterfaceEntry {
   addr_info?: IpAddrInfoEntry[];
 }
 
+// IPv4 addresses that are never somebody's LAN address: 169.254/16 is what a host assigns itself
+// when DHCP fails, and 127/8 is the loopback. On the `ip` path scope already rules both out.
+function isUsableLanIpv4(addr: string, meshIp?: string): boolean {
+  if (addr.length === 0) return false;
+  if (addr.startsWith('169.254.')) return false;
+  if (addr.startsWith('127.')) return false;
+  if (meshIp !== undefined && meshIp.length > 0 && addr === meshIp) return false;
+  return true;
+}
+
 // Exported for direct unit testing against a captured `ip -json addr` fixture string.
-export function parseLanIpFromIpAddrJson(json: string): string | null {
+export function parseLanIpFromIpAddrJson(json: string, meshIp?: string): string | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(json);
@@ -128,6 +156,7 @@ export function parseLanIpFromIpAddrJson(json: string): string | null {
     const addrs = Array.isArray(entry.addr_info) ? entry.addr_info : [];
     for (const a of addrs) {
       if (a && a.family === 'inet' && a.scope === 'global' && typeof a.local === 'string') {
+        if (!isUsableLanIpv4(a.local, meshIp)) continue;
         return a.local;
       }
     }
@@ -135,16 +164,91 @@ export function parseLanIpFromIpAddrJson(json: string): string | null {
   return null;
 }
 
+// The subset of node:os's NetworkInterfaceInfo this needs. Declared structurally so a test can
+// fabricate one without importing node's types, and so `family` accepts both shapes node has
+// shipped ('IPv4' as a string, 4 as a number).
+export interface NetworkInterfaceView {
+  address: string;
+  family: string | number;
+  internal: boolean;
+}
+
+export type InterfacesFn = () => Record<string, NetworkInterfaceView[] | undefined>;
+
+function isIpv4Family(family: string | number): boolean {
+  return family === 'IPv4' || family === 4 || family === 'inet';
+}
+
+// The `ip -json addr` rule, expressed against networkInterfaces(): first non-internal IPv4 that is
+// neither link-local nor this machine's mesh address, in enumeration order.
+export function selectLanIpFromInterfaces(
+  ifaces: Record<string, NetworkInterfaceView[] | undefined>,
+  meshIp?: string,
+): string | null {
+  for (const [name, addrs] of Object.entries(ifaces)) {
+    if (!Array.isArray(addrs)) continue;
+    if (name === 'lo') continue;
+    for (const a of addrs) {
+      if (!a || typeof a.address !== 'string') continue;
+      if (a.internal) continue;
+      if (!isIpv4Family(a.family)) continue;
+      if (!isUsableLanIpv4(a.address, meshIp)) continue;
+      return a.address;
+    }
+  }
+  return null;
+}
+
 type RunFn = (argv: string[], opts?: RunOptions) => Promise<RunResult>;
 
-export async function lanIp(runFn: RunFn = run): Promise<string | null> {
-  const res = await runFn(['ip', '-json', 'addr'], { timeoutMs: 5000 });
+export interface LanIpOptions {
+  // Defaults to this machine's platform. Injected by tests to exercise the other path.
+  platform?: PlatformId;
+  interfaces?: InterfacesFn;
+  // This machine's overlay address (cfg.meshIp), excluded from the candidates when known.
+  meshIp?: string;
+}
+
+// One line the first time iproute2 turns out to be missing or broken, not one per republish: this
+// runs at startup and again after every suspend/resume, and a repeated identical warning is how a
+// real signal gets trained out of the log.
+let lanIpFallbackWarned = false;
+
+function warnFallbackOnce(reason: string, detail: Record<string, unknown>): void {
+  if (lanIpFallbackWarned) return;
+  lanIpFallbackWarned = true;
+  log('warn', 'lanIp: falling back to node:os networkInterfaces()', { reason, ...detail });
+}
+
+export async function lanIp(runFn: RunFn = run, opts: LanIpOptions = {}): Promise<string | null> {
+  const platform = opts.platform ?? currentPlatform();
+  const readInterfaces: InterfacesFn = opts.interfaces ?? (networkInterfaces as unknown as InterfacesFn);
+
+  const fromInterfaces = (): string | null => {
+    const ip = selectLanIpFromInterfaces(readInterfaces(), opts.meshIp);
+    if (ip === null) log('warn', 'lanIp: no primary LAN IPv4 address found', { source: 'networkInterfaces' });
+    return ip;
+  };
+
+  // iproute2 is Linux-only. Spawning it anywhere else buys an ENOENT, not an address.
+  if (platform !== 'linux') return fromInterfaces();
+
+  let res: RunResult;
+  try {
+    res = await runFn(['ip', '-json', 'addr'], { timeoutMs: 5000 });
+  } catch (err) {
+    // Bun.spawn throws when the binary is absent -- the failure mode that kept the endpoint file
+    // from ever being published rather than merely leaving it stale.
+    warnFallbackOnce('ip -json addr could not be spawned', { error: String(err) });
+    return fromInterfaces();
+  }
   if (res.code !== 0) {
     log('warn', 'lanIp: ip -json addr failed', { code: res.code, stderr: res.stderr });
-    return null;
+    warnFallbackOnce('ip -json addr exited non-zero', { code: res.code });
+    return fromInterfaces();
   }
-  const ip = parseLanIpFromIpAddrJson(res.stdout);
-  if (ip === null) log('warn', 'lanIp: no primary LAN IPv4 address found');
+  const ip = parseLanIpFromIpAddrJson(res.stdout, opts.meshIp);
+  if (ip === null) log('warn', 'lanIp: no primary LAN IPv4 address found', { source: 'ip -json addr' });
   return ip;
 }
 
@@ -225,6 +329,17 @@ export async function publishEndpointFile(
   deps: PublishEndpointDeps,
 ): Promise<PublishEndpointResult> {
   const runFn = deps.runFn ?? run;
+  // The caller discovers its LAN address before it has a reason to mention cfg, so lanIp() is
+  // usually asked without a mesh address to exclude. On a platform that answers from
+  // networkInterfaces() the overlay adapter is just another non-internal IPv4, so it can win.
+  // Publishing it would hand every peer a LAN dial candidate pointing at the overlay they are
+  // still trying to establish, so say so plainly rather than shipping it silently.
+  if (cfg.meshIp.length > 0 && deps.lanIp === cfg.meshIp) {
+    log('warn', 'publishEndpointFile: LAN address equals this machine mesh address', {
+      machine: cfg.machine,
+      lanIp: deps.lanIp,
+    });
+  }
   const tsMs = deps.nowMs ?? nowMs();
   const ports = deps.ports ?? { udp: cfg.wan.udpPort, tcp: cfg.wan.tcpPort };
   const newFile = await buildEndpointFile(cfg, key, deps.wanIp, deps.lanIp, tsMs, ports);

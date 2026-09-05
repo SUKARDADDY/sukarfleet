@@ -416,6 +416,12 @@ export interface UiSetupState {
   meshSecret: MeshSecretState;
   credential: boolean;
   paired: boolean;
+  // True when this daemon asked for cfg.meshIp and could not have it: the address is not on
+  // any interface yet, so the peer-facing server fell back to 0.0.0.0. That is the state every
+  // machine is in between the Identity card and the sudo step, and the console says so on the
+  // Mesh card. Optional because a console can be talking to a daemon older than this field, and
+  // absent has to read as "no fallback" rather than as one.
+  meshBindFallback?: boolean;
   // The one root step, built by elevatedInstallCommand() in uiserve.ts from this
   // daemon's own checkout and state directory. The console prints it verbatim
   // rather than composing a path of its own: a printed command that names a

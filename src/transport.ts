@@ -3,8 +3,10 @@
 // per-peer rx/tx wedge detection, and suspend/resume-aware clock vetting.
 
 import type { FleetConfig } from './types';
+import type { RunResult } from './util';
 import { clockDriftMs, log, run } from './util';
-import { serviceManagerFor } from './platform';
+import { clockSyncProbeFor, currentPlatform, serviceManagerFor } from './platform';
+import type { ClockSyncState, PlatformId } from './platform';
 
 // ---------------------------------------------------------------------------
 // TOML generation (pure)
@@ -214,6 +216,19 @@ export class Transport {
     this.runner = deps.runner ?? run;
   }
 
+  // easytier-cli may simply not be there -- a fresh Windows machine that has not installed the
+  // mesh yet is the ordinary case -- and Bun.spawn raises ENOENT rather than returning an exit
+  // code. Every poll below documents that it never throws, so the absent binary has to arrive as
+  // the failure it is: a non-zero result whose stderr names the reason, handled by the same branch
+  // that already handles a CLI which ran and refused.
+  private async runCli(argv: string[], timeoutMs: number): Promise<RunResult> {
+    try {
+      return await this.runner(argv, { timeoutMs });
+    } catch (err) {
+      return { code: 127, stdout: '', stderr: `could not run ${argv[0]}: ${String(err)}` };
+    }
+  }
+
   // Polls the loopback RPC portal with two commands (real v2.6.4 interface,
   // verified on the installed binary): `-o json peer list` for peer presence
   // (its rx/tx values are humanized display strings, useless as counters) and
@@ -222,7 +237,7 @@ export class Transport {
   // cannot trust; never throws.
   async pollOnce(nowMs: number): Promise<PeerSample[] | null> {
     const base = [this.cfg.easytier.cliPath, '-p', this.cfg.easytier.rpcAddr, '-o', 'json'];
-    const res = await this.runner([...base, 'peer', 'list'], { timeoutMs: 30000 });
+    const res = await this.runCli([...base, 'peer', 'list'], 30000);
     if (res.code !== 0) {
       log('warn', 'transport: easytier-cli peer poll failed', { code: res.code, stderr: res.stderr.slice(0, 500) });
       this.recordPoll(nowMs, false, 0);
@@ -297,7 +312,7 @@ export class Transport {
   // throws and never blocks a poll: an unreadable connector list leaves the
   // diagnosis null (unknown), which reads as "no opinion", not as "healthy".
   private async refreshDiagnosis(base: string[], nonLocalPeerCount: number): Promise<void> {
-    const res = await this.runner([...base, 'connector', 'list'], { timeoutMs: 30000 });
+    const res = await this.runCli([...base, 'connector', 'list'], 30000);
     if (res.code !== 0) {
       log('warn', 'transport: easytier-cli connector poll failed', { code: res.code, stderr: res.stderr.slice(0, 500) });
       this.lastDiagnosis = null;
@@ -332,7 +347,7 @@ export class Transport {
 
   // Sums traffic_bytes_rx + traffic_bytes_tx from `easytier-cli stats`.
   private async readStatsTotal(base: string[]): Promise<number | null> {
-    const res = await this.runner([...base, 'stats'], { timeoutMs: 30000 });
+    const res = await this.runCli([...base, 'stats'], 30000);
     if (res.code !== 0) {
       log('warn', 'transport: easytier-cli stats poll failed', { code: res.code, stderr: res.stderr.slice(0, 500) });
       return null;
@@ -425,6 +440,8 @@ export class Transport {
 
 export interface ClockSentinelDeps {
   runner?: typeof run;
+  // Which platform's time client to ask. Defaults to this machine's; injected by tests.
+  platform?: PlatformId;
   now?: () => number;
   monotonicNs?: () => number;
   onResume?: () => void | Promise<void>;
@@ -451,6 +468,7 @@ export class ClockSentinel {
   private baselineMonoNs: number;
   private baselineWallMs: number;
   private vetted = false;
+  private lastClockState: ClockSyncState | null = null;
   private peerOffsets: PeerOffsetSample[] = [];
 
   constructor(
@@ -478,12 +496,34 @@ export class ClockSentinel {
     return true;
   }
 
+  // Asks the platform's own time client, through the seam in platform.ts. The probe never throws:
+  // an absent or failing client is 'unknown', which is not vetted but is a different fact from a
+  // clock the client says is wrong. Only 'synced' vets, so Windows and macOS run the daemon,
+  // gossip and sync what they can, and hold auto-commit with the reason on the record.
   async vet(): Promise<boolean> {
     const runner = this.deps.runner ?? run;
-    const res = await runner(['timedatectl', 'show', '-p', 'NTPSynchronized', '--value'], { timeoutMs: 10000 });
-    const ntpOk = res.code === 0 && res.stdout.trim() === 'yes';
-    this.vetted = ntpOk && !this.peerSkewFlagged();
+    const probe = clockSyncProbeFor(this.deps.platform ?? currentPlatform());
+    const state = await probe.probe((argv, opts) => runner(argv, { timeoutMs: opts?.timeoutMs ?? 10000 }));
+    // One line per transition, not one per poll: vet() re-runs on every sync cycle while the clock
+    // is unvetted, and a warning repeated every two minutes is how a real signal gets ignored.
+    if (state !== this.lastClockState) {
+      if (state !== 'synced') {
+        log('warn', 'transport: clock not vetted by the platform time client', {
+          platform: probe.platform,
+          support: probe.support,
+          state,
+        });
+      }
+      this.lastClockState = state;
+    }
+    this.vetted = state === 'synced' && !this.peerSkewFlagged();
     return this.vetted;
+  }
+
+  // What the last vet() actually learned, for callers that want to tell "the clock is wrong" apart
+  // from "no time client answered". Null until vet() has run once.
+  clockSyncState(): ClockSyncState | null {
+    return this.lastClockState;
   }
 
   // Peer-reported presence clockMs, cross-checked against this machine's own

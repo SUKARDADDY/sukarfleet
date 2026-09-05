@@ -97,9 +97,22 @@ The installer is [`install/windows/`](../install/windows/README.md): double-clic
 `Add-To-Fleet.cmd`. It writes `admin.enabled: false` rather than leaving a lane switched on that
 refuses at the first real call.
 
+The machine key and the other private files the daemon writes rely on the installer's ACL rather
+than on mode bits. `Install-Sukarfleet.ps1` restricts `~/.config/sukarfleet` to your SID and lets
+everything created inside inherit it, which is what NTFS has in place of `0600`. The daemon
+therefore does not consult mode on Windows at all: NTFS reports `0666` for every file and `chmod`
+is a no-op, so enforcing `0600` there would refuse every start rather than protect anything. It
+logs the substitution once per file at load and carries on. The credential store is the one place
+that still refuses.
+
 Also note the store-privacy probe will typically report that mode is **not** enforced on NTFS,
 because NTFS carries ACLs rather than POSIX mode bits. That is an honest answer, and the admin lane
 refuses on it rather than storing a credential whose privacy it cannot demonstrate.
+
+Two Linux tools the daemon used to reach for are simply absent here, so it reads its LAN address
+from `node:os` rather than `ip -json addr` and vets its clock with `w32tm /query /status` rather
+than `timedatectl`, reporting a stopped or unreadable time service as unknown, which holds
+auto-commit and logs the reason instead of stopping the daemon.
 
 ### Anything else — unsupported
 

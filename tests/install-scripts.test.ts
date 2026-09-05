@@ -144,6 +144,44 @@ describe('the staged file is refused unless it is what it claims to be', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The restart that ends the elevated stage
+// ---------------------------------------------------------------------------
+//
+// The deadlock this closes, seen on a fresh Ubuntu 24.04 VM: the Identity card writes meshIp, the
+// console restarts the daemon, and the daemon comes back before EasyTier exists -- so the mesh
+// address is on no interface. Until this stage brings the mesh up, the node cannot bind that
+// address; after it does, nothing was telling the node to try again, and it went on listening on
+// every interface until a reboot.
+
+describe('the elevated stage restarts the node once the mesh address exists', () => {
+  test('it restarts the invoking user own systemd user unit, through their runtime dir', async () => {
+    const run = await elevated();
+    expect(run.code).toBe(0);
+    const uid = process.getuid?.() ?? 0;
+    const user = process.env.USER ?? 'nobody';
+    // Root's `systemctl --user` is root's own manager, so the restart has to be run AS the user,
+    // with the runtime dir their manager is addressed through.
+    expect(run.output).toContain(
+      `runuser -u ${user} -- env XDG_RUNTIME_DIR=/run/user/${uid} systemctl --user restart sukarfleet.service`,
+    );
+  });
+
+  test('the restart comes after the mesh service, not before it', async () => {
+    const run = await elevated();
+    const mesh = run.output.indexOf('easytier-fleet.service');
+    const restart = run.output.indexOf('systemctl --user restart sukarfleet.service');
+    expect(mesh).toBeGreaterThan(-1);
+    expect(restart).toBeGreaterThan(mesh);
+  });
+
+  test('--no-easytier does not restart the node: the address still does not exist', async () => {
+    const run = await elevated(['--no-easytier']);
+    expect(run.code).toBe(0);
+    expect(run.output).not.toContain('systemctl --user restart sukarfleet.service');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Values out of the user's own files
 // ---------------------------------------------------------------------------
 //

@@ -9,8 +9,10 @@
 
 import { describe, expect, test } from 'bun:test';
 import {
+  clockSyncProbeFor,
   currentPlatform,
   notificationBackendFor,
+  parseW32tmStatus,
   platformReport,
   serviceManagerFor,
 } from '../src/platform';
@@ -142,5 +144,141 @@ describe('support levels are honest', () => {
       'service-manager',
       'store-privacy-probe',
     ]);
+  });
+});
+
+// Captured `w32tm /query /status` output. The daemon vets its clock before it will auto-commit,
+// and the inline `timedatectl` that used to do it killed the first real Windows boot outright.
+const W32TM_SYNCED = [
+  'Leap Indicator: 0(no warning)',
+  'Stratum: 3 (secondary reference - syncd by (S)NTP)',
+  'Precision: -23 (119.209ns per tick)',
+  'Root Delay: 0.0284932s',
+  'Root Dispersion: 7.7961637s',
+  'ReferenceId: 0x51E1F1EF (source IP:  81.225.241.239)',
+  'Last Successful Sync Time: 9/5/2026 1:12:33 AM',
+  'Source: time.windows.com,0x8',
+  'Poll Interval: 10 (1024s)',
+  '',
+].join('\r\n');
+
+const W32TM_UNSYNCED = [
+  'Leap Indicator: 3(not synchronized)',
+  'Stratum: 0 (unspecified)',
+  'Precision: -23 (119.209ns per tick)',
+  'Root Delay: 0.0000000s',
+  'Root Dispersion: 0.0000000s',
+  'ReferenceId: 0x00000000 (unspecified or unavailable)',
+  'Last Successful Sync Time: unspecified',
+  'Source: Local CMOS Clock',
+  'Poll Interval: 10 (1024s)',
+  '',
+].join('\r\n');
+
+// The awkward middle: the leap indicator says all is well about a clock whose only reference is
+// the machine's own hardware. Nothing outside this box has ever checked it.
+const W32TM_LOCAL_SOURCE = [
+  'Leap Indicator: 0(no warning)',
+  'Stratum: 1 (primary reference - syncd by radio clock)',
+  'Source: Local CMOS Clock',
+  'Poll Interval: 10 (1024s)',
+  '',
+].join('\r\n');
+
+const W32TM_SERVICE_STOPPED =
+  'The following error occurred: The service has not been started. (0x80070426)\r\n';
+
+describe('w32tm status parsing', () => {
+  test('a clock synchronised to a real time server reads as synced', () => {
+    expect(parseW32tmStatus(W32TM_SYNCED)).toBe('synced');
+  });
+
+  test('leap indicator 3 reads as unsynced', () => {
+    expect(parseW32tmStatus(W32TM_UNSYNCED)).toBe('unsynced');
+  });
+
+  test('a no-warning clock whose only source is its own hardware is NOT synced', () => {
+    expect(parseW32tmStatus(W32TM_LOCAL_SOURCE)).toBe('unsynced');
+  });
+
+  test('output this parser does not understand is unknown, never a verdict', () => {
+    expect(parseW32tmStatus(W32TM_SERVICE_STOPPED)).toBe('unknown');
+    expect(parseW32tmStatus('')).toBe('unknown');
+    // Localised Windows: the labels are translated and nothing matches.
+    expect(parseW32tmStatus('Anzeige für Schaltsekunde: 0(keine Warnung)\r\nQuelle: time.windows.com')).toBe(
+      'unknown',
+    );
+    // A leap indicator with no Source line proves only half of it.
+    expect(parseW32tmStatus('Leap Indicator: 0(no warning)\r\nStratum: 3')).toBe('unknown');
+  });
+});
+
+describe('clock sync probe', () => {
+  test('linux asks timedatectl and maps yes/no/anything-else', async () => {
+    const probe = clockSyncProbeFor('linux');
+    const calls: string[][] = [];
+    const runner = (out: string, code = 0): Runner => async (argv) => {
+      calls.push(argv);
+      return { code, stdout: out, stderr: '' };
+    };
+    expect(await probe.probe(runner('yes\n'))).toBe('synced');
+    expect(await probe.probe(runner('no\n'))).toBe('unsynced');
+    expect(await probe.probe(runner('', 1))).toBe('unknown');
+    expect(calls[0]).toEqual(['timedatectl', 'show', '-p', 'NTPSynchronized', '--value']);
+  });
+
+  test('windows asks w32tm and parses its status', async () => {
+    const probe = clockSyncProbeFor('windows');
+    const calls: string[][] = [];
+    const runner: Runner = async (argv) => {
+      calls.push(argv);
+      return { code: 0, stdout: W32TM_SYNCED, stderr: '' };
+    };
+    expect(await probe.probe(runner)).toBe('synced');
+    expect(calls[0]).toEqual(['w32tm', '/query', '/status']);
+  });
+
+  test('a stopped Windows Time service is unknown, not a claim about the clock', async () => {
+    const probe = clockSyncProbeFor('windows');
+    const runner: Runner = async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'The service has not been started. (0x80070426)',
+    });
+    expect(await probe.probe(runner)).toBe('unknown');
+  });
+
+  test('a spawn that throws ENOENT is unknown and NEVER propagates', async () => {
+    // The literal failure from the first real Windows boot: the daemon died on this before it
+    // served a single request.
+    const throwing: Runner = async (argv) => {
+      throw new Error(`ENOENT: no such file or directory, uv_spawn '${argv[0]}'`);
+    };
+    for (const p of ['linux', 'windows'] as const) {
+      expect(await clockSyncProbeFor(p).probe(throwing)).toBe('unknown');
+    }
+  });
+
+  test('macos refuses to guess rather than shipping a probe that answers the wrong question', async () => {
+    const probe = clockSyncProbeFor('macos');
+    expect(probe.support).toBe('unsupported');
+    expect(await probe.probe()).toBe('unknown');
+  });
+
+  test('an unknown platform is unknown, not optimistically synced', async () => {
+    expect(await clockSyncProbeFor('unknown').probe()).toBe('unknown');
+  });
+});
+
+describe('a seam whose tool is absent refuses instead of throwing', () => {
+  test('service manager reports the spawn failure as a failed restart', async () => {
+    const throwing: Runner = async (argv) => {
+      throw new Error(`ENOENT: no such file or directory, uv_spawn '${argv[0]}'`);
+    };
+    for (const p of ['linux', 'macos', 'windows'] as const) {
+      const res = await serviceManagerFor(p).restart('easytier-fleet.service', throwing);
+      expect(res.ok).toBe(false);
+      expect(res.detail).toContain('127');
+    }
   });
 });

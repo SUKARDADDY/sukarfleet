@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   buildAuthHeader,
+  enforcePrivateMode,
   loadOrCreateMachineKey,
   publicKeyFingerprint,
   signCanonical,
@@ -360,5 +361,123 @@ describe('publicKeyFingerprint', () => {
     await rm(otherDir, { recursive: true, force: true });
 
     expect(publicKeyFingerprint(key.publicKeyJwk)).not.toBe(publicKeyFingerprint(otherKey.publicKeyJwk));
+  });
+});
+
+// The permission rule for the machine key file, on both sides of the platform boundary. The
+// Windows half is the first real Windows run's defect: NTFS reports 0666 for every file and
+// chmod is a no-op there, so the POSIX rule could only ever refuse and the daemon never started.
+// The platform is injected through the opts seam rather than by mutating process.platform, so
+// these run identically on any host.
+describe('machine key file permissions', () => {
+  function captureLogs(): { lines: Record<string, unknown>[]; restore: () => void } {
+    const lines: Record<string, unknown>[] = [];
+    const real = console.log;
+    console.log = (...args: unknown[]): void => {
+      try {
+        lines.push(JSON.parse(args.map(String).join(' ')) as Record<string, unknown>);
+      } catch {
+        // non-JSON console output, not a log() line -- ignore
+      }
+    };
+    return { lines, restore: () => { console.log = real; } };
+  }
+
+  async function writeKeyFileAt(mode: number): Promise<{ path: string; key: MachineKey }> {
+    const key = await freshKey('alpha');
+    const path = keyPathIn(tempDir);
+    await chmod(path, mode);
+    return { path, key };
+  }
+
+  test('POSIX: corrects a widened key file back to 0600 and loads it', async () => {
+    const { path, key } = await writeKeyFileAt(0o644);
+    const cap = captureLogs();
+    let loaded: MachineKey;
+    try {
+      loaded = await loadOrCreateMachineKey('alpha', { keyPath: path, platform: 'linux' });
+    } finally {
+      cap.restore();
+    }
+
+    expect(loaded).toEqual(key);
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    expect(cap.lines.some((l) => String(l.msg).includes('permissions are not 0600'))).toBe(true);
+    expect(cap.lines.some((l) => String(l.msg).includes('NTFS carries ACLs'))).toBe(false);
+  });
+
+  test('POSIX: refuses to load when the correction does not stick', async () => {
+    const { path } = await writeKeyFileAt(0o644);
+    // A chmod that reports success and changes nothing is exactly what a mode-blind filesystem
+    // does, and is the only way to reach the refusal from a real ext4 temp dir.
+    await expect(
+      enforcePrivateMode(path, { platform: 'linux', chmodFile: async () => {} }),
+    ).rejects.toThrow(/still has insecure permissions \(644\) after chmod 0600; refusing to load/);
+    await chmod(path, 0o600);
+  });
+
+  test('POSIX: refuses to load when the correction itself fails', async () => {
+    const { path } = await writeKeyFileAt(0o644);
+    await expect(
+      enforcePrivateMode(path, {
+        platform: 'linux',
+        chmodFile: async () => { throw new Error('EROFS: read-only file system'); },
+      }),
+    ).rejects.toThrow(/has insecure permissions \(644\) and could not be corrected to 0600/);
+    await chmod(path, 0o600);
+  });
+
+  test('POSIX: reports the mode as enforced for a key file already at 0600', async () => {
+    const { path } = await writeKeyFileAt(0o600);
+    expect(await enforcePrivateMode(path, { platform: 'linux' })).toBe('enforced');
+  });
+
+  test('Windows: loads a key file whose mode is not 0600 instead of refusing', async () => {
+    const { path, key } = await writeKeyFileAt(0o666); // what NTFS reports for every file
+    const cap = captureLogs();
+    let loaded: MachineKey;
+    try {
+      loaded = await loadOrCreateMachineKey('alpha', { keyPath: path, platform: 'windows' });
+    } finally {
+      cap.restore();
+    }
+
+    expect(loaded).toEqual(key);
+    const acl = cap.lines.filter((l) => String(l.msg).includes('NTFS carries ACLs'));
+    expect(acl.length).toBe(1);
+    expect(String(acl[0]?.msg)).toBe(
+      `keys: NTFS carries ACLs rather than mode bits; relying on the installer's ACL for ${path}`,
+    );
+    expect(acl[0]?.level).toBe('warn');
+    expect(cap.lines.some((l) => String(l.msg).includes('permissions are not 0600'))).toBe(false);
+    await chmod(path, 0o600);
+  });
+
+  test('Windows: the ACL notice is logged once per path, not once per load', async () => {
+    const { path } = await writeKeyFileAt(0o666);
+    const cap = captureLogs();
+    try {
+      await loadOrCreateMachineKey('alpha', { keyPath: path, platform: 'windows' });
+      await loadOrCreateMachineKey('alpha', { keyPath: path, platform: 'windows' });
+      await loadOrCreateMachineKey('alpha', { keyPath: path, platform: 'windows' });
+    } finally {
+      cap.restore();
+    }
+
+    expect(cap.lines.filter((l) => String(l.msg).includes('NTFS carries ACLs')).length).toBe(1);
+    await chmod(path, 0o600);
+  });
+
+  test('Windows: reports the mode as not enforced and never chmods', async () => {
+    const { path } = await writeKeyFileAt(0o666);
+    let chmodCalls = 0;
+    const outcome = await enforcePrivateMode(path, {
+      platform: 'windows',
+      chmodFile: async () => { chmodCalls += 1; },
+    });
+    expect(outcome).toBe('not-enforced');
+    expect(chmodCalls).toBe(0);
+    expect((await stat(path)).mode & 0o777).toBe(0o666);
+    await chmod(path, 0o600);
   });
 });
