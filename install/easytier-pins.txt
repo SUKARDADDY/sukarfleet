@@ -19,7 +19,7 @@
 # the web console URL instead, and install-elevated refuses an EasyTier line it
 # cannot verify. An unverified download is worse than no download.
 #
-# The tray lines below may also read 326fab24863553705fb0752dd01fd29ec11d18fba9b125f4c747c2794303cd4a, which quickstart
+# The tray lines below may also read SHA256-FILLED-AT-RELEASE, which quickstart
 # treats exactly like TODO-S9. It is a tray-only token, and the tray section
 # explains why it is spelled differently. The EasyTier lines are pinned against
 # upstream releases that already exist, so they never need it.
@@ -41,7 +41,7 @@
 # which defaults to this project's GitHub release for the tag being installed.
 # The version column is the sukarfleet release tag without its leading 'v'.
 #
-# x86_64 reads 326fab24863553705fb0752dd01fd29ec11d18fba9b125f4c747c2794303cd4a because the binary is built from this
+# x86_64 reads SHA256-FILLED-AT-RELEASE because the binary is built from this
 # tree: its hash cannot exist until the tag does. The release process replaces
 # that one token with the hash of the asset it uploaded. Until then the
 # placeholder behaves exactly like TODO-S9 -- nothing is fetched, quickstart
