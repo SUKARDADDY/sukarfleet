@@ -447,6 +447,7 @@ function uiDeps(ctx: NodeCtx): UiRoutesDeps {
           runTimeoutSec: ctx.cfg.admin.runTimeoutSec,
           maxRunTimeoutSec: ctx.cfg.admin.maxRunTimeoutSec,
           ratePerMin: ctx.cfg.admin.ratePerMin,
+          uiAssets: ctx.cfg.admin.uiAssets ?? true,
         },
         setup: {
           complete: ctx.cfg.peers.length > 0,

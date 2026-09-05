@@ -54,6 +54,9 @@ export function defaultConfig(machine: string): FleetConfig {
       udpPort: null,
       tcpPort: null,
     },
+    notifications: {
+      os: true,
+    },
     fleetRepoPath: join(stateDir(), 'fleet-repo'),
     mcpPort: 7719,
     intervals: {
@@ -92,6 +95,7 @@ export function defaultConfig(machine: string): FleetConfig {
       maxOutputBytes: 262144,
       ratePerMin: 20,
       uiEnabled: true,
+      uiAssets: true,
     },
   };
 }
@@ -167,6 +171,9 @@ function mergeDefaults(raw: Record<string, unknown>, base: FleetConfig): FleetCo
   const easytier = isPlainObject(raw.easytier) ? { ...base.easytier, ...raw.easytier } : base.easytier;
   const intervals = isPlainObject(raw.intervals) ? { ...base.intervals, ...raw.intervals } : base.intervals;
   const thresholds = isPlainObject(raw.thresholds) ? { ...base.thresholds, ...raw.thresholds } : base.thresholds;
+  const notifications = isPlainObject(raw.notifications)
+    ? { ...base.notifications, ...raw.notifications }
+    : base.notifications;
 
   const migrated = migrateLegacyExecBlock(raw, base);
 
@@ -183,6 +190,7 @@ function mergeDefaults(raw: Record<string, unknown>, base: FleetConfig): FleetCo
     easytier: easytier as FleetConfig['easytier'],
     intervals: intervals as FleetConfig['intervals'],
     thresholds: thresholds as FleetConfig['thresholds'],
+    notifications: notifications as FleetConfig['notifications'],
     mcpPort: migrated.mcpPort,
     admin: admin as FleetConfig['admin'],
   } as FleetConfig;
@@ -274,6 +282,9 @@ function validate(cfg: FleetConfig): void {
     }
   }
 
+  if (!isPlainObject(cfg.notifications)) fail('notifications must be an object');
+  if (typeof cfg.notifications.os !== 'boolean') fail('notifications.os must be a boolean');
+
   const iv = cfg.intervals as unknown;
   if (!isPlainObject(iv)) fail('intervals must be an object');
   for (const k of ['gossipSec', 'syncSec', 'watchdogSec', 'transportPollSec'] as const) {
@@ -300,6 +311,11 @@ function validateAdmin(raw: unknown): void {
   const admin = raw as Record<string, unknown>;
   for (const k of ['enabled', 'acceptIncoming', 'allowPlaintextFallback', 'uiEnabled'] as const) {
     if (typeof admin[k] !== 'boolean') fail(`admin.${k} must be a boolean`);
+  }
+  // Optional (P6): absent means "default true", same as every other admin.* field mergeDefaults
+  // fills in -- only a present-but-wrong-typed value is rejected.
+  if (admin.uiAssets !== undefined && typeof admin.uiAssets !== 'boolean') {
+    fail('admin.uiAssets must be a boolean');
   }
   // sshUser may legitimately be empty before the installer fills it in; the origin leg refuses
   // rather than the daemon failing to boot.

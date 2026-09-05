@@ -3,7 +3,7 @@
 // per-peer rx/tx wedge detection, and suspend/resume-aware clock vetting.
 
 import type { FleetConfig } from './types';
-import { log, run } from './util';
+import { clockDriftMs, log, run } from './util';
 import { serviceManagerFor } from './platform';
 
 // ---------------------------------------------------------------------------
@@ -436,7 +436,9 @@ export interface ClockSentinelDeps {
   onEndpointRepublish?: () => void | Promise<void>;
 }
 
-const SUSPEND_JUMP_MS = 60000;
+// Exported for node.ts's watchdogLoop (P4), which grants its own post-resume grace window off the
+// same threshold rather than inventing a second one.
+export const SUSPEND_JUMP_MS = 60000;
 const PEER_OFFSET_WINDOW = 8; // recent readings kept per peer for the median check
 
 interface PeerOffsetSample {
@@ -466,9 +468,7 @@ export class ClockSentinel {
   // passing. Resets the baseline and un-vets the clock either way.
   async check(nowMs: number): Promise<boolean> {
     const monoNs = (this.deps.monotonicNs ?? Bun.nanoseconds)();
-    const monoElapsedMs = (monoNs - this.baselineMonoNs) / 1e6;
-    const wallElapsedMs = nowMs - this.baselineWallMs;
-    const drift = Math.abs(wallElapsedMs - monoElapsedMs);
+    const drift = clockDriftMs(this.baselineMonoNs, this.baselineWallMs, monoNs, nowMs);
     if (drift <= SUSPEND_JUMP_MS) return false;
 
     this.baselineMonoNs = monoNs;

@@ -48,6 +48,12 @@ export interface FleetConfig {
     udpPort: number | null;
     tcpPort: number | null;
   };
+  // Desktop notification duty. Default true (today's behaviour: the daemon notifies directly).
+  // Set os:false to hand notification duty to a client that polls the daemon's fault state itself
+  // (e.g. the tray app), so the two never double-fire. Flat, one field -- same shape as wan/easytier.
+  notifications: {
+    os: boolean;
+  };
   fleetRepoPath: string;
   // Loopback MCP port. Top-level rather than nested: the MCP surface is how an agent reaches the
   // fleet, which is the product's whole point, and it is not part of the admin lane. It previously
@@ -197,7 +203,14 @@ export interface AdminConfig {
   // instead of growing the daemon's heap without bound.
   maxOutputBytes: number;
   ratePerMin: number;
+  // uiEnabled:false is the pre-P6 switch and keeps its pre-P6 meaning unchanged: the whole surface
+  // (/ui, /ui/*, /api/ui/*) 404s, backward compatibly. uiAssets (P6, default true) is the narrower
+  // one, meaningful only while uiEnabled is true: uiAssets:false 404s just the HTML/asset routes
+  // (/ui, /ui/*) while /api/ui/* and /pair/* keep working, so a native console (which talks only
+  // to the API) can stay reachable on a machine that wants the browser GUI off. Optional so an
+  // on-disk config predating P6 is untouched -- config.ts's mergeDefaults fills the default.
   uiEnabled: boolean;
+  uiAssets?: boolean;
 }
 
 // Every way an admin call can be turned down without executing. Kept as a closed union (unlike
@@ -378,6 +391,10 @@ export interface UiAdminLaneView {
   runTimeoutSec: number;
   maxRunTimeoutSec: number;
   ratePerMin: number;
+  // Class G: additive so a console can tell which mode it's in. Mirrors AdminConfig.uiAssets --
+  // meaningful only while `enabled`/uiEnabled make the lane worth asking about at all, true by
+  // default (config.ts's mergeDefaults fills it, so this is never actually undefined at runtime).
+  uiAssets: boolean;
 }
 
 export type MeshSecretState = 'none' | 'pending' | 'installed';

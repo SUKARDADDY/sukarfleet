@@ -287,6 +287,160 @@ describe('Gossip persistence', () => {
   });
 });
 
+interface LogLine {
+  level: string;
+  msg: string;
+  [k: string]: unknown;
+}
+
+function captureLogs(): { lines: LogLine[]; restore: () => void } {
+  const lines: LogLine[] = [];
+  const real = console.log;
+  console.log = (...args: unknown[]): void => {
+    try {
+      lines.push(JSON.parse(args.map(String).join(' ')));
+    } catch {
+      // non-JSON console output, not a log() line -- ignore
+    }
+  };
+  return { lines, restore: () => { console.log = real; } };
+}
+
+describe('Gossip.broadcastOnce: transition-only logging', () => {
+  function withFetch<T>(impl: typeof fetch, fn: () => Promise<T>): Promise<T> {
+    const real = globalThis.fetch;
+    globalThis.fetch = impl;
+    return fn().finally(() => {
+      globalThis.fetch = real;
+    });
+  }
+
+  test('a thrown fetch: first failure logs info, repeats debounce to debug', async () => {
+    const key = await generateMachineKey('alpha');
+    const peers: PeerConfig[] = [{ name: 'beta', meshIp: '127.0.0.1', nodePort: 7710, publicKeyJwk: null }];
+    const gossip = new Gossip(buildCfg('alpha', peers), key, emptyPayload);
+
+    const { lines, restore } = captureLogs();
+    try {
+      await withFetch(
+        (async () => {
+          throw new Error('ECONNREFUSED');
+        }) as unknown as typeof fetch,
+        async () => {
+          await gossip.broadcastOnce();
+          await gossip.broadcastOnce();
+        },
+      );
+    } finally {
+      restore();
+    }
+
+    const offline = lines.filter((l) => l.msg === 'gossip: peer went offline');
+    expect(offline).toHaveLength(2);
+    expect(offline[0]!.level).toBe('info');
+    expect(offline[1]!.level).toBe('debug');
+  });
+
+  // Class D: a peer that ANSWERS with non-OK is up-but-rejecting, a different failure than
+  // unreachable -- it must warn unconditionally, every tick, never debounced through the offline
+  // TransitionGate (that gate is reserved for the thrown/aborted path below).
+  test('a non-OK response warns unconditionally every tick, never debounced', async () => {
+    const key = await generateMachineKey('alpha');
+    const peers: PeerConfig[] = [{ name: 'beta', meshIp: '127.0.0.1', nodePort: 7710, publicKeyJwk: null }];
+    const gossip = new Gossip(buildCfg('alpha', peers), key, emptyPayload);
+
+    const rejecting = (async () => ({ ok: false, status: 503 }) as Response) as unknown as typeof fetch;
+    const { lines, restore } = captureLogs();
+    try {
+      await withFetch(rejecting, async () => {
+        await gossip.broadcastOnce();
+        await gossip.broadcastOnce();
+        await gossip.broadcastOnce();
+      });
+    } finally {
+      restore();
+    }
+
+    const rejected = lines.filter((l) => l.msg === 'gossip: broadcast rejected by peer');
+    expect(rejected).toHaveLength(3);
+    expect(rejected.every((l) => l.level === 'warn')).toBe(true);
+    expect(rejected.every((l) => l.status === 503)).toBe(true);
+    // Never went through the offline gate at all -- no "peer went offline"/"peer recovered" line.
+    expect(lines.filter((l) => l.msg === 'gossip: peer went offline')).toHaveLength(0);
+    expect(lines.filter((l) => l.msg === 'gossip: peer recovered')).toHaveLength(0);
+  });
+
+  test('a thrown/aborted fetch still uses the offline TransitionGate and pins the error field', async () => {
+    const key = await generateMachineKey('alpha');
+    const peers: PeerConfig[] = [{ name: 'beta', meshIp: '127.0.0.1', nodePort: 7710, publicKeyJwk: null }];
+    const gossip = new Gossip(buildCfg('alpha', peers), key, emptyPayload);
+
+    const throwing = (async () => {
+      throw new Error('ECONNREFUSED');
+    }) as unknown as typeof fetch;
+    const { lines, restore } = captureLogs();
+    try {
+      await withFetch(throwing, async () => {
+        await gossip.broadcastOnce();
+        await gossip.broadcastOnce();
+      });
+    } finally {
+      restore();
+    }
+
+    const offline = lines.filter((l) => l.msg === 'gossip: peer went offline');
+    expect(offline).toHaveLength(2);
+    expect(offline[0]!.level).toBe('info');
+    expect(offline[0]!.error).toContain('ECONNREFUSED');
+    expect(offline[1]!.level).toBe('debug');
+    expect(offline[1]!.error).toContain('ECONNREFUSED');
+  });
+
+  test('a success after failures logs one "peer recovered" info line, then stays quiet', async () => {
+    const key = await generateMachineKey('alpha');
+    const peers: PeerConfig[] = [{ name: 'beta', meshIp: '127.0.0.1', nodePort: 7710, publicKeyJwk: null }];
+    const gossip = new Gossip(buildCfg('alpha', peers), key, emptyPayload);
+
+    const failing = (async () => {
+      throw new Error('ECONNREFUSED');
+    }) as unknown as typeof fetch;
+    const succeeding = (async () => ({ ok: true, status: 200 }) as Response) as unknown as typeof fetch;
+
+    const { lines, restore } = captureLogs();
+    try {
+      await withFetch(failing, () => gossip.broadcastOnce());
+      await withFetch(succeeding, () => gossip.broadcastOnce());
+      await withFetch(succeeding, () => gossip.broadcastOnce());
+    } finally {
+      restore();
+    }
+
+    expect(lines.filter((l) => l.msg === 'gossip: peer went offline')).toHaveLength(1);
+    const recovered = lines.filter((l) => l.msg === 'gossip: peer recovered');
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]!.level).toBe('info');
+  });
+
+  test('an always-healthy peer never logs a transition line', async () => {
+    const key = await generateMachineKey('alpha');
+    const peers: PeerConfig[] = [{ name: 'beta', meshIp: '127.0.0.1', nodePort: 7710, publicKeyJwk: null }];
+    const gossip = new Gossip(buildCfg('alpha', peers), key, emptyPayload);
+
+    const succeeding = (async () => ({ ok: true, status: 200 }) as Response) as unknown as typeof fetch;
+    const { lines, restore } = captureLogs();
+    try {
+      await withFetch(succeeding, async () => {
+        await gossip.broadcastOnce();
+        await gossip.broadcastOnce();
+      });
+    } finally {
+      restore();
+    }
+
+    expect(lines.filter((l) => l.msg.startsWith('gossip: peer'))).toHaveLength(0);
+  });
+});
+
 describe('Gossip degrades gracefully without src/keys.ts', () => {
   test('src/keys.ts does not exist yet in this lane; module still loads and signs/verifies', async () => {
     let keysExists = true;

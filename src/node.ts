@@ -14,16 +14,17 @@ import type {
   PresencePayload,
   PresenceRepoStat,
   PeerView,
+  UiAdminLaneView,
   UiState,
 } from './types';
 import { expandHome, loadConfig, patchConfig, persistLegacyMigration, stateDir } from './config';
-import { atomicWrite, log, nowMs, run, sdNotify, readJsonFile } from './util';
+import { atomicWrite, clockDriftMs, log, nowMs, run, sdNotify, readJsonFile } from './util';
 
 import { buildAuthHeader, loadOrCreateMachineKey, writeSecretFile } from './keys';
 import { Gossip } from './gossip';
 import { Syncer } from './syncer';
 import { Health, type HealthSelf } from './health';
-import { Transport, ClockSentinel } from './transport';
+import { Transport, ClockSentinel, SUSPEND_JUMP_MS } from './transport';
 import * as endpoints from './endpoints';
 import * as derive from './derive';
 import * as gitserve from './gitserve';
@@ -187,6 +188,96 @@ export function isLoopFresh(nowMsVal: number, lastOkMs: number, windowMs: number
   return nowMsVal - lastOkMs < windowMs;
 }
 
+// P3 single-pusher takeover streak threshold: a roamer needs this many CONSECUTIVE syncLoop ticks
+// of anchorDaemonOnline === false before it takes over pushing derive's derived main. Exported so
+// tests IMPORT it rather than re-hardcoding the number the gate actually checks.
+export const TAKEOVER_STREAK = 2;
+
+// P3 single-pusher policy (Class A fix). Previously this gate read transport.anchorReachable() --
+// the EasyTier PEER TABLE, a different systemd unit than the anchor's node daemon. That mismatch
+// had two failure modes, both landing on "the fleet loses its single pusher": (1) the anchor
+// daemon dies while the mesh stays up -- the roamer still sees the anchor in the peer table, reads
+// reachable, and nobody ever pushes for the whole outage; (2) a roamer whose anchorReachable()
+// never has a trusted sighting to report (zero configured peers, or an easytier CLI poll that
+// never succeeds) reads null forever, which the old gate treated as "don't take over" forever too.
+//
+// The fix keys the gate on the anchor DAEMON's own heartbeat instead: gossip.getPeerViews' `online`
+// is true only when a signed envelope from that peer arrived within gossipSec x peerOfflineFactor
+// -- direct evidence the daemon process itself is alive and broadcasting, not merely that the mesh
+// transport can see a peer. transport.anchorReachable() is left untouched (health.ts still reads
+// it for the separate anchor-unreachable alarm); this gate no longer consults it at all.
+//
+// anchorDaemonOnline is `null` only when this machine has no configured peers at all --
+// anchorDaemonOnlineFromGossip below returns null exactly then, since gossip.getPeerViews always
+// returns one PeerView per configured peer and `online` on each is a plain boolean, never null.
+//
+// KNOWN HONESTY LIMIT (accepted, self-healing): a roamer that takes over on this signal may push
+// its own last-fetched (possibly stale) refs if the mesh itself is also down -- the daemon
+// heartbeat and the transport are different failure axes, and this gate only observes the former.
+// A subsequent successful fetch/merge cycle corrects it; there is no dual-pusher risk either way,
+// since a stale push is still exactly one push.
+export function shouldPushThisTick(
+  role: 'anchor' | 'roamer',
+  anchorDaemonOnline: boolean | null,
+  streak: number,
+): boolean {
+  if (role === 'anchor') return true;
+  // No peers configured at all: there is no anchor to defer to, so this solo machine is its own
+  // pusher -- restores the pre-P3 behavior for that shape of config.
+  if (anchorDaemonOnline === null) return true;
+  return anchorDaemonOnline === false && streak >= TAKEOVER_STREAK;
+}
+
+// Reads the anchor daemon's liveness the same way transport.ts's anchorReachable() identifies
+// "the anchor": PeerConfig carries no role marker (see types.ts), and the standard hub-and-spoke
+// topology gives a roamer exactly one peer anyway, so "all configured peers offline in gossip" is
+// treated as anchor-down. Returns null (not false) when there are zero configured peers -- see
+// shouldPushThisTick's null case above.
+export function anchorDaemonOnlineFromGossip(views: readonly { online: boolean }[]): boolean | null {
+  if (views.length === 0) return null;
+  return views.some((v) => v.online);
+}
+
+// Roamer-only debounce layered on top of shouldPushThisTick: the roamer only starts pushing once
+// the anchor-daemon-online signal (anchorDaemonOnlineFromGossip, NOT transport.anchorReachable())
+// has read false for two CONSECUTIVE syncLoop ticks (one lost/racy gossip cycle must not flip who
+// pushes), and yields the instant a tick sees anything else -- true or null resets the streak to
+// zero, not just recovery. The anchor never calls this: its push decision never depends on the
+// streak. Exported so tests/node-exec.test.ts can pin the debounce boundary.
+export function nextAnchorDownStreak(prevStreak: number, anchorDaemonOnlineNow: boolean | null): number {
+  return anchorDaemonOnlineNow === false ? prevStreak + 1 : 0;
+}
+
+// P4 watchdog grace-window arithmetic (Class B fix). Pulled out of watchdogLoop's body so the
+// safety-critical part -- deciding whether THIS tick earns a fresh post-resume grace window -- is
+// pure and directly testable, rather than only reachable by driving the live scheduled loop.
+//
+// Grants a fresh window (nowMs + windowMs) ONLY when driftMs is a genuine jump (> SUSPEND_JUMP_MS)
+// AND the previous window has already expired (nowMs >= prevGraceUntilMs). That second condition
+// is the hardening the panel asked for: without it, a suspend/resume cycle that lands WHILE an
+// earlier grace window is still open would extend that window indefinitely -- back-to-back suspend
+// cycles must not add up to continuous grace, since grace exists to cover one resume's catch-up
+// time, not to become a standing exemption from the watchdog. A merely-stale tick (driftMs at or
+// below the threshold) never renews anything, jump or not: the return value is prevGraceUntilMs,
+// byte-identical, so callers can detect "did a grant just happen" with `!==`.
+export function nextWatchdogGrace(prevGraceUntilMs: number, driftMs: number, nowMs: number, windowMs: number): number {
+  if (nowMs < prevGraceUntilMs) return prevGraceUntilMs; // previous window still open: refuse a new grant
+  if (driftMs > SUSPEND_JUMP_MS) return nowMs + windowMs; // fresh jump, no open window: grant
+  return prevGraceUntilMs; // merely stale (including driftMs === SUSPEND_JUMP_MS exactly): unchanged
+}
+
+// P4 watchdog suspend-awareness. Fresh marks always ping. Stale marks still ping while nowMs is
+// inside the one-shot post-resume grace window (graceUntilMs) -- granted once by watchdogLoop when
+// its own tick-to-tick clockDriftMs exceeds SUSPEND_JUMP_MS, and never renewed by a later stale
+// tick, so a real wedge that happens to span a suspend still withholds once the grace expires.
+// graceUntilMs of 0 (the pre-jump default) never satisfies nowMs < graceUntilMs, so a daemon that
+// never suspends behaves exactly as before P4. Exported so tests/node-exec.test.ts can pin every
+// boundary without a live loop.
+export function watchdogShouldPing(gossipFresh: boolean, syncFresh: boolean, nowMsVal: number, graceUntilMs: number): boolean {
+  if (gossipFresh && syncFresh) return true;
+  return nowMsVal < graceUntilMs;
+}
+
 function isLoopback(server: MinimalServer, req: Request): boolean {
   const ip = server.requestIP(req);
   if (!ip) return false; // unix socket / unknown: fail closed
@@ -198,6 +289,45 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { 'content-type': 'application/json' },
   });
+}
+
+// Class G: pulled out of buildUiState's admin object literal so the additive uiAssets field (and
+// the rest of the admin lane view) is directly testable without spinning up the daemon --
+// buildUiState itself is a closure inside main() and cannot be exercised any other way. Pure
+// projection: every input is already resolved by the caller (adminLaneConfigured(), secrets.status,
+// sshAdmin.trust()), so this does no I/O of its own.
+export interface BuildAdminLaneViewArgs {
+  cfg: FleetConfig;
+  configured: boolean;
+  credential: {
+    present: boolean;
+    stale: boolean;
+    sealed: 'tpm2' | 'user' | 'plaintext' | null;
+    setAtMs: number | null;
+  };
+  sshKeyFingerprint: string | null;
+}
+
+export function buildAdminLaneView(args: BuildAdminLaneViewArgs): UiAdminLaneView {
+  const { cfg, configured, credential, sshKeyFingerprint } = args;
+  return {
+    enabled: cfg.admin.enabled,
+    acceptIncoming: cfg.admin.acceptIncoming,
+    uiEnabled: cfg.admin.uiEnabled,
+    configured,
+    credentialPresent: credential.present,
+    credentialStale: credential.stale,
+    credentialSealed: credential.sealed,
+    credentialSetAtMs: credential.setAtMs,
+    sshUser: cfg.admin.sshUser,
+    sshKeyFingerprint,
+    runTimeoutSec: cfg.admin.runTimeoutSec,
+    maxRunTimeoutSec: cfg.admin.maxRunTimeoutSec,
+    ratePerMin: cfg.admin.ratePerMin,
+    // config.ts's mergeDefaults always fills this (default true), so the ?? is defensive only --
+    // a raw FleetConfig built by hand (e.g. in a test) without it still gets the pre-P6 meaning.
+    uiAssets: cfg.admin.uiAssets ?? true,
+  };
 }
 
 // --- Shape guards for the loopback-only CLI-facing exec routes (see fetchHandler below) --------
@@ -254,6 +384,16 @@ async function main(): Promise<void> {
   let syncLoopOkMs = nowMs();
   let lastTransportSummary: unknown = null;
   let lastTransportRestartOk: boolean | null = null;
+  // P3 single-pusher takeover debounce (nextAnchorDownStreak); consulted for the roamer role only,
+  // stays 0 and unused on the anchor.
+  let anchorDownStreak = 0;
+  // P4 watchdog suspend-awareness. watchdogLoop keeps its OWN mono/wall baseline -- deliberately
+  // separate from clockSentinel's, which only resets on a detected jump -- so it always measures
+  // drift since the immediately preceding tick, not since the last resume. graceUntilMs is 0 until
+  // a jump is first detected, so a daemon that never suspends never enters the grace branch below.
+  let watchdogPrevMonoNs = Bun.nanoseconds();
+  let watchdogPrevWallMs = nowMs();
+  let watchdogGraceUntilMs = 0;
 
   // Builds (and, if changed, publishes) this machine's signed endpoint file. Used both
   // at startup and as ClockSentinel's post-resume republish step.
@@ -787,21 +927,12 @@ async function main(): Promise<void> {
         urgency: f.urgency,
         firstSeenMs: f.firstSeenMs,
       })),
-      admin: {
-        enabled: cfg.admin.enabled,
-        acceptIncoming: cfg.admin.acceptIncoming,
-        uiEnabled: cfg.admin.uiEnabled,
+      admin: buildAdminLaneView({
+        cfg,
         configured: await adminLaneConfigured(),
-        credentialPresent: credential.present,
-        credentialStale: credential.stale,
-        credentialSealed: credential.sealed,
-        credentialSetAtMs: credential.setAtMs,
-        sshUser: cfg.admin.sshUser,
+        credential,
         sshKeyFingerprint: trust?.sshKeyFingerprint || null,
-        runTimeoutSec: cfg.admin.runTimeoutSec,
-        maxRunTimeoutSec: cfg.admin.maxRunTimeoutSec,
-        ratePerMin: cfg.admin.ratePerMin,
-      },
+      }),
       setup: {
         complete: identityReady && meshSecret === 'installed' && credentialReady && paired,
         identity: identityReady,
@@ -1149,12 +1280,30 @@ async function main(): Promise<void> {
       }
     }
 
+    // P3 single-pusher policy: one decision per tick, reused for every repo below (the debounce
+    // counts syncLoop ticks, not per-repo calls). Keyed on the anchor daemon's own gossip
+    // heartbeat (Class A fix), never transport.anchorReachable() -- see shouldPushThisTick's
+    // doc comment for why. Read once here so every repo this tick agrees, rather than each racing
+    // a fresh gossip snapshot.
+    const anchorDaemonOnlineNow = anchorDaemonOnlineFromGossip(gossip.getPeerViews(nowMs()));
+    if (cfg.role === 'roamer') anchorDownStreak = nextAnchorDownStreak(anchorDownStreak, anchorDaemonOnlineNow);
+    const push = shouldPushThisTick(cfg.role, anchorDaemonOnlineNow, anchorDownStreak);
+
     for (const repo of cfg.repos) {
       if (!adopted.has(repo.name)) continue; // never sync on main
 
       await syncer.syncOnce(repo);
       try {
-        await derive.updateMain(repo.path);
+        const derived = await derive.updateMain(repo.path, { push });
+        // A fresh sha existed and this machine sat it out -- the durable "who pushes" signal is
+        // the absence of a force-push race, not a log line, so this stays at debug. Skipped for
+        // 'unchanged-inputs': that tick minted nothing, so there was never anything to suppress.
+        if (cfg.role === 'roamer' && derived.skipped === 'push-suppressed-non-owner') {
+          log('debug', 'derive: push suppressed this tick, anchor is the pusher', {
+            repo: repo.name,
+            sha: derived.sha,
+          });
+        }
       } catch (err) {
         log('error', 'derive.updateMain failed', { repo: repo.name, error: String(err) });
       }
@@ -1249,11 +1398,41 @@ async function main(): Promise<void> {
   const watchdogIntervalMs = Math.max(1000, (cfg.intervals.watchdogSec / 3) * 1000);
   const watchdogLoop = scheduleLoop('watchdog', watchdogIntervalMs, async () => {
     const now = nowMs();
-    const gossipFresh = isLoopFresh(now, gossipLoopOkMs, cfg.intervals.watchdogSec * 1000);
     const syncFreshWindowMs = Math.max(cfg.intervals.watchdogSec, cfg.intervals.syncSec * 2.5) * 1000;
+
+    // Suspend/resume detection local to this loop (separate from clockSentinel's -- see the
+    // baseline declarations above): a drift since the PREVIOUS tick beyond SUSPEND_JUMP_MS means
+    // something happened between ticks that wall-clock loop-freshness marks cannot tell apart from
+    // a wedge. Baseline always advances, jump or not, so this always measures since-last-tick.
+    const nowMonoNs = Bun.nanoseconds();
+    const drift = clockDriftMs(watchdogPrevMonoNs, watchdogPrevWallMs, nowMonoNs, now);
+    watchdogPrevMonoNs = nowMonoNs;
+    watchdogPrevWallMs = now;
+    // nextWatchdogGrace (Class B fix) is a no-op unless this tick both crosses SUSPEND_JUMP_MS AND
+    // the previous grant has already expired -- a fresh jump landing mid an already-open window is
+    // refused, not extended, so back-to-back suspend cycles can't add up to continuous grace.
+    const nextGrace = nextWatchdogGrace(watchdogGraceUntilMs, drift, now, syncFreshWindowMs);
+    if (nextGrace !== watchdogGraceUntilMs) {
+      watchdogGraceUntilMs = nextGrace;
+      log('info', 'watchdog: clock jump detected mid-tick, granting post-resume grace', {
+        driftMs: drift,
+        graceUntilMs: watchdogGraceUntilMs,
+      });
+    }
+
+    const gossipFresh = isLoopFresh(now, gossipLoopOkMs, cfg.intervals.watchdogSec * 1000);
     const syncFresh = isLoopFresh(now, syncLoopOkMs, syncFreshWindowMs);
-    if (gossipFresh && syncFresh) {
+    const fresh = gossipFresh && syncFresh;
+
+    if (watchdogShouldPing(gossipFresh, syncFresh, now, watchdogGraceUntilMs)) {
       sdNotify('WATCHDOG=1');
+      if (!fresh) {
+        log('info', 'watchdog: pinging despite stale marks (post-resume grace)', {
+          gossipFresh,
+          syncFresh,
+          graceUntilMs: watchdogGraceUntilMs,
+        });
+      }
     } else {
       log('warn', 'watchdog ping withheld -- a loop is stale or wedged', {
         gossipFresh,

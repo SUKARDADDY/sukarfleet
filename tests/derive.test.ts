@@ -380,6 +380,59 @@ test('union path: postMerge regenerator re-runs over the unioned result', async 
   expect(generated).toContain('BBB');
 });
 
+test('push:false (P3 single-pusher) updates the local ref but never touches origin', async () => {
+  const dir = join(root, 'push-false');
+  await buildBaseRepo(dir);
+  // A REAL local bare origin, not an unreachable URL: an invalid-URL fixture cannot distinguish
+  // "push was suppressed" from "push was attempted and silently failed". Here, if the push leg
+  // ran despite push:false, this bare repo would grow a refs/heads/main; asserting it stays
+  // completely ref-less proves the leg was never reached, not merely that it errored quietly.
+  const originDir = join(root, 'push-false-origin.git');
+  await g(root, ['init', '-q', '--bare', 'push-false-origin.git']);
+  await g(dir, ['remote', 'add', 'origin', originDir]);
+
+  const res = await updateMain(dir, { push: false });
+  expect(res.sha).toBeTruthy();
+  expect(res.pushed).toBe(false);
+  expect(res.skipped).toBe('push-suppressed-non-owner');
+  expect(await g(dir, ['rev-parse', 'refs/sukarfleet/derived-main'])).toBe(res.sha!);
+
+  const mainCheck = await run(['git', 'rev-parse', '--verify', '--quiet', 'refs/heads/main'], {
+    cwd: originDir,
+    env: ENV,
+  });
+  expect(mainCheck.code).not.toBe(0); // still absent -- the push leg was never even reached
+  const originRefs = (await g(originDir, ['for-each-ref', '--format=%(refname)'])).trim();
+  expect(originRefs).toBe(''); // the fresh bare repo has exactly the refs it started with: none
+});
+
+test('push:false skips a second time too, once inputs are unchanged', async () => {
+  const dir = join(root, 'push-false-idem');
+  await buildBaseRepo(dir);
+  await g(dir, ['remote', 'add', 'origin', '/nonexistent/definitely-not-a-repo.git']);
+
+  const first = await updateMain(dir, { push: false });
+  expect(first.skipped).toBe('push-suppressed-non-owner');
+  const second = await updateMain(dir, { push: false });
+  // Idempotence check runs before the push gate, so an unchanged input set reports its own
+  // reason -- 'push-suppressed-non-owner' would be misleading here since nothing was minted.
+  expect(second.skipped).toBe('unchanged-inputs');
+  expect(second.pushed).toBe(false);
+});
+
+test('push:true (explicit) is byte-identical to the default (push omitted) behavior', async () => {
+  const dirDefault = join(root, 'push-default');
+  const dirExplicit = join(root, 'push-explicit');
+  await buildBaseRepo(dirDefault);
+  await buildBaseRepo(dirExplicit);
+
+  const resDefault = await updateMain(dirDefault);
+  const resExplicit = await updateMain(dirExplicit, { push: true });
+  expect(resExplicit.sha).toBe(resDefault.sha);
+  expect(resExplicit.pushed).toBe(resDefault.pushed);
+  expect(resExplicit.skipped).toBe(resDefault.skipped);
+});
+
 test('no sync branches: null sha, skipped', async () => {
   const dir = join(root, 'empty');
   await mkdir(dir, { recursive: true });

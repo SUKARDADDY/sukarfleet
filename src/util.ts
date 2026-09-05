@@ -291,6 +291,18 @@ export function nowMs(): number {
   return Date.now();
 }
 
+// Suspend/resume detector's core math, shared by transport.ts's ClockSentinel and node.ts's
+// watchdogLoop (P4): the absolute divergence between monotonic-elapsed and wall-elapsed time since
+// a baseline. Ordinary elapsed time keeps the two in lockstep; a sleep, hibernate or manual clock
+// change does not, and shows up here as a large gap. Pure and baseline-injected so each caller can
+// keep its own baseline and its own idea of "too much drift" (transport.ts's SUSPEND_JUMP_MS)
+// without sharing state or a clock.
+export function clockDriftMs(baselineMonoNs: number, baselineWallMs: number, nowMonoNs: number, nowWallMs: number): number {
+  const monoElapsedMs = (nowMonoNs - baselineMonoNs) / 1e6;
+  const wallElapsedMs = nowWallMs - baselineWallMs;
+  return Math.abs(wallElapsedMs - monoElapsedMs);
+}
+
 export function b64encode(data: Uint8Array): string {
   return Buffer.from(data).toString('base64');
 }
@@ -301,4 +313,40 @@ export function b64decode(s: string): Uint8Array {
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Per-key latch that turns repeated bad/ok observations into transition events, so a call site can
+// log loud only when a key's state actually flips (first failure, first recovery) and quiet
+// otherwise. Replaces the ad-hoc `warnedOnce` booleans scattered through the daemon with one
+// reusable primitive. Not persisted across restarts: a fresh process starts every key unlatched,
+// same as those booleans did.
+export type TransitionResult = 'entered' | 'still-bad' | 'recovered' | 'still-ok';
+
+export class TransitionGate {
+  private readonly bad = new Set<string>();
+
+  // Records one observation for `key` and reports which of the four transitions it represents:
+  //   'entered'    -- key just went bad (was ok or unseen, now bad)
+  //   'still-bad'  -- key was already bad, still bad
+  //   'recovered'  -- key just went ok (was bad, now ok)
+  //   'still-ok'   -- key was ok or unseen, still ok
+  observe(key: string, isBad: boolean): TransitionResult {
+    const wasBad = this.bad.has(key);
+    if (isBad) {
+      if (wasBad) return 'still-bad';
+      this.bad.add(key);
+      return 'entered';
+    }
+    if (wasBad) {
+      this.bad.delete(key);
+      return 'recovered';
+    }
+    return 'still-ok';
+  }
+
+  // Drops all latch state for `key`, so the next observe() call starts as though the key had
+  // never been seen. For a caller retiring a key entirely (e.g. a peer removed from config).
+  forget(key: string): void {
+    this.bad.delete(key);
+  }
 }

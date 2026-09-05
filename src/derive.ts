@@ -32,6 +32,11 @@ export interface UpdateMainOpts {
   unionPaths?: string[];
   postMerge?: string[][];
   postMergeTimeoutMs?: number;
+  // Single-pusher policy (P3, node.ts's shouldPushDerivedMain): gates ONLY the push leg below.
+  // Default true. The local refs/sukarfleet/derived-main update always runs regardless -- it is
+  // free, and it is what keeps the derived sha diffable across the fleet even on the machine that
+  // is not this cycle's pusher.
+  push?: boolean;
 }
 
 interface Tip {
@@ -481,7 +486,13 @@ export async function updateMain(
   await gitOK(repoPath, ['update-ref', DERIVED_REF, sha]);
 
   let pushed = false;
-  if (await originExists(repoPath)) {
+  let skipped: string | null = null;
+  if (opts.push === false) {
+    // Single-pusher policy: this machine is not this cycle's pusher. The origin remote is never
+    // even consulted -- originExists() would otherwise fire a subprocess for no reason on every
+    // suppressed tick.
+    skipped = 'push-suppressed-non-owner';
+  } else if (await originExists(repoPath)) {
     const r = await git(repoPath, ['push', '--force', 'origin', `${sha}:refs/heads/main`]);
     if (r.code === 0) {
       pushed = true;
@@ -495,5 +506,5 @@ export async function updateMain(
     }
   }
 
-  return { sha, pushed, skipped: null };
+  return { sha, pushed, skipped };
 }
