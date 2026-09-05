@@ -537,7 +537,7 @@ Mesh card says as much once the secret is installed: "Installed. To change the s
 stage again here and re-run the same sudo line." (`ui/app.js`, `clients/tray/src/console.js`).
 
 **An upgrade run** is the same command with a newer tag. Restart discipline here is not the
-installer's to invent: `docs/CUTOVER.md` requires a graceful `systemctl --user stop` and a `git
+installer's to invent: `docs/OPERATIONS.md` requires a graceful `systemctl --user stop` and a `git
 fsck` on every synced repo, because restarting mid-sync is what corrupted repositories on this fleet
 before. An upgrade run that finds configured repos prints that warning and asks for `--restart`
 rather than bouncing the daemon under a sync.

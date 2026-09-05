@@ -660,7 +660,7 @@ fi
 sctl --user daemon-reload || true
 sctl --user enable sukarfleet.service 2>/dev/null || \
   { [ "$DRY_RUN" = "1" ] || warn "systemctl --user enable failed -- starting anyway; the node will not come back after a reboot."; }
-# Restart discipline is not this script's to invent. docs/CUTOVER.md requires a
+# Restart discipline is not this script's to invent. docs/OPERATIONS.md requires a
 # graceful stop and a `git fsck` on every synced repo, because restarting mid-sync
 # is what corrupted repositories on this fleet before. So an upgrade run that
 # finds a live daemon WITH repos configured refuses to bounce it and asks for
@@ -689,7 +689,7 @@ if [ "$DO_RESTART" = "1" ]; then
   log "restarted sukarfleet.service"
 elif [ "$DAEMON_LIVE" = "1" ] && [ "$REPOS_CONFIGURED" = "1" ]; then
   log "sukarfleet.service is already running and this machine has repos configured -- not restarting it."
-  note "  Restarting mid-sync is how repositories get corrupted (docs/CUTOVER.md). The unit on disk"
+  note "  Restarting mid-sync is how repositories get corrupted (docs/OPERATIONS.md). The unit on disk"
   note "  is up to date; when you are ready, re-run with --restart, or:"
   note "      systemctl --user restart sukarfleet.service"
 elif [ "$DAEMON_LIVE" = "1" ]; then
@@ -737,12 +737,18 @@ fi
 # Exit 0 with the line, 1 for no pin, 2 for a pin file that contradicts itself.
 # Two lines for the same (version, arch, asset-prefix) mean nobody knows which
 # SHA256 this machine should trust, and taking the first is how a stale pin
-# outlives the line meant to replace it. A TODO-S9 line never shadows a real
+# outlives the line meant to replace it. An unfilled line never shadows a real
 # one either: the first VALID pin wins, whatever order they sit in.
+#
+# Two tokens mean "not a pin". TODO-S9 is "no such build exists"; the release
+# placeholder is "this build's hash cannot be known until the tag is cut, because
+# the binary is built from this tree". Both are unverifiable, so both are treated
+# the same way here -- the difference is only what they tell a reader.
+PIN_UNFILLED_RE='^(TODO-S9|SHA256-FILLED-AT-RELEASE)$'
 pin_lookup() {
   local prefix="$1" arch="$2"
   [ -f "$PINS_FILE" ] || return 1
-  awk -v p="$prefix" -v a="$arch" '
+  awk -v p="$prefix" -v a="$arch" -v unfilled="$PIN_UNFILLED_RE" '
     /^[[:space:]]*#/ { next }
     NF < 4 { next }
     $2 != a { next }
@@ -751,7 +757,7 @@ pin_lookup() {
       key = $1 SUBSEP $2
       if (key in seen) { dupver = $1; duparch = $2; exit }
       seen[key] = 1
-      if ($3 != "TODO-S9") { if (!haveval) { haveval = 1; valline = $3 " " $4 } }
+      if ($3 !~ unfilled) { if (!haveval) { haveval = 1; valline = $3 " " $4 } }
       else if (!havetodo) { havetodo = 1; todoline = $3 " " $4 }
     }
     END {
@@ -781,10 +787,13 @@ else
     TRAY_REASON="install/easytier-pins.txt has more than one tray pin for $ARCH at the same version, so there is no single SHA256 to trust"
   elif [ -z "$PIN_LINE" ]; then
     TRAY_REASON="no tray pin for $ARCH in install/easytier-pins.txt"
-  elif [ "$TRAY_SHA" = "TODO-S9" ]; then
-    # The honest state before the first release: a pin nobody has computed is not
-    # a pin, and an unverified download is worse than no download.
-    TRAY_REASON="no tray binary has been released yet (its pin in install/easytier-pins.txt is still TODO-S9)"
+  elif printf '%s' "$TRAY_SHA" | grep -Eq "$PIN_UNFILLED_RE"; then
+    # The honest state before the first release, and the honest state of a tree
+    # checked out between a commit and its tag: a pin nobody has computed is not
+    # a pin, and an unverified download is worse than no download. The token is
+    # quoted back so the reason distinguishes "no such build" from "not hashed
+    # yet" without this script having to say which is which.
+    TRAY_REASON="no tray binary has been released yet (its pin in install/easytier-pins.txt is still $TRAY_SHA)"
   elif [ -z "$RELEASE_BASE" ]; then
     TRAY_REASON="no release base to fetch the tray from (set SUKARFLEET_RELEASE_BASE, or install via install/get.sh which sets it)"
   elif [ -x "$TRAY_BIN" ] && [ "$DRY_RUN" != "1" ] && \

@@ -26,8 +26,10 @@ const EXCLUDED_DIRS = new Set(['node_modules', '.git', 'target', 'gen']);
 const EXCLUDED_FILES = new Set(['live-capture.json', 'no-personal-data.test.ts']);
 // .svg because the brand marks and the tray's inline icons are text. .txt and .lock because
 // licence texts and dependency lockfiles are text too, and a lockfile is exactly the sort of
-// generated thing that quietly records a registry URL or a local path.
-const SCANNED_EXTENSIONS = ['.ts', '.js', '.json', '.md', '.sh', '.toml', '.service', '.html', '.css', '.ps1', '.cmd', '.rs', '.py', '.svg', '.txt', '.lock'];
+// generated thing that quietly records a registry URL or a local path. .yml and .yaml because
+// CI workflows are where a runner name, a self-hosted host or a deployment target gets written
+// down, and .github/ was outside this list until the workflows landed.
+const SCANNED_EXTENSIONS = ['.ts', '.js', '.json', '.md', '.sh', '.toml', '.service', '.html', '.css', '.ps1', '.cmd', '.rs', '.py', '.svg', '.txt', '.lock', '.yml', '.yaml'];
 
 // Patterns describing SHAPES of private data, not one person's specifics -- so this keeps working
 // for the next contributor, whose machine is not named the same thing.

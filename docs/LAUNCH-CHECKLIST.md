@@ -1,10 +1,10 @@
 # Launch checklist
 
-Binary items, decided in advance, judged at the end of the timebox. All green means launch. Anything
-red means a concrete reassessment, not a vibe.
+This project's release gate. Binary items, written down before they were judged. All green means the
+release ships. Anything red means a concrete reassessment, not a vibe.
 
-The point of fixing these now is that a checklist written at judging time is a checklist written to
-pass.
+The point of fixing them in advance is that a checklist written at judging time is a checklist
+written to pass.
 
 | # | Item | State |
 |---|------|-------|
@@ -22,8 +22,9 @@ pass.
 
 ## Notes on the ones most likely to be red
 
-**Item 5 (the 14-day soak)** cannot start until cutover does, and cutover cannot start until someone
-runs the gate in [`CUTOVER.md`](CUTOVER.md). It is the single longest pole and nothing shortens it.
+**Item 5 (the 14-day soak)** was the single longest pole and nothing shortened it. It could not
+start until both machines were running this code, and it then had to run for fourteen consecutive
+days without a rollback. The dates are in the row above.
 
 **Item 6 (experimental platforms)** was forced on a Windows 11 VM on 2026-09-05; the refusal and the
 health check are quoted in the table. macOS still has no hardware on this project: "experimental"

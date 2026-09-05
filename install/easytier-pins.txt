@@ -19,6 +19,11 @@
 # the web console URL instead, and install-elevated refuses an EasyTier line it
 # cannot verify. An unverified download is worse than no download.
 #
+# The tray lines below may also read 326fab24863553705fb0752dd01fd29ec11d18fba9b125f4c747c2794303cd4a, which quickstart
+# treats exactly like TODO-S9. It is a tray-only token, and the tray section
+# explains why it is spelled differently. The EasyTier lines are pinned against
+# upstream releases that already exist, so they never need it.
+#
 # The fleet's wire compatibility IS the EasyTier version, so a silent bump is a
 # silent fleet split. Bumping a version here means bumping it on every machine.
 # The Windows installer mirrors these values in its own $MeshHashes table
@@ -34,9 +39,17 @@
 # The native tray console. URL shape:
 #   $SUKARFLEET_RELEASE_BASE/<asset>
 # which defaults to this project's GitHub release for the tag being installed.
-# There is no release yet, so both values are TODO-S9 and no machine installs a
-# tray: quickstart prints the web console URL and the install still succeeds.
-# S9 cuts the tag, uploads the binaries and replaces these two lines. The version
-# column is the sukarfleet release tag without its leading 'v'.
-0.1.0  x86_64   TODO-S9  sukarfleet-tray-linux-x86_64
-0.1.0  aarch64  TODO-S9  sukarfleet-tray-linux-aarch64
+# The version column is the sukarfleet release tag without its leading 'v'.
+#
+# x86_64 reads 326fab24863553705fb0752dd01fd29ec11d18fba9b125f4c747c2794303cd4a because the binary is built from this
+# tree: its hash cannot exist until the tag does. The release process replaces
+# that one token with the hash of the asset it uploaded. Until then the
+# placeholder behaves exactly like TODO-S9 -- nothing is fetched, quickstart
+# prints the web console URL, and the install still succeeds -- so a tree
+# carrying it is installable, just without a tray.
+#
+# aarch64 reads TODO-S9 because there is no aarch64 tray build at all. That is a
+# different sentence from "not hashed yet", and it is why the two tokens are not
+# the same token.
+0.1.0  x86_64   326fab24863553705fb0752dd01fd29ec11d18fba9b125f4c747c2794303cd4a  sukarfleet-tray-linux-x86_64
+0.1.0  aarch64  TODO-S9                   sukarfleet-tray-linux-aarch64
