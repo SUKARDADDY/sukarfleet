@@ -8,6 +8,7 @@ import {
   buildAdminLaneView,
   nextAnchorDownStreak,
   nextWatchdogGrace,
+  pushAllowedForRepo,
   shouldPushThisTick,
   TAKEOVER_STREAK,
   watchdogShouldPing,
@@ -62,6 +63,92 @@ describe('shouldPushThisTick (P3 single-pusher policy, Class A: gossip-keyed tak
   for (const { role, online, streak, want } of cases) {
     test(`role=${role} anchorDaemonOnline=${online} streak=${streak} -> ${want}`, () => {
       expect(shouldPushThisTick(role, online, streak)).toBe(want);
+    });
+  }
+});
+
+describe('pushAllowedForRepo (P3 hardening: a takeover yields to a live pusher, and needs a fresh origin fetch)', () => {
+  test('the anchor is never vetoed, whatever this cycle saw on origin', () => {
+    for (const online of [true, false, null] as const) {
+      for (const originFetchOk of [true, false, null] as const) {
+        for (const moved of [true, false]) {
+          expect(pushAllowedForRepo('anchor', true, online, originFetchOk, moved)).toBe(true);
+        }
+      }
+    }
+  });
+
+  test('a roamer taking over pushes only for a repo whose origin fetch succeeded this cycle', () => {
+    expect(pushAllowedForRepo('roamer', true, false, true, false)).toBe(true);
+    expect(pushAllowedForRepo('roamer', true, false, false, false)).toBe(false);
+    // No origin remote configured: nothing to fetch, nothing to push to, no reason to veto.
+    expect(pushAllowedForRepo('roamer', true, false, null, false)).toBe(true);
+  });
+
+  test('a roamer taking over stands down for a repo whose main moved under another pusher', () => {
+    // The veto that actually bounds two pushers: evidence beats the gossip-derived guess.
+    expect(pushAllowedForRepo('roamer', true, false, true, true)).toBe(false);
+    expect(pushAllowedForRepo('roamer', true, false, null, true)).toBe(false);
+  });
+
+  test('a solo roamer (no configured peers, anchorDaemonOnline=null) is never vetoed -- it took nothing over', () => {
+    for (const originFetchOk of [true, false, null] as const) {
+      for (const moved of [true, false]) {
+        expect(pushAllowedForRepo('roamer', true, null, originFetchOk, moved)).toBe(true);
+      }
+    }
+  });
+
+  test('a roamer pushing while the anchor reads ONLINE is not a takeover, so neither veto applies', () => {
+    for (const originFetchOk of [true, false, null] as const) {
+      for (const moved of [true, false]) {
+        expect(pushAllowedForRepo('roamer', true, true, originFetchOk, moved)).toBe(true);
+      }
+    }
+  });
+
+  test('a push decision of false stays false, so no veto can ever turn a push ON', () => {
+    for (const role of ['anchor', 'roamer'] as const) {
+      for (const online of [true, false, null] as const) {
+        for (const originFetchOk of [true, false, null] as const) {
+          for (const moved of [true, false]) {
+            expect(pushAllowedForRepo(role, false, online, originFetchOk, moved)).toBe(false);
+          }
+        }
+      }
+    }
+  });
+
+  // The real composition: what the sync loop ends up doing for one repo, gate then veto.
+  const composed: Array<{
+    role: 'anchor' | 'roamer';
+    online: boolean | null;
+    streak: number;
+    originFetchOk: boolean | null;
+    moved: boolean;
+    want: boolean;
+  }> = [];
+  for (const role of ['anchor', 'roamer'] as const) {
+    for (const online of [true, false, null] as const) {
+      for (const streak of [0, TAKEOVER_STREAK]) {
+        for (const originFetchOk of [true, false, null] as const) {
+          for (const moved of [true, false]) {
+            const gate = shouldPushThisTick(role, online, streak);
+            // Only a roamer that pushes BECAUSE the anchor read offline is a takeover; that is the
+            // one cell either veto can touch.
+            const takeover = gate && role === 'roamer' && online === false;
+            const vetoed = takeover && (originFetchOk === false || moved);
+            composed.push({ role, online, streak, originFetchOk, moved, want: gate && !vetoed });
+          }
+        }
+      }
+    }
+  }
+  for (const c of composed) {
+    const name = `role=${c.role} online=${c.online} streak=${c.streak} originFetchOk=${c.originFetchOk} moved=${c.moved} -> ${c.want}`;
+    test(name, () => {
+      const gate = shouldPushThisTick(c.role, c.online, c.streak);
+      expect(pushAllowedForRepo(c.role, gate, c.online, c.originFetchOk, c.moved)).toBe(c.want);
     });
   }
 });

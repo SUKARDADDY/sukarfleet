@@ -18,6 +18,27 @@ const AUTHOR_NAME = 'sukarfleet';
 const AUTHOR_EMAIL = 'fleet@sukarfleet.local';
 const SYNC_SEG = '/sync/';
 
+// How many times a refused or failed derived-main push is retried on later ticks before this
+// machine stops asking and waits for the inputs to change. Exported so tests IMPORT the number the
+// retry leg actually checks rather than re-hardcoding it.
+export const MAX_PUSH_RETRIES = 3;
+
+// Per-repo push state carried between ticks, keyed by repo path. Module-level because updateMain is
+// a plain function called once per repo per tick, not an object with a lifetime -- the daemon
+// process is that lifetime. Everything here is a memory of what THIS process did or last saw, and
+// is safe to lose on restart: a fresh process simply re-baselines and retries once more.
+//
+// The push this machine still owes for a repo, with the number of retries already spent on it. Set
+// whenever a push is refused or fails, cleared on a successful push and whenever a new sha is
+// minted (the new sha is what is owed from then on).
+const owedPush = new Map<string, { sha: string; attempts: number }>();
+// The last sha THIS machine put on origin's main, so a later reading of the tracking ref can tell
+// "our own push came back" from "somebody else is pushing".
+const lastPushedSha = new Map<string, string>();
+// The tracking ref as of the previous originMainMovedByOther() call, so a main that simply has not
+// moved is not re-read as a foreign push on every tick.
+const lastSeenOriginMain = new Map<string, string>();
+
 export interface UpdateMainResult {
   sha: string | null;
   pushed: boolean;
@@ -412,6 +433,129 @@ async function originExists(repoPath: string): Promise<boolean> {
   return r.code === 0 && r.stdout.trim().length > 0;
 }
 
+// The lease baseline for the derived-main push: origin's main as this machine last saw it, i.e.
+// the value of the tracking ref refreshed by the syncer's fetch (and by pushDerivedMain below).
+//
+// An absent tracking ref is NOT proof that origin has no main, so it does not lease against the
+// empty string. A repo adopted from a `clone --single-branch -b dev` carries a refspec that only
+// ever fetches dev, so refs/remotes/origin/main stays absent for the life of that clone while
+// origin's main is alive and moving; an empty lease there reads as "main must not exist yet" and
+// would refuse every push forever, where the pre-lease plain --force worked. So when the ref is
+// absent, ask origin directly -- ls-remote answers the same question the lease asks, and comes back
+// empty for an origin that genuinely has no main yet.
+//
+// That fallback is a thinner guarantee than the tracking ref (it is read one round trip before the
+// push instead of at the top of the cycle), and it is deliberately temporary: the first successful
+// push writes the tracking ref, and every push after it leases against the normal baseline.
+async function originMainLease(repoPath: string): Promise<string> {
+  const r = await git(repoPath, ['rev-parse', '--verify', '--quiet', ORIGIN_MAIN_REF]);
+  if (r.code === 0) return r.stdout.trim();
+  const ls = await git(repoPath, ['ls-remote', 'origin', 'refs/heads/main']);
+  // Could not ask origin: fall back to the strict "must not exist" expectation. A push is about to
+  // be attempted against the same unreachable origin and would fail on its own anyway; the point is
+  // to never widen the lease on a guess.
+  if (ls.code !== 0) return '';
+  const line = ls.stdout.split('\n').find((l) => l.trim().length > 0);
+  if (line === undefined) return '';
+  return line.split(/\s+/)[0] ?? '';
+}
+
+// The only place the derived main is written to origin. The single-pusher gate in node.ts decides
+// who SHOULD push; the lease decides what a push is allowed to overwrite. Per push that guarantee
+// is exact and worth having: a push lands only if origin's main is still the sha this machine last
+// saw, so no push ever silently discards another machine's main. A roamer that took over on a
+// stale read of the anchor's liveness is refused and logged instead of racing.
+//
+// It is a guarantee about ONE push, not about the fleet settling. Every sync cycle fetches origin,
+// which refreshes the baseline to whatever the other pusher wrote, so a refused machine's next
+// lease is valid again -- the lease alone would let two machines take turns clobbering main, each
+// push returning 0. What actually bounds that is the pair around it: node.ts's yield rule (a roamer
+// stands down as soon as it sees a main it did not push) and the bounded retry in updateMain (a
+// refused push is retried at most MAX_PUSH_RETRIES times, then left alone until inputs change).
+//
+// The anchor pays nothing for the lease: every successful push refreshes the baseline below, so the
+// anchor's lease is always current.
+async function pushDerivedMain(repoPath: string, sha: string): Promise<boolean> {
+  const lease = await originMainLease(repoPath);
+  const r = await git(repoPath, [
+    'push',
+    `--force-with-lease=refs/heads/main:${lease}`,
+    'origin',
+    `${sha}:refs/heads/main`,
+  ]);
+  if (r.code === 0) {
+    lastPushedSha.set(repoPath, sha);
+    owedPush.delete(repoPath);
+    // Refresh the baseline now rather than waiting for the next fetch. git already does this when
+    // origin carries the usual +refs/heads/*:refs/remotes/origin/* refspec; doing it explicitly
+    // also covers an origin configured by url alone, whose fetch stores nothing under refs/remotes
+    // and would otherwise leave every later push leasing against an absent ref.
+    //
+    // Best effort on purpose. The push has already landed, so a ref-lock or D/F failure here means
+    // a stale tracking ref that the next fetch repairs -- not a failed push. Throwing would make
+    // node.ts log `derive.updateMain failed` for a push that succeeded.
+    const u = await git(repoPath, ['update-ref', ORIGIN_MAIN_REF, sha]);
+    if (u.code !== 0) {
+      log('warn', 'derive: main pushed but the origin tracking ref could not be updated', {
+        repo: repoPath,
+        sha,
+        code: u.code,
+        stderr: u.stderr.trim().slice(0, 500),
+      });
+    }
+    return true;
+  }
+  // Refused or failed: this machine still owes this sha. Remembering it here is what lets the
+  // unchanged-inputs branch of updateMain retry a bounded number of times without inferring
+  // "something is owed" from the refs, which is what made the retry unbounded.
+  const prevOwed = owedPush.get(repoPath);
+  owedPush.set(repoPath, {
+    sha,
+    attempts: prevOwed !== undefined && prevOwed.sha === sha ? prevOwed.attempts + 1 : 0,
+  });
+  const stderr = r.stderr.trim();
+  if (stderr.includes('stale info')) {
+    // git's word for a lease that no longer holds. Distinct message and distinct meaning from a
+    // push that simply failed: nothing is wrong with the network, another machine moved main.
+    log('warn', 'derive: main moved on origin since last fetch, push refused', {
+      repo: repoPath,
+      sha,
+      expected: lease,
+      stderr: stderr.slice(0, 500),
+    });
+  } else {
+    log('warn', 'derive: force-push of main to origin failed', {
+      repo: repoPath,
+      sha,
+      code: r.code,
+      stderr: stderr.slice(0, 500),
+    });
+  }
+  return false;
+}
+
+// Has origin's main moved under a push that was not ours? Read-only and local: one rev-parse of the
+// tracking ref as this cycle's fetch left it, no network. node.ts calls it for a ROAMER that is
+// about to take over the push, and a true answer is that roamer's cue to stand down -- somebody
+// else is demonstrably pushing, whatever this machine's gossip says about the anchor's heartbeat.
+//
+// Three answers are deliberately NOT foreign, and each of them is load-bearing:
+//   - an absent tracking ref: nothing has been observed to move, so there is nothing to yield to;
+//   - the first observation of a repo in this process: it is the baseline. Without this, a roamer
+//     taking over after a real anchor death would yield forever to the dead anchor's last push;
+//   - a value unchanged since the previous observation: a main that is just sitting there is not
+//     evidence of another pusher. This is what lets the roamer take over for good once whoever was
+//     pushing actually stops.
+export async function originMainMovedByOther(repoPath: string): Promise<boolean> {
+  const r = await git(repoPath, ['rev-parse', '--verify', '--quiet', ORIGIN_MAIN_REF]);
+  const current = r.code === 0 ? r.stdout.trim() : '';
+  if (current.length === 0) return false;
+  const prev = lastSeenOriginMain.get(repoPath);
+  lastSeenOriginMain.set(repoPath, current);
+  if (prev === undefined || prev === current) return false;
+  return current !== lastPushedSha.get(repoPath);
+}
+
 export async function updateMain(
   repoPath: string,
   opts: UpdateMainOpts = {},
@@ -428,6 +572,42 @@ export async function updateMain(
   // so skip without minting. The previous main is never reused as a parent.
   const prior = (await storedState(repoPath, DERIVED_REF)) ?? (await storedState(repoPath, ORIGIN_MAIN_REF));
   if (prior !== null && setsEqual(prior.set, inputSet)) {
+    // Unchanged inputs mint nothing, but they must not swallow a push this machine still OWES. A
+    // push the lease refused (or one that died on the network) leaves DERIVED_REF already sitting
+    // on the derived sha, so the next tick reads the inputs as unchanged and, without this retry,
+    // would never push again: origin would keep the main it has until some machine's sync branch
+    // happens to move.
+    //
+    // The retry is driven by memory of our own refused push (owedPush) and bounded, never inferred
+    // from the refs. Re-pushing whenever refs/remotes/origin/main differs from the derived sha --
+    // the obvious version -- re-pushes on EVERY tick during a partition: the cycle's fetch
+    // refreshes that ref to whatever the other pusher wrote, so the lease is valid again and the
+    // push lands, and the two machines take turns clobbering main forever, each push returning 0.
+    // origin/main differing from ours is not by itself a reason to push. That also means a main
+    // hand-pushed to GitHub is left alone until inputs change, exactly as it was before this leg
+    // existed. Only this cycle's pusher pays for the check, and it costs one Map lookup.
+    const owed = owedPush.get(repoPath);
+    if (
+      opts.push !== false &&
+      owed !== undefined &&
+      owed.sha === prior.sha &&
+      owed.attempts < MAX_PUSH_RETRIES
+    ) {
+      const retried = await pushDerivedMain(repoPath, prior.sha);
+      const after = owedPush.get(repoPath);
+      if (!retried && after !== undefined && after.sha === prior.sha && after.attempts >= MAX_PUSH_RETRIES) {
+        // Fires exactly once per owed sha: attempts only reaches the cap on this line, and the
+        // guard above stops every later tick. So a permanent refusal (protected branch, revoked
+        // token) costs a bounded number of push subprocesses and warns, not one of each per repo
+        // per tick for as long as the daemon runs.
+        log('warn', 'derive: giving up on main push until inputs change', {
+          repo: repoPath,
+          sha: prior.sha,
+          attempts: after.attempts,
+        });
+      }
+      return { sha: prior.sha, pushed: retried, skipped: 'unchanged-inputs' };
+    }
     return { sha: prior.sha, pushed: false, skipped: 'unchanged-inputs' };
   }
 
@@ -484,6 +664,10 @@ export async function updateMain(
   const sha = await commitTree(repoPath, finalTree, parents, message, newestTs);
 
   await gitOK(repoPath, ['update-ref', DERIVED_REF, sha]);
+  // A new sha supersedes anything still owed for the old one: nobody wants the previous derived
+  // main on origin any more. If this sha's own push fails below, pushDerivedMain records it fresh
+  // with attempts 0, which is why changed inputs are what reset a machine that had given up.
+  owedPush.delete(repoPath);
 
   let pushed = false;
   let skipped: string | null = null;
@@ -493,17 +677,7 @@ export async function updateMain(
     // suppressed tick.
     skipped = 'push-suppressed-non-owner';
   } else if (await originExists(repoPath)) {
-    const r = await git(repoPath, ['push', '--force', 'origin', `${sha}:refs/heads/main`]);
-    if (r.code === 0) {
-      pushed = true;
-    } else {
-      log('warn', 'derive: force-push of main to origin failed', {
-        repo: repoPath,
-        sha,
-        code: r.code,
-        stderr: r.stderr.trim().slice(0, 500),
-      });
-    }
+    pushed = await pushDerivedMain(repoPath, sha);
   }
 
   return { sha, pushed, skipped };

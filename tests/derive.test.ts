@@ -3,7 +3,7 @@ import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { updateMain } from '../src/derive';
+import { MAX_PUSH_RETRIES, originMainMovedByOther, updateMain } from '../src/derive';
 import { run } from '../src/util';
 
 // Fixed identity/date so branch commit shas are stable across machines running the suite.
@@ -445,4 +445,265 @@ test('no sync branches: null sha, skipped', async () => {
   expect(res.sha).toBeNull();
   expect(res.skipped).toBe('no-sync-branches');
   expect(res.pushed).toBe(false);
+});
+
+test('lease refuses the push when origin main moved since the last fetch; the next tick retries after a fetch', async () => {
+  const dir = join(root, 'lease');
+  await buildBaseRepo(dir);
+  const originDir = join(root, 'lease-origin.git');
+  await g(root, ['init', '-q', '--bare', 'lease-origin.git']);
+  await g(dir, ['remote', 'add', 'origin', originDir]);
+
+  const first = await updateMain(dir);
+  expect(first.pushed).toBe(true);
+  expect(await g(originDir, ['rev-parse', 'refs/heads/main'])).toBe(first.sha!);
+
+  // A second clone moves origin's main behind this repo's back -- the shape a second, divergent
+  // pusher makes. This repo's refs/remotes/origin/main still points at first.sha, so its lease is
+  // stale from here on.
+  const other = join(root, 'lease-other');
+  await g(root, ['clone', '-q', '-b', 'main', originDir, 'lease-other']);
+  await writeFile(other, 'from-other.txt', 'other pusher\n');
+  await g(other, ['add', '-A']);
+  await g(other, ['commit', '-qm', 'other-pusher'], '2023-01-01T00:00:00 +0000');
+  await g(other, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+  const foreign = await g(originDir, ['rev-parse', 'refs/heads/main']);
+  expect(foreign).not.toBe(first.sha!);
+
+  // Move a sync branch so the input set changes: this exercises the mint-and-push leg, not the
+  // unchanged-inputs retry leg below.
+  await g(dir, ['switch', '-q', 'sync/aaa']);
+  await writeFile(dir, 'only-aaa.txt', 'from-aaa-again\n');
+  await g(dir, ['add', '-A']);
+  await g(dir, ['commit', '-qm', 'aaa2'], '2023-06-01T00:00:00 +0000');
+  await g(dir, ['switch', '-q', 'work']);
+
+  const refused = await updateMain(dir);
+  expect(refused.skipped).toBeNull();
+  expect(refused.sha).not.toBe(first.sha!);
+  expect(refused.pushed).toBe(false); // the lease held
+  expect(await g(originDir, ['rev-parse', 'refs/heads/main'])).toBe(foreign); // untouched
+  // The local derived ref still advanced: it is free and diffable, only the push was refused.
+  expect(await g(dir, ['rev-parse', 'refs/sukarfleet/derived-main'])).toBe(refused.sha!);
+
+  // The refused push is still owed. Unchanged inputs must not swallow the retry: without that,
+  // the derived ref sitting at the new sha would make every later tick skip and origin would keep
+  // the foreign main forever.
+  await g(dir, ['fetch', '-q', '--prune', 'origin']);
+  const retried = await updateMain(dir);
+  expect(retried.skipped).toBe('unchanged-inputs'); // nothing re-minted
+  expect(retried.sha).toBe(refused.sha!);
+  expect(retried.pushed).toBe(true);
+  expect(await g(originDir, ['rev-parse', 'refs/heads/main'])).toBe(retried.sha!);
+
+  // Once origin holds the derived sha, an unchanged tick goes back to pushing nothing.
+  const settled = await updateMain(dir);
+  expect(settled.skipped).toBe('unchanged-inputs');
+  expect(settled.pushed).toBe(false);
+});
+
+test('an origin main this repo has never fetched is leased from ls-remote, not refused forever', async () => {
+  // An origin configured by url alone carries no fetch refspec, so nothing ever lands in
+  // refs/remotes/origin/main -- the same shape as a repo adopted from a `clone --single-branch -b
+  // dev`, whose refspec only ever fetches dev. Leasing against the empty string there means "main
+  // must not exist yet", which would refuse every push for the life of that clone. The lease falls
+  // back to asking origin, so the push lands, and the tracking ref it writes puts every later push
+  // back on the normal baseline.
+  const dir = join(root, 'lease-never-fetched');
+  await buildBaseRepo(dir);
+  const originDir = join(root, 'lease-never-fetched-origin.git');
+  await g(root, ['init', '-q', '--bare', 'lease-never-fetched-origin.git']);
+  // Seed origin's main from a separate clone so this repo has provably never seen it.
+  const seeder = join(root, 'lease-never-fetched-seed');
+  await g(root, ['clone', '-q', originDir, 'lease-never-fetched-seed']);
+  await writeFile(seeder, 'seed.txt', 'seed\n');
+  await g(seeder, ['add', '-A']);
+  await g(seeder, ['commit', '-qm', 'seed'], '2023-01-01T00:00:00 +0000');
+  await g(seeder, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+  const seeded = await g(originDir, ['rev-parse', 'refs/heads/main']);
+
+  await g(dir, ['config', 'remote.origin.url', originDir]); // url only: no refspec, no tracking ref
+  const res = await updateMain(dir);
+  expect(res.pushed).toBe(true);
+  expect(res.sha).not.toBe(seeded);
+  expect(await g(originDir, ['rev-parse', 'refs/heads/main'])).toBe(res.sha!);
+  // The successful push wrote the baseline the next lease will read.
+  expect(await g(dir, ['rev-parse', 'refs/remotes/origin/main'])).toBe(res.sha!);
+});
+
+// Two machines whose sync tips have diverged (a mesh partition: neither can see the other's tip)
+// pushing to one origin. Before the bounded retry, this ping-ponged forever: every tick's fetch
+// refreshed refs/remotes/origin/main to the other machine's sha, which made the lease valid again,
+// and an "origin/main is not our derived sha" retry re-pushed on both sides every tick, silently,
+// each push returning 0. The retry is now driven by a push this machine actually owes, so unchanged
+// inputs push nothing at all.
+test('two divergent pushers on one origin do not ping-pong main: unchanged inputs push nothing', async () => {
+  const originDir = join(root, 'pingpong-origin.git');
+  await g(root, ['init', '-q', '--bare', 'pingpong-origin.git']);
+
+  async function mk(dir: string, tips: [string, string][]): Promise<void> {
+    await mkdir(dir, { recursive: true });
+    await g(dir, ['init', '-q', '-b', 'work']);
+    await g(dir, ['config', 'core.autocrlf', 'false']);
+    await writeFile(dir, 'shared.txt', 'base\n');
+    await g(dir, ['add', '-A']);
+    await g(dir, ['commit', '-qm', 'base'], '2020-01-01T00:00:00 +0000');
+    for (const [machine, content] of tips) {
+      await g(dir, ['switch', '-q', '-c', `sync/${machine}`, 'work']);
+      await writeFile(dir, `f-${machine}.txt`, content);
+      await g(dir, ['add', '-A']);
+      await g(dir, ['commit', '-qm', machine], '2021-01-01T00:00:00 +0000');
+    }
+    await g(dir, ['switch', '-q', 'work']);
+    await g(dir, ['remote', 'add', 'origin', originDir]);
+  }
+
+  const a = join(root, 'pingpong-a');
+  const b = join(root, 'pingpong-b');
+  // Each machine holds its own tip fresh and the other machine's tip stale: two different input
+  // sets, so two different derived shas, exactly the state a partition leaves behind.
+  await mk(a, [['aaa', 'a-view\n'], ['bbb', 'stale-bbb\n']]);
+  await mk(b, [['aaa', 'stale-aaa\n'], ['bbb', 'b-view\n']]);
+
+  // One tick of the real loop: the syncer's origin fetch, then derive.
+  async function tick(dir: string): Promise<{ pushed: boolean; originMain: string }> {
+    await g(dir, ['fetch', '-q', '--prune', 'origin']);
+    const res = await updateMain(dir, { push: true });
+    return { pushed: res.pushed, originMain: await g(originDir, ['rev-parse', 'refs/heads/main']) };
+  }
+
+  const aPushes: boolean[] = [];
+  const bPushes: boolean[] = [];
+  const mains: string[] = [];
+  for (let i = 0; i < 6; i++) {
+    const ra = await tick(a);
+    aPushes.push(ra.pushed);
+    const rb = await tick(b);
+    bPushes.push(rb.pushed);
+    mains.push(rb.originMain);
+  }
+
+  // Each side pushes exactly once, on the tick its own inputs first produced a derived sha.
+  expect(aPushes).toEqual([true, false, false, false, false, false]);
+  expect(bPushes).toEqual([true, false, false, false, false, false]);
+  // And main stops moving after that first round rather than flipping every tick.
+  expect(new Set(mains).size).toBe(1);
+
+  // The other half of the rule: a main that is not ours is left alone until inputs change. Neither
+  // machine reconverges origin behind the other's back.
+  const settled = mains[0]!;
+  expect(await g(originDir, ['rev-parse', 'refs/heads/main'])).toBe(settled);
+
+  // Changed inputs are what earns a push again -- one push, not one per tick.
+  await g(a, ['switch', '-q', 'sync/aaa']);
+  await writeFile(a, 'f-aaa.txt', 'a-view-2\n');
+  await g(a, ['add', '-A']);
+  await g(a, ['commit', '-qm', 'aaa2'], '2022-01-01T00:00:00 +0000');
+  await g(a, ['switch', '-q', 'work']);
+  const moved = await tick(a);
+  expect(moved.pushed).toBe(true);
+  expect(moved.originMain).not.toBe(settled);
+  expect((await tick(a)).pushed).toBe(false);
+});
+
+// A push that is permanently refused (protected branch, revoked token -- here an origin whose
+// pre-receive hook always rejects) must not cost a push subprocess and a warn per repo per tick
+// forever. It is retried a bounded number of times and then dropped until inputs change.
+test('a refused push is retried on later ticks and gives up after MAX_PUSH_RETRIES', async () => {
+  const dir = join(root, 'retry-cap');
+  await buildBaseRepo(dir);
+  const originDir = join(root, 'retry-cap-origin.git');
+  await g(root, ['init', '-q', '--bare', 'retry-cap-origin.git']);
+  // Every push attempt that reaches receive-pack appends a line, so the file counts attempts even
+  // though none of them land.
+  const counter = join(root, 'retry-cap-attempts.txt');
+  const hook = join(originDir, 'hooks', 'pre-receive');
+  await Bun.write(hook, `#!/bin/sh\necho attempt >> ${counter}\nexit 1\n`);
+  await run(['chmod', '+x', hook]);
+  await g(dir, ['remote', 'add', 'origin', originDir]);
+
+  async function attempts(): Promise<number> {
+    const f = Bun.file(counter);
+    if (!(await f.exists())) return 0;
+    return (await f.text()).split('\n').filter((l) => l.length > 0).length;
+  }
+
+  // Tick 1 mints a sha and its push is refused.
+  const first = await updateMain(dir);
+  expect(first.pushed).toBe(false);
+  expect(await attempts()).toBe(1);
+
+  // Later ticks retry with unchanged inputs, and stop once the cap is reached.
+  for (let i = 0; i < MAX_PUSH_RETRIES + 3; i++) {
+    await g(dir, ['fetch', '-q', '--prune', 'origin']);
+    const res = await updateMain(dir);
+    expect(res.skipped).toBe('unchanged-inputs');
+    expect(res.pushed).toBe(false);
+    expect(res.sha).toBe(first.sha!);
+  }
+  expect(await attempts()).toBe(1 + MAX_PUSH_RETRIES);
+
+  // Changed inputs are the only thing that makes this machine ask again.
+  await g(dir, ['switch', '-q', 'sync/aaa']);
+  await writeFile(dir, 'only-aaa.txt', 'from-aaa-again\n');
+  await g(dir, ['add', '-A']);
+  await g(dir, ['commit', '-qm', 'aaa2'], '2023-06-01T00:00:00 +0000');
+  await g(dir, ['switch', '-q', 'work']);
+  const minted = await updateMain(dir);
+  expect(minted.sha).not.toBe(first.sha!);
+  expect(minted.pushed).toBe(false);
+  expect(await attempts()).toBe(2 + MAX_PUSH_RETRIES);
+});
+
+// The signal a roamer stands down on. Read-only: it reports on refs/remotes/origin/main as the
+// cycle's fetch left it, and never on the network.
+test('originMainMovedByOther: baseline, own push, foreign push, then ours again', async () => {
+  const dir = join(root, 'moved-by-other');
+  await buildBaseRepo(dir);
+  const originDir = join(root, 'moved-by-other-origin.git');
+  await g(root, ['init', '-q', '--bare', 'moved-by-other-origin.git']);
+  await g(dir, ['remote', 'add', 'origin', originDir]);
+
+  // No tracking ref yet: nothing has been observed to move.
+  expect(await originMainMovedByOther(dir)).toBe(false);
+
+  // First observation of a present ref is the baseline, never foreign -- otherwise a roamer taking
+  // over after a real anchor death would yield to the dead anchor's last push forever.
+  const ours1 = await updateMain(dir);
+  expect(ours1.pushed).toBe(true);
+  expect(await originMainMovedByOther(dir)).toBe(false);
+
+  // Our own push moving the ref is not another pusher.
+  await g(dir, ['switch', '-q', 'sync/aaa']);
+  await writeFile(dir, 'only-aaa.txt', 'from-aaa-2\n');
+  await g(dir, ['add', '-A']);
+  await g(dir, ['commit', '-qm', 'aaa2'], '2023-01-01T00:00:00 +0000');
+  await g(dir, ['switch', '-q', 'work']);
+  const ours2 = await updateMain(dir);
+  expect(ours2.pushed).toBe(true);
+  expect(await originMainMovedByOther(dir)).toBe(false);
+
+  // A second clone pushes: that is the evidence a roamer yields to.
+  const other = join(root, 'moved-by-other-clone');
+  await g(root, ['clone', '-q', '-b', 'main', originDir, 'moved-by-other-clone']);
+  await writeFile(other, 'from-other.txt', 'other pusher\n');
+  await g(other, ['add', '-A']);
+  await g(other, ['commit', '-qm', 'other'], '2023-02-01T00:00:00 +0000');
+  await g(other, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+  await g(dir, ['fetch', '-q', '--prune', 'origin']);
+  expect(await originMainMovedByOther(dir)).toBe(true);
+
+  // A main that has simply stopped moving is not evidence of a live pusher: this is what lets the
+  // roamer take over for good once the other machine stops.
+  expect(await originMainMovedByOther(dir)).toBe(false);
+
+  // And once we push again, the ref is ours once more.
+  await g(dir, ['switch', '-q', 'sync/bbb']);
+  await writeFile(dir, 'only-bbb.txt', 'from-bbb-2\n');
+  await g(dir, ['add', '-A']);
+  await g(dir, ['commit', '-qm', 'bbb2'], '2023-03-01T00:00:00 +0000');
+  await g(dir, ['switch', '-q', 'work']);
+  const ours3 = await updateMain(dir);
+  expect(ours3.pushed).toBe(true);
+  expect(await originMainMovedByOther(dir)).toBe(false);
 });
