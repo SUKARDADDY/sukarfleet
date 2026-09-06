@@ -19,6 +19,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
 
+// A tray-first app that fails to start fails invisibly: no window appears, and
+// on Windows there is not even a console for a panic to land in. SUKARFLEET_TRAY_TRACE=1
+// prints one line per startup stage to stderr, so "it runs and nothing happens"
+// becomes "it stopped between these two lines".
+fn trace(stage: &str) {
+    if std::env::var_os("SUKARFLEET_TRAY_TRACE").is_some() {
+        eprintln!("sukarfleet-tray: {stage}");
+    }
+}
+
 pub struct Shared {
     pub endpoint: String,
     pub summary: Mutex<String>,
@@ -35,7 +45,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(10);
 const DOWN_BACKOFF_SECS: [u64; 6] = [1, 2, 4, 8, 16, 30];
 
 fn main() {
+    trace("main");
     let endpoint = config::endpoint();
+    trace("endpoint resolved");
     let shared = Arc::new(Shared {
         endpoint,
         summary: Mutex::new(String::new()),
@@ -54,13 +66,16 @@ fn main() {
         .invoke_handler(tauri::generate_handler![snapshot, api::api_call])
         .manage(shared.clone())
         .setup(move |app| {
+            trace("setup");
             tray::init(app.handle())?;
+            trace("tray created");
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move { poll_loop(handle, shared).await });
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building sukarfleet-tray");
+    trace("built");
 
     app.run(|_app, event| {
         // Tray-only app: closing the popover must not exit; only app.exit() (Quit) does.
@@ -80,6 +95,7 @@ async fn poll_loop(app: AppHandle, shared: Arc<Shared>) {
     let mut down_streak: usize = 0;
     let mut last_up_wall: Option<SystemTime> = None;
 
+    trace("poll loop");
     loop {
         let outcome = client.poll().await;
         let now = Instant::now();
