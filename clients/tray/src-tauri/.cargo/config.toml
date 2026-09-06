@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+#
+# Link the Visual C++ runtime into the binary rather than depending on it.
+#
+# A default MSVC build imports VCRUNTIME140.dll and VCRUNTIME140_1.dll, which
+# ship with the Visual C++ Redistributable. Every machine that can build this
+# has it; a machine that only runs it very often does not. The failure is a
+# modal Windows dialog saying the code execution cannot proceed, raised by the
+# loader before main, so the process appears to start and then does nothing:
+# no window, no log line, no exit code. Observed on a clean Windows 11 install
+# on 2026-09-06, where the dialog was behind the installer's own window.
+#
+# The tray is a single file an installer drops into place, so it carries its own
+# runtime. The cost is about a megabyte and no separate redistributable to
+# install, chase or version.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
