@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Builds the native tray console. One job today, because Windows is the platform
+# whose binary nobody here can produce by hand: the Linux tray is built on the
+# machine that ships it, and a Windows binary built on Linux would be a
+# cross-compile nobody runs. This runs on Windows, so what is uploaded is what a
+# Windows machine would have built for itself.
+#
+# The upload is an artifact, never a release asset. Cutting a release is a
+# deliberate act by a person, and it is the step that fills the SHA256 this job
+# prints into install/easytier-pins.txt. Until that happens the installer treats
+# the tray as unreleased and prints the web console URL instead, which is the
+# fail-closed answer: an unverified download is worse than no download.
+name: tray
+
+on:
+  push:
+    paths:
+      - 'clients/tray/**'
+      - '.github/workflows/tray.yml'
+  pull_request:
+    paths:
+      - 'clients/tray/**'
+      - '.github/workflows/tray.yml'
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner image ships a rustup stable toolchain, so nothing installs a
+      # toolchain here. Printed because a binary is only as reproducible as the
+      # compiler that made it, and this line is the record of which one did.
+      - name: toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+          rustc --version
+
+      # The frontend is static files under clients/tray/src, so there is no
+      # frontend build step and no Node or Bun on this runner. tauri-build reads
+      # tauri.conf.json and embeds that directory as it stands.
+      #
+      # --locked because the lockfile is part of the tree: a build that quietly
+      # resolves a different dependency graph than the one reviewed here is not
+      # the build this repository describes.
+      - name: build
+        run: cargo build --release --locked --manifest-path clients/tray/src-tauri/Cargo.toml
+
+      - name: name and hash the asset
+        shell: pwsh
+        run: |
+          $src = 'clients/tray/src-tauri/target/release/sukarfleet-tray.exe'
+          $out = 'sukarfleet-tray-windows-x86_64.exe'
+          Copy-Item $src $out
+          $sha = (Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash.ToLower()
+          "$sha  $out" | Set-Content -Encoding ascii SHA256SUMS
+          # Printed as the pin line install/easytier-pins.txt wants, so cutting a
+          # release is a copy rather than a retyping.
+          Write-Host ''
+          Write-Host 'pin line for install/easytier-pins.txt (version column is the release tag without its v):'
+          Write-Host "  <version>  x86_64   $sha  $out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sukarfleet-tray-windows-x86_64
+          path: |
+            sukarfleet-tray-windows-x86_64.exe
+            SHA256SUMS
+          if-no-files-found: error
