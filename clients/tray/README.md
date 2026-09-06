@@ -21,6 +21,33 @@ The tray icon IS the fleet health signal; the menu is the primary readout
   icon plus coalesced, diffed notifications — not a bus workaround.
 - GNOME needs the AppIndicator/StatusNotifier extension (`ubuntu-appindicators`)
   or the icon will not appear. KDE works natively.
+- Platform differences live in `tray.rs` and are two: the primary click, and
+  what the unreachable menu copies. Linux SNI trays deliver no click events, so
+  the menu has to open on the primary click; Windows delivers them and expects
+  left for the thing, right for the menu. And a node that is not answering is a
+  systemd user unit on Linux and a scheduled task on Windows, so the commands
+  offered for the clipboard differ. There is no log command on Windows, because
+  the task's output goes nowhere and naming a file that does not exist would
+  send someone looking for it.
+
+## Building for Windows
+
+`.github/workflows/tray.yml` builds it on a Windows runner and uploads
+`sukarfleet-tray-windows-x86_64.exe` as an artifact, with the pin line for
+`install/easytier-pins.txt` printed in the log. Nothing here cross-compiles: a
+Windows binary produced on Linux is one nobody has run.
+
+To build it by hand on a Windows machine, install rustup with the MSVC toolchain
+and the Visual Studio C++ build tools, then:
+
+```powershell
+cargo build --release --locked --manifest-path clients\tray\src-tauri\Cargo.toml
+```
+
+There is no frontend build step on any platform. `src/` is static files that
+tauri-build embeds as they are. The executable's icon comes from
+`src-tauri/icons/icon.ico`, which `bun run icons` generates with everything
+else; a build without that file is fine and ships the generic icon.
 
 ## Dev
 

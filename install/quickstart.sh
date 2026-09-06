@@ -778,7 +778,10 @@ if [ -n "$TRAY_REASON" ]; then
   : # decided in preflight; reported in the banner
 else
   set +e
-  PIN_LINE="$(pin_lookup 'sukarfleet-tray-' "$ARCH" 2>/dev/null)"
+  # The full platform, not the family: 'sukarfleet-tray-' also matches the Windows
+  # lines, and two lines for one (version, arch) is a duplicate, so a tray that
+  # exists would be refused because a second one exists too.
+  PIN_LINE="$(pin_lookup 'sukarfleet-tray-linux-' "$ARCH" 2>/dev/null)"
   PIN_RC=$?
   set -e
   TRAY_SHA="${PIN_LINE%% *}"

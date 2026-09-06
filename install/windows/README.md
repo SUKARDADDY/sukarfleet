@@ -41,7 +41,7 @@ service, opens the firewall for that one binary on that one port, and turns on N
 
 **User**, with no special rights. Installs Bun, runs `bun install`, generates this machine's
 fleet SSH key, scaffolds `~/.config/sukarfleet/config.json`, registers the node as a scheduled
-task, starts it, and waits for `/health`.
+task, starts it, waits for `/health`, and installs the tray console described below.
 
 The secret never appears in an argument. You type it in the unelevated stage, it goes to a file
 only you can read, the elevated stage consumes that file and overwrites it. Same reason the
@@ -52,6 +52,33 @@ leaves it alone rather than deleting something you named. It says so when it doe
 file still holds your fleet's secret in plaintext. Delete it once the mesh is up.
 
 Re-running is safe and is the upgrade path. Add `-Restart` to bounce the node.
+
+## The console
+
+The console is a tray icon, the same one a Linux machine gets. Left click opens the window, right
+click opens the menu, and the menu is the readout: faults, peers, repos, and the state of the node
+itself. Setup and pairing happen in the window, so nothing here needs a terminal.
+
+The installer puts it in `%LOCALAPPDATA%\Programs\sukarfleet`, adds a Start menu entry called
+"sukarfleet console", and registers it to start when you sign in. That registration is the same
+registry value the tray's own "Start at login" checkbox writes, so the two never disagree.
+
+The binary is downloaded from this project's release for the version pinned in
+`install/easytier-pins.txt` and checked against the SHA256 on that line. A pin nobody has filled
+in yet is not a pin, so nothing is downloaded against one: the installer says the tray has not been
+released, prints the browser console URL and carries on. Same for a download that fails or a hash
+that does not match. You end up with a working node either way, which is the point. `-SkipTray`
+skips it outright.
+
+The console **window** is a WebView2 host. Windows 11 ships that runtime; Windows 10 may not, and
+without it the icon and the menu still work while the window silently never appears. The installer
+checks for it and says so in the banner rather than leaving you clicking. To fix it:
+`winget install --id Microsoft.EdgeWebView2Runtime`.
+
+One thing the tray cannot offer here. On Linux it can copy a `journalctl` line for a node that has
+stopped answering. Windows has no journal, and the node's scheduled task writes its output nowhere,
+so the tray copies `Get-ScheduledTaskInfo` instead and calls it a check rather than a log. To read
+the node's own output, stop the task and run it in the foreground, as under "Checking on it" below.
 
 ## What it deliberately leaves undone
 
@@ -91,7 +118,8 @@ honest answer, and it follows from the paragraph above anyway.
 In this order, because each step needs the one before it.
 
 1. Ping the mesh address of a machine already in the fleet. No mesh, no pairing.
-2. Open `http://127.0.0.1:7710/ui/` and add the repos you want synced.
+2. Open the console, from the tray icon or at `http://127.0.0.1:7710/ui/`, and add the repos you
+   want synced.
 3. Pair. Click Pair on a machine already in the fleet and type its code in here.
 
 ## Checking on it
@@ -99,6 +127,7 @@ In this order, because each step needs the one before it.
 ```powershell
 Get-ScheduledTaskInfo -TaskName sukarfleet     # last run, last result, next run
 Get-Service easytier-fleet                     # the mesh transport
+Get-Process sukarfleet-tray                    # the console
 Invoke-WebRequest http://127.0.0.1:7710/health -UseBasicParsing
 ```
 
@@ -120,6 +149,8 @@ cd <checkout> ; & "$env:USERPROFILE\.bun\bin\bun.exe" run src\node.ts
 -Repo name=<path>       a cloned repo to sync; repeatable
 -Source <dir-or-zip>    where the sukarfleet source is; defaults to this checkout
 -SkipMesh               this machine already has the mesh transport
+-SkipTray               no tray console; use the browser GUI
+-TrayReleaseBase <url>  where to fetch the tray from, if not this project's release
 -Restart                bounce the node after installing
 ```
 
@@ -131,6 +162,10 @@ every process on the machine and lands in your shell history.
 ```powershell
 Stop-ScheduledTask -TaskName sukarfleet
 Unregister-ScheduledTask -TaskName sukarfleet -Confirm:$false
+Get-Process sukarfleet-tray -ErrorAction SilentlyContinue | Stop-Process
+Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run sukarfleet-tray
+Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\sukarfleet console.lnk"
+Remove-Item -Recurse "$env:LOCALAPPDATA\Programs\sukarfleet"
 & "C:\Program Files\EasyTier\easytier-cli.exe" service uninstall --name easytier-fleet   # as admin
 Remove-NetFirewallRule -DisplayName "sukarfleet mesh (TCP 11010)"                        # as admin
 Remove-NetFirewallRule -DisplayName "sukarfleet mesh (UDP 11010)"                        # as admin
