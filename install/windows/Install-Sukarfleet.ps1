@@ -1286,7 +1286,11 @@ function Show-Banner {
     Write-Host '    - DPAPI did not round-trip for this user either, so nothing would be sealed.'
   }
   Write-Host ''
-  Write-Host '  Sync, gossip, pairing, the GUI and MCP all work. See docs/PLATFORMS.md.'
+  Write-Host '    - Pairing refuses on Windows today. A pairing bundle has to carry an SSH host'
+  Write-Host '      key and this machine has none: Windows ships the SSH client, not the server.'
+  Write-Host '      The message you get says "no usable SSH identity yet". docs/PLATFORMS.md.'
+  Write-Host ''
+  Write-Host '  Sync, gossip, the GUI and MCP all work. See docs/PLATFORMS.md.'
   Write-Host '  ------------------------------------------------------------------------'
   Write-Host ''
 }

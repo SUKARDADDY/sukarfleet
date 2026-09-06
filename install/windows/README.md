@@ -101,6 +101,15 @@ symlinks in any repo you pass and says so.
 
 ## What this machine will not be able to do
 
+Pairing refuses, so a Windows machine cannot join a fleet today without a change to the daemon.
+The bundle a machine sends when it redeems a pairing code must carry at least one SSH host key;
+Windows ships the OpenSSH client and not the server, so there are none to carry, and the daemon
+looks for them in `/etc/ssh` on every platform anyway. Everything past that point does work: with
+host keys present, a Windows node and a Linux node paired and synced a repository in both
+directions on 2026-09-06. The second thing the bundle rejects is the SSH user name, which must
+match `^[a-z_][a-z0-9_-]*$`; this installer writes `%USERNAME%`, and a Windows account name
+usually starts with a capital.
+
 The admin lane cannot elevate on Windows. Its design is to pipe one password line to a tool
 that reads stdin, and Windows has no such tool. UAC is a different mechanism with a different
 threat model, and pretending otherwise would produce the kind of confidently wrong answer this
@@ -120,7 +129,10 @@ In this order, because each step needs the one before it.
 1. Ping the mesh address of a machine already in the fleet. No mesh, no pairing.
 2. Open the console, from the tray icon or at `http://127.0.0.1:7710/ui/`, and add the repos you
    want synced.
-3. Pair. Click Pair on a machine already in the fleet and type its code in here.
+3. Pair. Click Pair on a machine already in the fleet and type its code in here. **This
+   refuses on Windows today** with "This machine has no usable SSH identity yet": a pairing
+   bundle has to carry an SSH host key, and a machine with no SSH server has none.
+   `docs/PLATFORMS.md` has the detail.
 
 ## Checking on it
 
