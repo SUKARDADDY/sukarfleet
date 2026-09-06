@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Builds the native tray console. One job today, because Windows is the platform
+# whose binary nobody here can produce by hand: the Linux tray is built on the
+# machine that ships it, and a Windows binary built on Linux would be a
+# cross-compile nobody runs. This runs on Windows, so what is uploaded is what a
+# Windows machine would have built for itself.
+#
+# The upload is an artifact, never a release asset. Cutting a release is a
+# deliberate act by a person, and it is the step that fills the SHA256 this job
+# prints into install/easytier-pins.txt. Until that happens the installer treats
+# the tray as unreleased and prints the web console URL instead, which is the
+# fail-closed answer: an unverified download is worse than no download.
+name: tray
+
+on:
+  push:
+    paths:
+      - 'clients/tray/**'
+      - '.github/workflows/tray.yml'
+  pull_request:
+    paths:
+      - 'clients/tray/**'
+      - '.github/workflows/tray.yml'
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner image ships a rustup stable toolchain, so nothing installs a
+      # toolchain here. Printed because a binary is only as reproducible as the
+      # compiler that made it, and this line is the record of which one did.
+      - name: toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+          rustc --version
+
+      # The frontend is static files under clients/tray/src, so there is no
+      # frontend build step and no Node or Bun on this runner. tauri-build reads
+      # tauri.conf.json and embeds that directory as it stands.
+      #
+      # --locked because the lockfile is part of the tree: a build that quietly
+      # resolves a different dependency graph than the one reviewed here is not
+      # the build this repository describes.
+      #
+      # Run from the crate directory, not with --manifest-path from the root.
+      # Cargo reads .cargo/config.toml by walking up from the working directory,
+      # so a build started at the root silently ignores the crt-static setting
+      # that lives next to the crate, and produces a binary that needs the Visual
+      # C++ Redistributable. The check below is what catches that if it happens.
+      - name: build
+        working-directory: clients/tray/src-tauri
+        run: cargo build --release --locked
+
+      - name: name and hash the asset
+        shell: pwsh
+        run: |
+          $src = 'clients/tray/src-tauri/target/release/sukarfleet-tray.exe'
+          $out = 'sukarfleet-tray-windows-x86_64.exe'
+          Copy-Item $src $out
+          $sha = (Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash.ToLower()
+          "$sha  $out" | Set-Content -Encoding ascii SHA256SUMS
+          # Printed as the pin line install/easytier-pins.txt wants, so cutting a
+          # release is a copy rather than a retyping.
+          Write-Host ''
+          Write-Host 'pin line for install/easytier-pins.txt (version column is the release tag without its v):'
+          Write-Host "  <version>  x86_64   $sha  $out"
+
+      # The runner has the Visual C++ Redistributable, so a binary that imports
+      # VCRUNTIME140 starts here and stops dead on a clean machine, in front of a
+      # modal dialog raised before main. The smoke below cannot see that; this
+      # can. .cargo/config.toml links the runtime in statically, and this is the
+      # check that says it still does.
+      - name: no dependency on the VC++ redistributable
+        shell: pwsh
+        run: |
+          $hit = Select-String -Path .\sukarfleet-tray-windows-x86_64.exe -Pattern 'VCRUNTIME140' -Encoding ascii -List
+          if ($hit) {
+            Write-Host 'the binary imports VCRUNTIME140: it will not start on a machine without the'
+            Write-Host 'Visual C++ Redistributable, and will hang in front of a dialog rather than exit.'
+            exit 1
+          }
+          Write-Host 'no VCRUNTIME140 import'
+
+      # A binary that builds and then cannot start is a build worth failing. The
+      # tray has no window and no console, so "it started" is not observable from
+      # outside: SUKARFLEET_TRAY_TRACE is how it says so. The runner has no
+      # daemon to talk to and its desktop is not a user's, so this asserts only
+      # the stages that are true anywhere, and prints the rest.
+      - name: smoke - does it start
+        shell: pwsh
+        run: |
+          $trace = Join-Path $PWD 'trace.txt'
+          $env:SUKARFLEET_TRAY_TRACE = $trace
+          $p = Start-Process -FilePath .\sukarfleet-tray-windows-x86_64.exe -PassThru
+          Start-Sleep -Seconds 25
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          if (-not (Test-Path $trace)) {
+            Write-Host 'no trace file at all: the binary did not reach the first line of main'
+            exit 1
+          }
+          $lines = Get-Content $trace
+          $lines | ForEach-Object { Write-Host "  $_" }
+          foreach ($want in @('main', 'endpoint resolved', 'plugins registered', 'built')) {
+            if (-not ($lines -match [regex]::Escape($want))) {
+              Write-Host "stopped before: $want"
+              exit 1
+            }
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sukarfleet-tray-windows-x86_64
+          path: |
+            sukarfleet-tray-windows-x86_64.exe
+            SHA256SUMS
+          if-no-files-found: error

@@ -72,6 +72,16 @@ param(
   # and a wrong one here syncs the wrong tree.
   [string[]] $Repo = @(),
 
+  # --- the native tray console ---
+  # A desktop machine gets a tray icon and a console window; without it the console is
+  # the daemon's web GUI in a browser. Skipping it costs nothing but the icon.
+  [switch] $SkipTray,
+  # Where the tray binary is fetched from. The Linux path gets this from install/get.sh,
+  # which bakes in the tag it cloned; Windows has no get.sh, so it is built from the
+  # version column of the pin in install/easytier-pins.txt. $env:SUKARFLEET_RELEASE_BASE
+  # overrides it, which is how a test fleet serves its own build.
+  [string] $TrayReleaseBase = '',
+
   # --- behaviour ---
   # The Bun this tree's bun.lock was resolved against, matching BUN_VERSION in
   # install/quickstart.sh. Pinned rather than 'latest' so a fresh Windows machine and a fresh
@@ -195,6 +205,18 @@ $MeshCore  = Join-Path $MeshDir 'easytier-core.exe'
 $MeshCli   = Join-Path $MeshDir 'easytier-cli.exe'
 
 $TaskName = 'sukarfleet'
+
+# The native tray console. Per-user, like everything else this installer owns: it needs no
+# administrator rights, so asking for them to place a 12 MB binary would be a second UAC
+# prompt for nothing. LOCALAPPDATA\Programs is where a per-user install belongs on Windows.
+$TrayDir      = Join-Path $env:LOCALAPPDATA 'Programs\sukarfleet'
+$TrayExe      = Join-Path $TrayDir 'sukarfleet-tray.exe'
+$TrayShortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\sukarfleet console.lnk'
+$RunKey       = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+# Must match the tray's own product name: its "Start at login" checkbox reads and writes
+# this exact value, and a second spelling would give the operator two switches for one
+# behaviour, one of which silently loses.
+$RunValueName = 'sukarfleet-tray'
 
 # EasyTier release zips, pinned by content. The fleet's wire compatibility is the version, so
 # a silent bump is a silent fleet split.
@@ -858,8 +880,13 @@ function Invoke-UserStage {
   if ($healthy) { Write-Step "node healthy on 127.0.0.1:$port" }
   else { Write-Warn "the node did not answer /health within 20s. Check: Get-ScheduledTaskInfo -TaskName $TaskName , then run it in the foreground: cd `"$repoRoot`" ; & `"$bun`" run src\node.ts" }
 
-  Show-Banner -UiUrl $uiUrl -RepoRoot $repoRoot -Bun $bun -SealOk $sealOk
-  if (-not $NoOpen) { Start-Process $uiUrl -ErrorAction SilentlyContinue }
+  # --- 8. the native tray console -------------------------------------------
+  $tray = Install-Tray -RepoRoot $repoRoot
+
+  Show-Banner -UiUrl $uiUrl -RepoRoot $repoRoot -Bun $bun -SealOk $sealOk -Tray $tray
+  # A machine whose console is the tray does not also want a browser tab: opening both
+  # would be the installer saying it is not sure which console it just installed.
+  if (-not $NoOpen -and -not $tray.Installed) { Start-Process $uiUrl -ErrorAction SilentlyContinue }
 }
 
 # Backfills only what a Windows node cannot run without, and never touches a lane switch:
@@ -1011,14 +1038,224 @@ function Register-NodeTask {
   else { Write-Note "'$TaskName' already running" }
 }
 
+# ---------------------------------------------------------------------------
+# The native tray console
+# ---------------------------------------------------------------------------
+# One pin file serves both installers. install/easytier-pins.txt holds four whitespace-
+# separated columns -- version, arch, sha256, asset -- and the asset name is what tells its
+# consumers apart: quickstart.sh reads the lines starting 'sukarfleet-tray-linux-', this
+# reads the ones starting 'sukarfleet-tray-windows-'. Reading the same file rather than
+# mirroring hashes into a table here means a release fills one line and both platforms
+# follow it. (The EasyTier hashes above are the exception, and say so.)
+#
+# Returns $null when there is no line for this arch, and throws for a file that
+# contradicts itself: two lines for one (version, arch) mean nobody knows which SHA256 to
+# trust, and taking the first is how a stale pin outlives the line meant to replace it.
+# A pin that is not a pin is returned with Unfilled = $true rather than swallowed, so the
+# caller can tell "no such build" from "not hashed yet" when it explains itself.
+$script:PinUnfilled = @('TODO-S9', 'SHA256-FILLED-AT-RELEASE')
+
+function Get-Pin {
+  param(
+    [Parameter(Mandatory)] [string] $PinsFile,
+    [Parameter(Mandatory)] [string] $AssetPrefix,
+    [Parameter(Mandatory)] [string] $Arch
+  )
+  if (-not (Test-Path -LiteralPath $PinsFile)) { return $null }
+  $seen = @{}
+  $filled = $null
+  $unfilled = $null
+  foreach ($line in (Get-Content -LiteralPath $PinsFile)) {
+    $t = $line.Trim()
+    if (-not $t -or $t.StartsWith('#')) { continue }
+    $c = @($t -split '\s+')
+    if ($c.Count -lt 4) { continue }
+    if ($c[1] -ne $Arch) { continue }
+    if (-not $c[3].StartsWith($AssetPrefix)) { continue }
+    $key = "$($c[0]) $($c[1])"
+    if ($seen.ContainsKey($key)) {
+      throw "install\easytier-pins.txt has more than one $AssetPrefix pin for $key, so there is no single SHA256 to trust."
+    }
+    $seen[$key] = $true
+    $pin = @{
+      Version  = $c[0]
+      Arch     = $c[1]
+      Sha      = $c[2]
+      Asset    = $c[3]
+      Unfilled = ($script:PinUnfilled -contains $c[2])
+    }
+    # The first VALID pin wins whatever order the lines sit in, so an unfilled line never
+    # shadows a real one.
+    if ($pin.Unfilled) { if (-not $unfilled) { $unfilled = $pin } }
+    elseif (-not $filled) { $filled = $pin }
+  }
+  if ($filled) { return $filled }
+  return $unfilled
+}
+
+# The console WINDOW is a WebView2 host. Windows 11 ships the Evergreen runtime and
+# Windows 10 may not, and the failure mode without it is invisible: the icon appears, the
+# menu works, and clicking "Open fleet console" does nothing at all. Detected here so the
+# banner can say it once, in advance, instead of leaving someone clicking.
+function Get-WebView2Version {
+  $clsid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+  foreach ($root in @(
+      'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients',
+      'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients',
+      'HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients')) {
+    $item = Get-ItemProperty -LiteralPath "$root\$clsid" -ErrorAction SilentlyContinue
+    $pv = Get-Prop -Object $item -Name 'pv'
+    if ($pv) { return [string] $pv }
+  }
+  return ''
+}
+
+# Installs the tray, or explains why this machine is not getting one. Nothing in here can
+# fail the install: every path returns a reason and the caller falls back to the browser
+# console. A machine with a daemon and a browser is installed; a machine with half a
+# binary in LOCALAPPDATA is not.
+function Install-Tray {
+  param([Parameter(Mandatory)] [string] $RepoRoot)
+
+  $result = @{ Installed = $false; Reason = ''; Detail = ''; Started = $false; WebView2 = '' }
+
+  if ($SkipTray) { $result.Reason = '-SkipTray was passed'; return $result }
+
+  $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
+    'AMD64' { 'x86_64' }
+    'ARM64' { 'arm64' }
+    default { '' }
+  }
+  if (-not $arch) {
+    $result.Reason = "no tray build for processor architecture '$env:PROCESSOR_ARCHITECTURE'"
+    return $result
+  }
+
+  $pinsFile = Join-Path $RepoRoot 'install\easytier-pins.txt'
+  $pin = $null
+  try { $pin = Get-Pin -PinsFile $pinsFile -AssetPrefix 'sukarfleet-tray-windows-' -Arch $arch }
+  catch { $result.Reason = $_.Exception.Message; return $result }
+
+  if (-not $pin) {
+    $result.Reason = "no Windows tray pin for $arch in install\easytier-pins.txt"
+    return $result
+  }
+  if ($pin.Unfilled) {
+    # The honest state of a tree checked out between a commit and its tag. A pin nobody has
+    # computed is not a pin, and an unverified download is worse than no download.
+    $result.Reason = "no Windows tray binary has been released yet (its pin in install\easytier-pins.txt is still $($pin.Sha))"
+    return $result
+  }
+
+  $base = $TrayReleaseBase
+  if (-not $base) { $base = $env:SUKARFLEET_RELEASE_BASE }
+  if (-not $base) { $base = "https://github.com/SUKARDADDY/sukarfleet/releases/download/v$($pin.Version)" }
+  $base = $base.TrimEnd('/')
+
+  $want = $pin.Sha.ToLower()
+  $have = ''
+  if (Test-Path -LiteralPath $TrayExe) {
+    $have = (Get-FileHash -LiteralPath $TrayExe -Algorithm SHA256).Hash.ToLower()
+  }
+
+  if ($have -eq $want) {
+    Write-Note "tray already at $TrayExe and on its pin - left untouched"
+  } else {
+    $tmp = Join-Path $env:TEMP "$($pin.Asset).download"
+    Write-Step "downloading $($pin.Asset)"
+    try { Invoke-WebRequest -Uri "$base/$($pin.Asset)" -OutFile $tmp -UseBasicParsing }
+    catch {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+      $result.Reason = "could not download $($pin.Asset) from $base"
+      $result.Detail = $_.Exception.Message
+      return $result
+    }
+    $got = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLower()
+    if ($got -ne $want) {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+      $result.Reason = 'SHA256 mismatch against install\easytier-pins.txt'
+      $result.Detail = "expected $want, got $got for $($pin.Asset). Report a checksum mismatch rather than retrying it."
+      return $result
+    }
+    # Windows holds a running executable's image open, so an upgrade cannot overwrite a
+    # tray that is running. Stopping it is what re-running the installer means, and it is
+    # started again a few lines down.
+    $running = @(Get-Process -Name 'sukarfleet-tray' -ErrorAction SilentlyContinue)
+    if ($running.Count -gt 0) {
+      Write-Note 'stopping the running tray so its binary can be replaced'
+      $running | Stop-Process -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 1
+    }
+    [void] (New-Item -ItemType Directory -Force -Path $TrayDir)
+    try { Move-Item -LiteralPath $tmp -Destination $TrayExe -Force }
+    catch {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+      $result.Reason = "could not write $TrayExe"
+      $result.Detail = $_.Exception.Message
+      return $result
+    }
+    Write-Step "installed $TrayExe (SHA256 pinned)"
+  }
+  $result.Installed = $true
+
+  # A Start menu entry, so the console can be reopened after Quit without hunting for a
+  # path. Best effort, both of these: an installed tray with no shortcut is still a tray.
+  try {
+    $shell = New-Object -ComObject WScript.Shell
+    $lnk = $shell.CreateShortcut($TrayShortcut)
+    $lnk.TargetPath = $TrayExe
+    $lnk.WorkingDirectory = $TrayDir
+    $lnk.Description = 'sukarfleet console'
+    $lnk.Save()
+  } catch { Write-Warn "could not create the Start menu shortcut: $($_.Exception.Message)" }
+
+  # Autostart. This is the same registry value the tray's own "Start at login" checkbox
+  # toggles, written in the form that checkbox writes, so the installer and the tray never
+  # disagree about whether it is on.
+  try {
+    if (-not (Test-Path -LiteralPath $RunKey)) { [void] (New-Item -Path $RunKey -Force) }
+    Set-ItemProperty -LiteralPath $RunKey -Name $RunValueName -Value ('"' + $TrayExe + '"')
+  } catch { Write-Warn "could not register the tray to start at sign-in: $($_.Exception.Message)" }
+
+  $result.WebView2 = Get-WebView2Version
+
+  $already = @(Get-Process -Name 'sukarfleet-tray' -ErrorAction SilentlyContinue)
+  if ($already.Count -gt 0) {
+    $result.Started = $true
+  } else {
+    # Started now rather than at the next sign-in, so the console is open when this script
+    # finishes rather than tomorrow morning.
+    try {
+      [void] (Start-Process -FilePath $TrayExe -WorkingDirectory $TrayDir)
+      $result.Started = $true
+    } catch {
+      Write-Warn "the tray is installed but would not start now: $($_.Exception.Message). It starts at your next sign-in."
+    }
+  }
+  return $result
+}
+
 function Show-Banner {
-  param([string] $UiUrl, [string] $RepoRoot, [string] $Bun, [bool] $SealOk)
+  param([string] $UiUrl, [string] $RepoRoot, [string] $Bun, [bool] $SealOk, [hashtable] $Tray)
 
   $mesh = Get-Service -Name $MeshServiceName -ErrorAction SilentlyContinue
   Write-Host ''
   Write-Host '  ------------------------------------------------------------------------'
   Write-Host "  sukarfleet is installed on $MachineName."
   Write-Host ''
+  if ($Tray -and $Tray.Installed) {
+    Write-Host "  Console:  the sukarfleet icon in the notification area. Left click opens it;"
+    Write-Host "            right click is the menu. $TrayExe"
+    if (-not $Tray.WebView2) {
+      Write-Host '            Its WINDOW needs the WebView2 runtime, which this machine does not have:'
+      Write-Host '            the icon and the menu work, the window will not open. Until you install'
+      Write-Host '            it (winget install --id Microsoft.EdgeWebView2Runtime) use the GUI below.'
+    }
+  } else {
+    $why = if ($Tray) { $Tray.Reason } else { 'the tray was not attempted' }
+    Write-Host "  Console:  the browser GUI below. No tray on this machine: $why."
+    if ($Tray -and $Tray.Detail) { Write-Host "            $($Tray.Detail)" }
+  }
   Write-Host "  GUI:      $UiUrl"
   Write-Host "  Source:   $RepoRoot"
   Write-Host "  Config:   $ConfigFile"
@@ -1036,7 +1273,7 @@ function Show-Banner {
   Write-Host '  Next, in this order:'
   Write-Host "    1. Confirm this machine can reach the fleet: ping the mesh address of a machine"
   Write-Host '       already in it. No mesh, no pairing.'
-  Write-Host "    2. Open $UiUrl and add the repos you want synced. Clone each one first; the"
+  Write-Host '    2. Open the console and add the repos you want synced. Clone each one first; the'
   Write-Host '       daemon syncs repositories, it does not create them.'
   Write-Host '    3. Pair. Click Pair on a machine already in the fleet and type its code in here.'
   Write-Host ''
@@ -1049,7 +1286,11 @@ function Show-Banner {
     Write-Host '    - DPAPI did not round-trip for this user either, so nothing would be sealed.'
   }
   Write-Host ''
-  Write-Host '  Sync, gossip, pairing, the GUI and MCP all work. See docs/PLATFORMS.md.'
+  Write-Host '    - Pairing refuses on Windows today. A pairing bundle has to carry an SSH host'
+  Write-Host '      key and this machine has none: Windows ships the SSH client, not the server.'
+  Write-Host '      The message you get says "no usable SSH identity yet". docs/PLATFORMS.md.'
+  Write-Host ''
+  Write-Host '  Sync, gossip, the GUI and MCP all work. See docs/PLATFORMS.md.'
   Write-Host '  ------------------------------------------------------------------------'
   Write-Host ''
 }

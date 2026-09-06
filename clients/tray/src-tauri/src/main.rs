@@ -19,6 +19,26 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
 
+// A tray-first app that fails to start fails invisibly: no window appears, and
+// on Windows a GUI-subsystem binary has no console for a panic or an eprintln to
+// land in at all. Set SUKARFLEET_TRAY_TRACE to a file path and each startup stage
+// appends a line to it, so "it runs and nothing happens" becomes "it stopped
+// between these two lines". Set it to 1 for stderr, which is what a Linux
+// terminal wants.
+fn trace(stage: &str) {
+    let Some(dest) = std::env::var_os("SUKARFLEET_TRAY_TRACE") else { return };
+    let line = format!("sukarfleet-tray: {stage}\n");
+    if dest == "1" {
+        eprint!("{line}");
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&dest) {
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
+    }
+}
+
 pub struct Shared {
     pub endpoint: String,
     pub summary: Mutex<String>,
@@ -35,7 +55,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(10);
 const DOWN_BACKOFF_SECS: [u64; 6] = [1, 2, 4, 8, 16, 30];
 
 fn main() {
+    trace("main");
     let endpoint = config::endpoint();
+    trace("endpoint resolved");
     let shared = Arc::new(Shared {
         endpoint,
         summary: Mutex::new(String::new()),
@@ -43,24 +65,35 @@ fn main() {
         refresh: tokio::sync::Notify::new(),
     });
 
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
+    trace("builder");
+    let builder = tauri::Builder::default();
+    trace("plugin: notification");
+    let builder = builder.plugin(tauri_plugin_notification::init());
+    trace("plugin: clipboard");
+    let builder = builder.plugin(tauri_plugin_clipboard_manager::init());
+    trace("plugin: opener");
+    let builder = builder.plugin(tauri_plugin_opener::init());
+    trace("plugin: autostart");
+    let builder = builder.plugin(tauri_plugin_autostart::init(
+        tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+        None,
+    ));
+    trace("plugins registered");
+    let app = builder
         .invoke_handler(tauri::generate_handler![snapshot, api::api_call])
         .manage(shared.clone())
         .setup(move |app| {
+            trace("setup");
             tray::init(app.handle())?;
+            trace("tray created");
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move { poll_loop(handle, shared).await });
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building sukarfleet-tray");
+    trace("built");
+
 
     app.run(|_app, event| {
         // Tray-only app: closing the popover must not exit; only app.exit() (Quit) does.
@@ -80,6 +113,7 @@ async fn poll_loop(app: AppHandle, shared: Arc<Shared>) {
     let mut down_streak: usize = 0;
     let mut last_up_wall: Option<SystemTime> = None;
 
+    trace("poll loop");
     loop {
         let outcome = client.poll().await;
         let now = Instant::now();

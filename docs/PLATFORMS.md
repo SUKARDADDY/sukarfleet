@@ -10,7 +10,9 @@ Support levels here are claims about **testing**, not promises about behaviour.
 
 | Seam | Linux | macOS | Windows |
 |---|---|---|---|
-| Sync, gossip, pairing, console, MCP | supported | experimental | experimental |
+| Sync, gossip, web console, MCP | supported | experimental | experimental |
+| Pairing | supported | experimental | **blocked** (no SSH host keys) |
+| Native tray console | supported | no build | experimental |
 | Service manager | `systemctl --user` — supported | `launchctl kickstart` — experimental | `Restart-Service` — experimental |
 | Desktop notification | gdbus (freedesktop, GTK fallback) — supported | `osascript` — experimental | WinRT toast — experimental |
 | Credential store | `systemd-creds` — supported | login Keychain — experimental | DPAPI CurrentUser — experimental |
@@ -96,6 +98,29 @@ drive admin from a Linux machine.
 The installer is [`install/windows/`](../install/windows/README.md): double-click
 `Add-To-Fleet.cmd`. It writes `admin.enabled: false` rather than leaving a lane switched on that
 refuses at the first real call.
+
+The console is the tray, as on Linux. The binary is built on a Windows runner by
+[`.github/workflows/tray.yml`](../.github/workflows/tray.yml), because a Windows binary
+cross-compiled on Linux is one nobody has run; the installer fetches it from the release and checks
+it against the SHA256 in `install/easytier-pins.txt`. An unreleased, unpinned or undownloadable tray
+leaves the machine with the browser console and a line saying which of those happened. The console
+window itself is a WebView2 host: Windows 11 ships that runtime, Windows 10 may not, and the
+installer looks for it and says so rather than letting the window silently never appear.
+
+Two differences you will notice. Left click opens the console here and opens the menu on Linux,
+which is each platform's own convention. And the tray's offer to copy a log command for a node that
+has stopped answering copies `Get-ScheduledTaskInfo` instead: Windows has no journal and nothing
+captures the node's output, so there is no log file to name. To read what the node is saying, stop
+the task and run it in the foreground.
+
+**Pairing does not work on Windows today.** A pairing bundle must carry at least one SSH host key,
+and a Windows machine has none: Windows ships the OpenSSH client, not the server, and the daemon
+reads host keys from `/etc/ssh` regardless of platform. The redeem fails with "This machine has no
+usable SSH identity yet", which names the symptom and not the cause. Sync itself does not need SSH
+(peers fetch from each other over authenticated git-over-HTTP) and the admin lane is off on Windows
+anyway, so what the requirement protects on this platform is an open question rather than a missing
+implementation. Once host keys are present the rest works: a Windows node and a Linux node paired,
+gossiped and synced a repository in both directions on 2026-09-06.
 
 The machine key and the other private files the daemon writes rely on the installer's ACL rather
 than on mode bits. `Install-Sukarfleet.ps1` restricts `~/.config/sukarfleet` to your SID and lets
