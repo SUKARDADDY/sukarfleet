@@ -26,9 +26,11 @@ The tray icon IS the fleet health signal; the menu is the primary readout
   the menu has to open on the primary click; Windows delivers them and expects
   left for the thing, right for the menu. And a node that is not answering is a
   systemd user unit on Linux and a scheduled task on Windows, so the commands
-  offered for the clipboard differ. There is no log command on Windows, because
-  the task's output goes nowhere and naming a file that does not exist would
-  send someone looking for it.
+  offered for the clipboard differ. There is no log command on Windows: the
+  installer's preferred task runs hidden and its output goes nowhere, and the
+  fallback it uses on an account without the batch-logon right runs in a visible
+  console window that nothing captures either. Naming a log file that does not
+  exist would send someone looking for it.
 
 ## Building for Windows
 
@@ -41,8 +43,15 @@ To build it by hand on a Windows machine, install rustup with the MSVC toolchain
 and the Visual Studio C++ build tools, then:
 
 ```powershell
-cargo build --release --locked --manifest-path clients\tray\src-tauri\Cargo.toml
+cd clients\tray\src-tauri
+cargo build --release --locked
 ```
+
+From the crate directory, not with `--manifest-path` from the repository root:
+`.cargo/config.toml` there links the C runtime into the binary, and cargo finds
+that file by walking up from the working directory. A build started elsewhere
+produces a binary that needs the Visual C++ Redistributable installed and hangs
+before `main` on a machine without it.
 
 There is no frontend build step on any platform. `src/` is static files that
 tauri-build embeds as they are. The executable's icon comes from

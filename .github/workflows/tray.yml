@@ -46,8 +46,15 @@ jobs:
       # --locked because the lockfile is part of the tree: a build that quietly
       # resolves a different dependency graph than the one reviewed here is not
       # the build this repository describes.
+      #
+      # Run from the crate directory, not with --manifest-path from the root.
+      # Cargo reads .cargo/config.toml by walking up from the working directory,
+      # so a build started at the root silently ignores the crt-static setting
+      # that lives next to the crate, and produces a binary that needs the Visual
+      # C++ Redistributable. The check below is what catches that if it happens.
       - name: build
-        run: cargo build --release --locked --manifest-path clients/tray/src-tauri/Cargo.toml
+        working-directory: clients/tray/src-tauri
+        run: cargo build --release --locked
 
       - name: name and hash the asset
         shell: pwsh
