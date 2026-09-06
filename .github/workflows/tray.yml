@@ -63,6 +63,32 @@ jobs:
           Write-Host 'pin line for install/easytier-pins.txt (version column is the release tag without its v):'
           Write-Host "  <version>  x86_64   $sha  $out"
 
+      # A binary that builds and then cannot start is a build worth failing. The
+      # tray has no window and no console, so "it started" is not observable from
+      # outside: SUKARFLEET_TRAY_TRACE is how it says so. The runner has no
+      # daemon to talk to and its desktop is not a user's, so this asserts only
+      # the stages that are true anywhere, and prints the rest.
+      - name: smoke - does it start
+        shell: pwsh
+        run: |
+          $trace = Join-Path $PWD 'trace.txt'
+          $env:SUKARFLEET_TRAY_TRACE = $trace
+          $p = Start-Process -FilePath .\sukarfleet-tray-windows-x86_64.exe -PassThru
+          Start-Sleep -Seconds 25
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          if (-not (Test-Path $trace)) {
+            Write-Host 'no trace file at all: the binary did not reach the first line of main'
+            exit 1
+          }
+          $lines = Get-Content $trace
+          $lines | ForEach-Object { Write-Host "  $_" }
+          foreach ($want in @('main', 'endpoint resolved', 'plugins registered', 'built')) {
+            if (-not ($lines -match [regex]::Escape($want))) {
+              Write-Host "stopped before: $want"
+              exit 1
+            }
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: sukarfleet-tray-windows-x86_64
