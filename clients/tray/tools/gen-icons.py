@@ -96,4 +96,14 @@ for s, name in [(32, "32x32.png"), (128, "128x128.png"), (256, "128x128@2x.png")
     src512.resize((s, s), Image.LANCZOS).save(os.path.join(OUT, name))
 src512.save(os.path.join(OUT, "icon.png"))
 
+# Windows takes the executable's icon from a resource compiled into the binary at
+# build time, and Explorer, the taskbar, the Start menu and alt-tab each pull a
+# different size out of it. One .ico holds all of them; a PNG holds none, and a
+# Windows build without this file ships with the generic executable icon.
+src512.save(
+    os.path.join(OUT, "icon.ico"),
+    format="ICO",
+    sizes=[(s, s) for s in (16, 20, 24, 32, 40, 48, 64, 128, 256)],
+)
+
 print("icons written to", os.path.abspath(OUT))

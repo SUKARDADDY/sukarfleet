@@ -9,13 +9,35 @@ use std::sync::Arc;
 use tauri::{
     image::Image,
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, Wry,
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 pub const TRAY_ID: &str = "main";
+
+// What the unreachable menu offers to copy. The node is a systemd user unit on
+// Linux and a scheduled task on Windows, so one pair of strings for both would
+// be a confidently wrong answer on one of them.
+#[cfg(target_os = "windows")]
+mod cmds {
+    pub const START: &str = "Start-ScheduledTask -TaskName sukarfleet";
+    // The task's output goes nowhere. Windows has no journal, and the installer
+    // registers `bun run src\node.ts` as the task action rather than behind a
+    // shell that could redirect it, so there is no log file to tail and saying
+    // otherwise would send an operator looking for one. What does exist is the
+    // task's own last-run record, so that is what this offers, under a label
+    // that does not promise logs.
+    pub const CHECK: &str = "Get-ScheduledTaskInfo -TaskName sukarfleet";
+    pub const CHECK_LABEL: &str = "Copy check command";
+}
+#[cfg(not(target_os = "windows"))]
+mod cmds {
+    pub const START: &str = "systemctl --user start sukarfleet.service";
+    pub const CHECK: &str = "journalctl --user -u sukarfleet -n 200";
+    pub const CHECK_LABEL: &str = "Copy log command";
+}
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize)]
 pub struct MenuModel {
@@ -67,8 +89,25 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon_for("unknown"))
         .menu(&menu)
-        .show_menu_on_left_click(true)
+        // Linux SNI delivers no click events, so the menu has to open on the
+        // primary click or the tray has no primary readout at all. Windows does
+        // deliver them, and its convention is the other way round: left opens
+        // the thing, right opens the menu. Following it costs one line, and a
+        // Windows hand does it without being told.
+        .show_menu_on_left_click(cfg!(target_os = "linux"))
         .on_menu_event(|app, event| handle_menu_event(app, event.id.as_ref()))
+        .on_tray_icon_event(|tray, event| {
+            // Never fires on Linux. On Windows this is the left click the line
+            // above stopped handing to the menu.
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                crate::window::show_console(tray.app_handle());
+            }
+        })
         .build(app)?;
     Ok(())
 }
@@ -95,7 +134,13 @@ fn build_menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<Wry>> {
             true,
             None::<&str>,
         )?)?;
-        menu.append(&MenuItem::with_id(app, "copy-logs", "Copy log command", true, None::<&str>)?)?;
+        menu.append(&MenuItem::with_id(
+            app,
+            "copy-logs",
+            cmds::CHECK_LABEL,
+            true,
+            None::<&str>,
+        )?)?;
     } else {
         if m.faults.is_empty() {
             menu.append(&MenuItem::with_id(app, "all-green", "All green", false, None::<&str>)?)?;
@@ -159,10 +204,10 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             let _ = app.clipboard().write_text(text);
         }
         "copy-start" => {
-            let _ = app.clipboard().write_text("systemctl --user start sukarfleet.service");
+            let _ = app.clipboard().write_text(cmds::START);
         }
         "copy-logs" => {
-            let _ = app.clipboard().write_text("journalctl --user -u sukarfleet -n 200");
+            let _ = app.clipboard().write_text(cmds::CHECK);
         }
         _ => {}
     }
