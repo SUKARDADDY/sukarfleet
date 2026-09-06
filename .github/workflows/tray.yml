@@ -63,6 +63,22 @@ jobs:
           Write-Host 'pin line for install/easytier-pins.txt (version column is the release tag without its v):'
           Write-Host "  <version>  x86_64   $sha  $out"
 
+      # The runner has the Visual C++ Redistributable, so a binary that imports
+      # VCRUNTIME140 starts here and stops dead on a clean machine, in front of a
+      # modal dialog raised before main. The smoke below cannot see that; this
+      # can. .cargo/config.toml links the runtime in statically, and this is the
+      # check that says it still does.
+      - name: no dependency on the VC++ redistributable
+        shell: pwsh
+        run: |
+          $hit = Select-String -Path .\sukarfleet-tray-windows-x86_64.exe -Pattern 'VCRUNTIME140' -Encoding ascii -List
+          if ($hit) {
+            Write-Host 'the binary imports VCRUNTIME140: it will not start on a machine without the'
+            Write-Host 'Visual C++ Redistributable, and will hang in front of a dialog rather than exit.'
+            exit 1
+          }
+          Write-Host 'no VCRUNTIME140 import'
+
       # A binary that builds and then cannot start is a build worth failing. The
       # tray has no window and no console, so "it started" is not observable from
       # outside: SUKARFLEET_TRAY_TRACE is how it says so. The runner has no
