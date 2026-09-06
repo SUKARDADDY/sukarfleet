@@ -6,13 +6,22 @@
 #   version   arch   sha256   asset
 #
 #   version  upstream version string, no leading 'v'
-#   arch     the `uname -m` token this line is for
+#   arch     the token the consumer of this line uses for the architecture, which
+#            is `uname -m` on Linux and the x86_64/arm64 mapping of
+#            %PROCESSOR_ARCHITECTURE% on Windows. They agree on x86_64 and differ
+#            on ARM (aarch64 vs arm64), so a Linux line and a Windows line for
+#            the same ARM machine are two different lines, as they should be:
+#            they name two different assets.
 #   sha256   lowercase hex, 64 characters, of the asset as downloaded
 #   asset    the exact release asset filename
 #
-# The asset name is what tells the two consumers apart. install-elevated.sh's
+# The asset name is what tells the three consumers apart. install-elevated.sh's
 # fetch_easytier reads the lines whose asset starts with 'easytier-linux-';
-# quickstart.sh's tray fetch reads the ones starting 'sukarfleet-tray-'.
+# quickstart.sh's tray fetch reads the ones starting 'sukarfleet-tray-linux-';
+# Install-Sukarfleet.ps1's Get-Pin reads 'sukarfleet-tray-windows-'. Each prefix
+# is the full platform, not a family: 'sukarfleet-tray-' would match both trays
+# at once, and two lines for one (version, arch) is exactly the contradiction the
+# duplicate check below refuses to guess its way out of.
 #
 # A sha256 of TODO-S9 means "no pin exists yet". Nothing is downloaded against a
 # TODO pin: quickstart treats a TODO tray line as "no tray available" and prints
@@ -53,3 +62,9 @@
 # the same token.
 0.1.0  x86_64   326fab24863553705fb0752dd01fd29ec11d18fba9b125f4c747c2794303cd4a  sukarfleet-tray-linux-x86_64
 0.1.0  aarch64  TODO-S9                   sukarfleet-tray-linux-aarch64
+
+# The Windows tray, built by .github/workflows/tray.yml on a Windows runner and
+# read by Install-Sukarfleet.ps1. Same two tokens, same meanings: x86_64 is built
+# and waiting for the tag that hashes it, and there is no arm64 build at all.
+0.1.0  x86_64   SHA256-FILLED-AT-RELEASE  sukarfleet-tray-windows-x86_64.exe
+0.1.0  arm64    TODO-S9                   sukarfleet-tray-windows-arm64.exe

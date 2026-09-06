@@ -12,6 +12,26 @@ other. Anything else has to be read here first.
 
 ## [Unreleased]
 
+### Added
+
+- **The tray console on Windows.** A Windows machine gets the same tray icon and console window a
+  Linux one gets, rather than a URL to paste into a browser.
+  [`.github/workflows/tray.yml`](.github/workflows/tray.yml) builds the binary on a Windows runner,
+  and `Install-Sukarfleet.ps1` fetches it, checks it against the SHA256 pinned in
+  [`install/easytier-pins.txt`](install/easytier-pins.txt), puts it in the Start menu and registers
+  it to start at sign-in. Nothing about it can fail an install: an unreleased, unpinned or
+  undownloadable tray leaves the machine with the browser console and says which of those it was.
+- The tray now follows the platform it runs on. Left click opens the console on Windows and the
+  menu on Linux, which is each platform's own convention and, on Linux, the only option, since SNI
+  trays deliver no click events. For a node that is not answering it copies the scheduled task's
+  start command on Windows instead of systemd's.
+
+### Changed
+
+- The Linux tray pin lookup asks for `sukarfleet-tray-linux-` rather than `sukarfleet-tray-`, which
+  the Windows lines also match. Two pins for one version and architecture are refused, not guessed
+  between, so leaving it would have cost Linux its tray the moment Windows got one.
+
 ## [0.1.0] - 2026-09-05
 
 First public release. It has run the maintainers' own two-machine fleet daily since 2026-08-04.
