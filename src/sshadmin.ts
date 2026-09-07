@@ -56,6 +56,8 @@ import {
   AUDIT_KIND_ADMIN_RUN_REQUESTED,
 } from './audit';
 import { canonicalJson, ensureDir, log, nowMs, run } from './util';
+import { currentPlatform } from './platform';
+import type { PlatformId } from './platform';
 
 // ---------------------------------------------------------------------------
 // Tunables. None of these belong in FleetConfig.admin (which pins the operator-facing numbers);
@@ -169,11 +171,15 @@ export interface SshAdminDeps {
   now?: () => number;
   // Test seams, all additive and all defaulted (mirrors executor.ts's ExecutorDeps.now and
   // keys.ts's opts.keyPath convention). `secrets` defaults to the real secrets.ts module,
-  // `publicKeyJwk` to this machine's on-disk machine key, `sshHostKeyDir` to /etc/ssh.
+  // `publicKeyJwk` to this machine's on-disk machine key. `sshHostKeyDir`, when set, is read as-is;
+  // when unset the source is platform-chosen (see localHostKeys).
   runner?: typeof run;
   secrets?: SudoBroker;
   publicKeyJwk?: JsonWebKey;
   sshHostKeyDir?: string;
+  // Forces the host-key branch (see localHostKeys). Defaults to currentPlatform(); a test sets it
+  // to 'windows' to exercise the self-minted host key without running on Windows.
+  platform?: PlatformId;
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,8 +1235,11 @@ export class SshAdmin {
     };
   }
 
-  private async localHostKeys(): Promise<string[]> {
-    const dir = this.deps.sshHostKeyDir ?? '/etc/ssh';
+  private resolvePlatform(): PlatformId {
+    return this.deps.platform ?? currentPlatform();
+  }
+
+  private async readHostKeyDir(dir: string): Promise<string[]> {
     try {
       const names = (await readdir(dir)).filter((n) => n.startsWith('ssh_host_') && n.endsWith('_key.pub')).sort();
       const out: string[] = [];
@@ -1243,6 +1252,51 @@ export class SshAdmin {
       log('warn', 'sshadmin: could not read local ssh host keys', { dir, error: String(err) });
       return [];
     }
+  }
+
+  private async localHostKeys(): Promise<string[]> {
+    // An explicit directory (test seam, or an operator override) is read exactly as given.
+    if (this.deps.sshHostKeyDir) return this.readHostKeyDir(this.deps.sshHostKeyDir);
+    // A Windows node does not run sshd -- the installer needs only the SSH client -- and keeps the
+    // admin lane off, so it can have no host keys at all, and the ones under %ProgramData%\ssh (if
+    // sshd is present) are Administrator-only and not this unprivileged process's to read. Its
+    // pairing identity is therefore a host key it owns and mints once under stateDir(). Advertising
+    // a host key for a service it does not run is harmless: no peer dials a Windows node's admin
+    // lane (it is off), and a pair bundle must still carry >=1 host key (pairing.ts sanitizeBundle).
+    if (this.resolvePlatform() === 'windows') {
+      const minted = await this.ensureNodeHostKey();
+      return minted ? [minted] : [];
+    }
+    // POSIX: the system host keys are the identity. An empty /etc/ssh stays empty -- there a
+    // missing host key is something the operator should see, not something to paper over.
+    return this.readHostKeyDir('/etc/ssh');
+  }
+
+  // A persistent ed25519 host key the node owns, kept under stateDir() so it survives restarts and
+  // is the machine's stable pairing identity. Generated once; a failure is logged and degrades to
+  // "no host key" (an honest unpairable bundle) rather than throwing into the pairing path.
+  private async ensureNodeHostKey(): Promise<string | null> {
+    const keyDir = join(stateDir(), 'hostkey');
+    const keyPath = join(keyDir, 'ssh_host_ed25519_key');
+    const pubPath = `${keyPath}.pub`;
+    const existing = normalizePubKey(await readFileOrEmpty(pubPath));
+    if (existing && (await Bun.file(keyPath).exists())) return existing;
+    await ensureDir(keyDir);
+    const res = await this.runner(
+      ['ssh-keygen', '-t', 'ed25519', '-N', '', '-C', `sukarfleet-host-${this.cfg.machine}`, '-f', keyPath],
+      { timeoutMs: 30000 },
+    );
+    if (res.code !== 0) {
+      log('warn', 'sshadmin: could not mint a node host key', { keyPath, code: res.code, error: res.stderr.trim() });
+      return null;
+    }
+    const minted = normalizePubKey(await readFileOrEmpty(pubPath));
+    if (!minted) {
+      log('warn', 'sshadmin: ssh-keygen produced no host public key', { pubPath });
+      return null;
+    }
+    log('info', 'sshadmin: minted a node host key for pairing', { keyPath });
+    return minted;
   }
 
   async localBundle(): Promise<PairBundle> {
