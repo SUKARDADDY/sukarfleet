@@ -66,20 +66,24 @@ interface Recorder {
   stats: PresenceRepoStat[];
   pushes: (number | null)[];
   conflicts: string[];
+  notApplicable: string[];
 }
 
 function recorder(vetted = true): Recorder {
   const stats: PresenceRepoStat[] = [];
   const pushes: (number | null)[] = [];
   const conflicts: string[] = [];
+  const notApplicable: string[] = [];
   return {
     stats,
     pushes,
     conflicts,
+    notApplicable,
     deps: {
       isClockVetted: () => vetted,
       onRepoStat: (_r, s) => stats.push(s),
       onGithubPush: (_r, ms) => pushes.push(ms),
+      onGithubPushNotApplicable: (r) => notApplicable.push(r),
       onConflictArtifact: (_r, p) => conflicts.push(p),
       machineKey: TEST_MACHINE_KEY,
     },
@@ -197,6 +201,29 @@ test('refuses to sync when HEAD is not sync/<machine>', async () => {
   expect(rec.stats).toHaveLength(1);
   expect(rec.stats[0]!.syncError).toMatch(/expected 'sync\/alpha'/);
   expect(rec.stats[0]!.lastSyncOkMs).toBeNull();
+});
+
+test('a repo with no origin reports GitHub push not-applicable, never a null push', async () => {
+  // setupPair strips beta's origin, which is exactly a machine kept off GitHub. Before this,
+  // pushOrigin returned silently and left node.ts's boot-time null in githubPushOkMs, which
+  // health.ts reads as "overdue by forever" -- a permanent github-push-stale alarm on a repo
+  // that is syncing perfectly, and it drags the peer's syncStale with it.
+  const { dirA, syncA, syncB, recA, recB, repoA, repoB } = await setupPair({ 'seed.txt': 'seed\n' });
+
+  await writeFile(join(dirA, 'foo.txt'), 'hello\n');
+  await syncA.syncOnce(repoA);
+  await syncB.syncOnce(repoB);
+
+  // beta: no origin -> not-applicable, and nothing recorded in the push table at all.
+  expect(recB.notApplicable).toContain(repoB.name);
+  expect(recB.pushes).toHaveLength(0);
+  // beta still synced fine; the absence of a GitHub remote is not a sync fault.
+  expect(recB.stats.at(-1)!.syncError).toBeNull();
+  // setupPair gives neither machine an origin, so alpha reports the same thing for the same
+  // reason. The origin-present path stays covered by the pushOrigin tests below, which assert a
+  // push IS recorded -- they would fail if this branch swallowed them.
+  expect(recA.notApplicable).toContain(repoA.name);
+  expect(recA.pushes).toHaveLength(0);
 });
 
 test('first sync round-trips a file between two machines', async () => {
