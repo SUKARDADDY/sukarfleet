@@ -1175,6 +1175,45 @@ describe('ssh identity and peer trust files', () => {
     expect(first.sshPublicKey.split(' ').length).toBe(2);
   });
 
+  test('localHostKeys mints a node host key on Windows when the host-key dir is empty', async () => {
+    const cfg = cfgFor('beta');
+    const admin = new SshAdmin({
+      cfg,
+      auditAppend: async () => ({}) as AuditEntry,
+      peerView: () => null,
+      now,
+      platform: 'windows',
+      // No sshHostKeyDir: a Windows node with no system host keys mints its own.
+    });
+    const bundle = await admin.localBundle();
+    // The exact condition pairing.ts sanitizeBundle enforces: a pairable bundle carries >=1 host key.
+    expect(bundle.sshHostKeys.length).toBe(1);
+    expect(bundle.sshHostKeys[0]!.startsWith('ssh-ed25519 ')).toBe(true);
+    // Stable identity: a second assembly reuses the minted key rather than rolling a new one.
+    const again = await admin.localBundle();
+    expect(again.sshHostKeys).toEqual(bundle.sshHostKeys);
+  });
+
+  test('localHostKeys prefers real host keys present in the dir over minting', async () => {
+    const cfg = cfgFor('beta');
+    const hkdir = join(dir, 'winssh');
+    await mkdir(hkdir, { recursive: true });
+    const real = await realKey('winssh/ssh_host_ed25519_key');
+    const admin = new SshAdmin({
+      cfg,
+      auditAppend: async () => ({}) as AuditEntry,
+      peerView: () => null,
+      now,
+      platform: 'windows',
+      sshHostKeyDir: hkdir,
+    });
+    const bundle = await admin.localBundle();
+    // Host keys are stored bare (type + base64, comment stripped), the same normalisation the
+    // fleet key gets, so compare against the two-field form rather than the commented .pub.
+    const bare = real.pub.split(' ').slice(0, 2).join(' ');
+    expect(bundle.sshHostKeys).toContain(bare);
+  });
+
   test('writeAuthorizedKey builds the option prefix locally and replaces by marker', async () => {
     const { pub } = await realKey('peer_key');
     const cfg = cfgFor('alpha'); // anchor: cloudflared terminates on its loopback
