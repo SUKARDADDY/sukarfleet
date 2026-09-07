@@ -601,6 +601,7 @@ async function main(): Promise<void> {
     },
     onRepoStat: (repoName, stat) => selfRepoStats.set(repoName, stat),
     onGithubPush: (repoName, okMs) => githubPushOkMs.set(repoName, okMs),
+    onGithubPushNotApplicable: (repoName) => githubPushOkMs.delete(repoName),
     onConflictArtifact: (repoName, path) => {
       log('warn', 'sync: losing side of a conflict preserved as an artifact', { repo: repoName, path });
     },

@@ -17,6 +17,10 @@ export interface SyncerDeps {
   isClockVetted: () => boolean;
   onRepoStat: (repo: string, stat: PresenceRepoStat) => void;
   onGithubPush: (repo: string, okMs: number | null) => void;
+  // Called INSTEAD of onGithubPush when the repo has no `origin` at all, so the daemon can drop
+  // it from the GitHub-push table entirely. Optional: an additive seam, and a caller that omits
+  // it keeps the previous behaviour. See pushOrigin for why a null is not good enough.
+  onGithubPushNotApplicable?: (repo: string) => void;
   onConflictArtifact: (repo: string, path: string) => void;
   // This machine's signing identity. Required to attach the x-fleet-auth header that
   // gitserve.ts mandates on every peer fetch (see fetchAll below). Contract addition —
@@ -444,7 +448,14 @@ export class Syncer {
   // (5) push sync/<machine> to origin with retries+backoff; skip cleanly when origin is absent.
   private async pushOrigin(repo: RepoConfig): Promise<void> {
     const originUrl = await this.git(repo.path, ['remote', 'get-url', 'origin']);
-    if (originUrl.code !== 0) return; // no GitHub backup configured
+    if (originUrl.code !== 0) {
+      // No GitHub backup for this repo. Say so explicitly rather than leaving the boot-time null
+      // in the table: health.ts reads a null as "overdue by forever" and raises github-push-stale
+      // every cycle, so a machine that was never meant to push alarms permanently -- and that
+      // fault drags the peer's syncStale true, misreporting a repo that is syncing perfectly.
+      this.deps.onGithubPushNotApplicable?.(repo.name);
+      return;
+    }
     const branch = `sync/${this.cfg.machine}`;
     const attempts = this.pushBackoffMs.length + 1;
     for (let i = 0; i < attempts; i++) {
