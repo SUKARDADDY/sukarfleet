@@ -32,6 +32,17 @@ const COPY = {
   laneStale: 'The stored sudo password was rejected. Re-enter it under Credentials.',
   noFaults: 'No alarms.',
   noPeers: 'No peers configured yet. Pair with another machine.',
+  noEnrollments: 'No installers generated yet.',
+  enrollLoading: 'Reading the installers on this machine…',
+  enrollBlocked: 'This machine cannot generate an installer yet.',
+  enrollReady: (ref) => `Ready. A generated installer downloads sukarfleet ${ref || 'from the release'} and pairs itself with this machine.`,
+  enrollNeedsName: 'Give the new machine a name first.',
+  enrollWorking: 'Generating…',
+  enrollFailed: 'The installer could not be generated.',
+  enrollMade: (path) => `Written to ${path}. Copy it to the new machine and double-click it. Valid for 24 hours, once.`,
+  enrollRevokeConfirm: (m) => `Revoke the installer for ${m}? It stops working immediately. This does NOT rotate the mesh secret it already carries, so delete the file too.`,
+  enrollRevoked: (m) => `The installer for ${m} is revoked.`,
+  enrollRevokeFailed: 'That installer was already used, already revoked, or is no longer on file.',
   noRepos: 'No repositories configured.',
   noRuns: 'No admin runs since the daemon started.',
   noAudit: 'No audit entries yet.',
@@ -375,6 +386,8 @@ const store = {
   runs: [],
   audit: [],
   pair: null,
+  // null = not read yet, 'unsupported' = this daemon has no enrollment route.
+  enroll: null,
   mesh: null,
   activeRunId: null,
   activeRun: null,
@@ -391,6 +404,7 @@ const store = {
   // survives that rebuild; a purely local DOM branch would not.
   confirm: {
     revoke: null, // machine name, or null
+    enrollRevoke: null, // enrollment id, or null
     sudoRemove: false,
     restart: false,
     identityRestart: false,
@@ -589,6 +603,8 @@ function renderFleet() {
     { node: el('span', 'mono', r.lastCommit ? r.lastCommit.slice(0, 12) : '—') },
     r.syncError || '',
   ])), COPY.noRepos, 5);
+
+  renderEnroll();
 
   renderRestartControl($('restart-actions'), 'restart-result', 'restart', 'danger');
 }
@@ -822,6 +838,8 @@ async function refreshScreen(screen) {
       store.adminStatus = Array.isArray(status) ? status : [];
       store.runs = Array.isArray(runs) ? runs : [];
       store.audit = audit && Array.isArray(audit.entries) ? audit.entries : [];
+    } else if (screen === 'fleet') {
+      await refreshEnroll();
     } else if (screen === 'setup') {
       await loadMeshSecret();
     }
@@ -1313,6 +1331,131 @@ function wireNav() {
   });
 }
 
+// ── enrollment: one-click installers for machines that are not here yet ────
+
+const ENROLL_STATE_TEXT = {
+  live: 'ready to use',
+  used: 'used',
+  revoked: 'revoked',
+  expired: 'expired',
+};
+
+function renderEnroll() {
+  const form = $('enroll-form');
+  if (!form) return;
+  const card = form.closest('.card');
+  const data = store.enroll;
+
+  // A daemon built without the route hides the card rather than showing one that cannot work.
+  if (data === 'unsupported') { show(card, false); return; }
+  show(card, true);
+
+  const button = $('enroll-generate');
+  if (!data) {
+    statusLine('enroll-state', COPY.enrollLoading, 'dot-idle');
+    return;
+  }
+
+  const s = data.suggest || {};
+  if (s.canMint) {
+    statusLine('enroll-state', COPY.enrollReady(s.ref), 'dot-ok');
+    if (button) button.disabled = false;
+  } else {
+    statusLine('enroll-state', s.blocked || COPY.enrollBlocked, 'dot-warn');
+    if (button) button.disabled = true;
+  }
+  setText('enroll-alloc-note', [s.meshIpFrom, s.rosterCaveat].filter(Boolean).join(' · '));
+
+  // The allocated address is offered as a PLACEHOLDER, never written into the field. A poll every
+  // three seconds that overwrote what the operator had just typed would be unusable.
+  const meshInput = $('enroll-meship');
+  if (meshInput && s.meshIp) meshInput.placeholder = s.meshIp;
+
+  fillTable($('enroll-table'), (data.enrollments || []).map((e) => row([
+    e.machine,
+    { node: el('span', 'mono', `${e.meshIp}:${e.nodePort}`) },
+    ENROLL_STATE_TEXT[e.state] || e.state,
+    e.state === 'live' ? fmtClock(e.expiresMs) : '—',
+    { node: el('span', 'mono', e.installerPath) },
+    { node: enrollRevokeCell(e) },
+  ])), COPY.noEnrollments, 6);
+}
+
+// Same in-place confirm the peer rows use: this console is a webview, where a window.confirm() is
+// not a dialog anyone should count on. Revoke is offered only while there is something to revoke.
+function enrollRevokeCell(entry) {
+  if (store.confirm.enrollRevoke === entry.id) {
+    return confirmStrip({
+      message: COPY.enrollRevokeConfirm(entry.machine),
+      confirmLabel: 'Revoke',
+      danger: true,
+      onConfirm: async () => {
+        store.confirm.enrollRevoke = null;
+        try {
+          const res = await api('/api/ui/enroll/revoke', { method: 'POST', body: { id: entry.id } });
+          if (res && res.ok === false) flash(res.message || COPY.enrollRevokeFailed, 'bad');
+          else flash(COPY.enrollRevoked(entry.machine), 'ok');
+        } catch (err) {
+          flash(err.message, 'bad');
+        }
+        await refreshEnroll();
+        render();
+      },
+      onCancel: () => { store.confirm.enrollRevoke = null; render(); },
+    });
+  }
+  const button = el('button', 'quiet danger', 'revoke');
+  button.type = 'button';
+  button.disabled = entry.state !== 'live';
+  button.addEventListener('click', () => {
+    store.confirm.enrollRevoke = entry.id;
+    render();
+  });
+  return button;
+}
+
+async function refreshEnroll() {
+  try {
+    store.enroll = await api('/api/ui/enroll');
+  } catch (err) {
+    // 404 is "this daemon does not have the feature", which is a permanent answer and latches.
+    // Anything else is a transient the operator should see once, without losing the last good list.
+    if (err.status === 404) store.enroll = 'unsupported';
+    else flash(err.message, 'bad');
+  }
+}
+
+function wireEnroll() {
+  const form = $('enroll-form');
+  if (!form) return;
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const machine = ($('enroll-machine').value || '').trim();
+    const meshIp = ($('enroll-meship').value || '').trim();
+    if (!machine) { result('enroll-result', COPY.enrollNeedsName, 'bad'); return; }
+
+    const button = $('enroll-generate');
+    if (button) button.disabled = true;
+    result('enroll-result', COPY.enrollWorking, '');
+    try {
+      const body = meshIp ? { machine, meshIp } : { machine };
+      const res = await api('/api/ui/enroll', { method: 'POST', body });
+      if (res && res.ok) {
+        result('enroll-result', COPY.enrollMade(res.view.installerPath), 'ok');
+        $('enroll-machine').value = '';
+        $('enroll-meship').value = '';
+      } else {
+        result('enroll-result', (res && res.message) || COPY.enrollFailed, 'bad');
+      }
+    } catch (err) {
+      result('enroll-result', err.message, 'bad');
+    }
+    if (button) button.disabled = false;
+    await refreshEnroll();
+    render();
+  });
+}
+
 let statePoller = null;
 
 function startPolling() {
@@ -1339,6 +1482,7 @@ wireSetup();
 wirePair();
 wireCredentials();
 wireAdmin();
+wireEnroll();
 render();
 pollState();
 startPolling();

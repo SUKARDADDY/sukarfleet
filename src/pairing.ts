@@ -46,6 +46,7 @@ import type { AuditEntry, FleetConfig, PairBundle, PairHelloResponse } from './t
 import { b64decode, b64encode, canonicalJson, log, nowMs, sleep } from './util';
 import { readCappedBody } from './http';
 import { AUDIT_KIND_PAIR_ACCEPTED } from './audit';
+import { ENROLL_ID_RE, ENROLL_TOKEN_RE, deriveEnrollKey, type EnrollmentPort } from './enroll';
 
 // ---------------------------------------------------------------------------
 // Tunables. Local constants rather than FleetConfig.admin fields: none of these is a per-machine
@@ -423,6 +424,11 @@ interface HelloPayload {
   v: 1;
   from: unknown;
   tsMs: number;
+  // Present only on an enrollment hello: the PUBLIC id of the token this exchange authenticates
+  // against, naming which credential the responder should check the MAC with. The token itself
+  // never travels; it is only ever key material. Absent means the typed pairing code, so a hello
+  // from a machine that predates enrollment canonicalises byte for byte as it always did.
+  enrollId?: string;
 }
 
 function parseHelloRequest(v: unknown): { payload: HelloPayload; mac: string } | null {
@@ -434,10 +440,17 @@ function parseHelloRequest(v: unknown): { payload: HelloPayload; mac: string } |
   if (p.v !== 1) return null;
   if (typeof p.tsMs !== 'number' || !Number.isFinite(p.tsMs)) return null;
   if (typeof p.from !== 'object' || p.from === null) return null;
+  // Shape-checked here so a malformed id is one 400 among all the others rather than a 401 that
+  // tells a prober its id was at least the right shape.
+  let enrollId: string | undefined;
+  if (p.enrollId !== undefined) {
+    if (typeof p.enrollId !== 'string' || !ENROLL_ID_RE.test(p.enrollId)) return null;
+    enrollId = p.enrollId;
+  }
   // `from` is carried through as the parsed object (the MAC covers canonicalJson of it verbatim,
   // and sanitizeBundle rebuilds it later). Any UNKNOWN top-level payload member is dropped here,
   // which makes the recomputed MAC disagree -- fail closed, by construction rather than by check.
-  return { payload: { v: 1, from: p.from, tsMs: p.tsMs }, mac: r.mac };
+  return { payload: { v: 1, from: p.from, tsMs: p.tsMs, ...(enrollId ? { enrollId } : {}) }, mac: r.mac };
 }
 
 function parseHelloResponse(v: unknown): { payload: HelloPayload & { reqSha256: string }; mac: string } | null {
@@ -466,6 +479,10 @@ export interface PairingDeps {
   // on a healthy machine -- a platform that refuses scrypt -- and that path has to be exercised
   // rather than reasoned about.
   deriveKey?: (code: string) => Promise<CryptoKey>;
+  // The enrollment-token store, when this machine can accept installer-driven pairings. Absent on
+  // a machine that has none -- and its absence is a refusal, not a crash: an enrollment hello then
+  // gets the same 401 as every other unauthenticated one.
+  enrollments?: EnrollmentPort;
 }
 
 interface ActiveCode {
@@ -619,6 +636,15 @@ export class Pairing {
     // be able to tell "no code minted" from "wrong code" from "expired" from "already burned".
     if (!this.fresh(hello.payload.tsMs)) return this.unauthorized(startMs);
 
+    // Which credential this hello claims to authenticate against is chosen ONCE, here, by a field
+    // the MAC covers. It is deliberately not "try the code, then try every token": iterating
+    // credentials would put the number of live enrollments into the response time of a failed
+    // hello, which is exactly the kind of signal the identical 401 and the timing floor exist to
+    // deny. One hello, one candidate key, one answer.
+    if (hello.payload.enrollId !== undefined) {
+      return this.helloByEnrollment(hello.payload.enrollId, hello, peer, startMs);
+    }
+
     const live = this.liveCode();
     if (!live) return this.unauthorized(startMs);
 
@@ -657,6 +683,69 @@ export class Pairing {
     // One-shot: burned synchronously, before any further await, so nothing can redeem it twice.
     this.active = null;
 
+    return this.completeHello(key, hello.payload, peer);
+  }
+
+  // The enrollment half of handleHello: same exchange, different credential. Everything the typed
+  // code gets from being minted moments ago and living in memory, a token gets from the store --
+  // liveness, single use, and the two identity fields it was bound to at mint.
+  private async helloByEnrollment(
+    enrollId: string,
+    hello: { payload: HelloPayload; mac: string },
+    peer: SanitizedBundle,
+    startMs: number,
+  ): Promise<Response> {
+    const port = this.deps.enrollments;
+    // A machine with no enrollment store REFUSES rather than fails: to a caller this is the same
+    // 401 as a wrong token, so probing cannot tell a daemon that has the feature from one that
+    // does not.
+    if (!port) return this.unauthorized(startMs);
+
+    const grant = await port.lookup(enrollId).catch((err: unknown) => {
+      log('warn', 'pairing: enrollment lookup failed', { error: String(err) });
+      return null;
+    });
+    if (!grant) return this.unauthorized(startMs);
+
+    const expected = await macRequest(grant.key, hello.payload);
+    if (!constantTimeEqual(expected, hello.mac)) {
+      log('warn', 'pairing: enrollment hello rejected, mac mismatch', { enrollId });
+      return this.unauthorized(startMs);
+    }
+
+    // Bindings are checked AFTER the MAC, on purpose. Checked before it, a caller holding only the
+    // id could walk names and addresses until the answer changed and learn what the installer was
+    // minted for; checked after, a caller who can reach this line already holds the token.
+    //
+    // There is no attempt counter and no burn on a bad MAC here: see the note in src/enroll.ts.
+    // At 256 bits an attempt budget bounds nothing, and one that a broken installer can trip locks
+    // the operator out of their own enrollment.
+    if (peer.bundle.machine !== grant.machine || peer.bundle.meshIp !== grant.meshIp) {
+      log('warn', 'pairing: enrollment hello rejected, identity does not match the token', {
+        enrollId,
+        expectedMachine: grant.machine,
+        gotMachine: peer.bundle.machine,
+      });
+      return this.unauthorized(startMs);
+    }
+
+    // THE one-shot, and it is the store's compare-and-set rather than a local flag: two installers
+    // racing the same token resolve to one success and one identical 401. Burned before applyPeer,
+    // matching the typed-code path -- a token that got as far as installing a peer is spent whether
+    // or not the rest of the exchange completes.
+    const burned = await port.burn(enrollId, peer.bundle.machine).catch((err: unknown) => {
+      log('error', 'pairing: could not burn enrollment token', { enrollId, error: String(err) });
+      return false;
+    });
+    if (!burned) return this.unauthorized(startMs);
+
+    return this.completeHello(grant.key, hello.payload, peer);
+  }
+
+  // Everything after the credential is accepted, shared by both paths so neither can drift into a
+  // weaker version of it: local bundle validated against its own validator, peer installed,
+  // response MAC'd with the request's digest bound in.
+  private async completeHello(key: CryptoKey, helloPayload: HelloPayload, peer: SanitizedBundle): Promise<Response> {
     let selfBundle: PairBundle;
     try {
       selfBundle = await this.deps.localBundle();
@@ -685,7 +774,7 @@ export class Pairing {
       v: 1 as const,
       from: selfBundle,
       tsMs: this.now(),
-      reqSha256: sha256B64(canonicalJson(hello.payload)),
+      reqSha256: sha256B64(canonicalJson(helloPayload)),
     };
     const response: PairHelloResponse = { payload, mac: await macResponse(key, payload) };
 
@@ -694,16 +783,39 @@ export class Pairing {
     return jsonResponse(response, 200);
   }
 
-  // Initiator side: the operator typed the peer's code here. `host`/`port` come from the GUI, not
-  // from any peer-supplied field.
-  async redeem(input: { code: string; host: string; port: number }): Promise<{
+  // Initiator side. Two callers, one exchange:
+  //   - the operator typed the peer's code into this machine's console, or
+  //   - a generated installer read a token out of its own payload and called this with nobody
+  //     watching, which is the whole point of src/enroll.ts.
+  // `host`/`port` come from the GUI or the installer payload, never from a peer-supplied field.
+  async redeem(input: {
+    code?: string;
+    // Both or neither. Their presence is what selects the enrollment path.
+    enrollId?: string;
+    token?: string;
+    host: string;
+    port: number;
+  }): Promise<{
     ok: boolean;
     peer?: string;
     reason?: RedeemReason;
     message?: string;
   }> {
+    const enrolling = input.enrollId !== undefined || input.token !== undefined;
     const code = normalizeCode(input.code ?? '');
-    if (!isWellFormedCode(code)) return { ok: false, reason: 'bad-code', message: 'That code is not valid.' };
+    if (enrolling) {
+      // Shape only. Whether the token is the RIGHT one is the responder's answer, not ours.
+      if (
+        typeof input.enrollId !== 'string' ||
+        !ENROLL_ID_RE.test(input.enrollId) ||
+        typeof input.token !== 'string' ||
+        !ENROLL_TOKEN_RE.test(input.token)
+      ) {
+        return { ok: false, reason: 'bad-code', message: 'That enrollment token is not valid.' };
+      }
+    } else if (!isWellFormedCode(code)) {
+      return { ok: false, reason: 'bad-code', message: 'That code is not valid.' };
+    }
 
     const url = helloUrl(input.host, input.port);
     if (!url) return { ok: false, reason: 'unreachable', message: 'That address is not valid.' };
@@ -727,12 +839,20 @@ export class Pairing {
     // other machine did nothing wrong and the operator must not be sent hunting for a bad code.
     let key: CryptoKey;
     try {
-      key = await this.deriveKey(code);
+      // The enrollment derivation is a single SHA-256 and cannot fail the way scrypt can, but it
+      // goes through the same guard rather than a shortcut: one failure shape for one caller to
+      // handle.
+      key = enrolling ? await deriveEnrollKey(input.token!) : await this.deriveKey(code);
     } catch (err) {
       log('error', 'pairing: code key derivation failed, cannot redeem', { error: String(err) });
       return { ok: false, reason: 'bad-response', message: 'This machine could not prepare the pairing key.' };
     }
-    const payload = { v: 1 as const, from: selfBundle, tsMs: this.now() };
+    const payload = {
+      v: 1 as const,
+      from: selfBundle,
+      tsMs: this.now(),
+      ...(enrolling ? { enrollId: input.enrollId } : {}),
+    };
     const reqBody = canonicalJson({ payload, mac: await macRequest(key, payload) });
 
     let res: Response;
@@ -749,7 +869,14 @@ export class Pairing {
     }
 
     if (res.status === 401) {
-      return { ok: false, reason: 'bad-code', message: 'That code is wrong, expired, or already used.' };
+      return enrolling
+        ? {
+            ok: false,
+            reason: 'bad-code',
+            message:
+              'That installer was refused: its token is expired, already used, revoked, or minted for a different machine name or mesh address.',
+          }
+        : { ok: false, reason: 'bad-code', message: 'That code is wrong, expired, or already used.' };
     }
     if (!res.ok) {
       log('warn', 'pairing: redeem got a non-OK response', { status: res.status });
