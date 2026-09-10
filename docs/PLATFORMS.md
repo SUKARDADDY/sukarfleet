@@ -113,14 +113,18 @@ has stopped answering copies `Get-ScheduledTaskInfo` instead: Windows has no jou
 captures the node's output, so there is no log file to name. To read what the node is saying, stop
 the task and run it in the foreground.
 
-**Pairing does not work on Windows today.** A pairing bundle must carry at least one SSH host key,
-and a Windows machine has none: Windows ships the OpenSSH client, not the server, and the daemon
-reads host keys from `/etc/ssh` regardless of platform. The redeem fails with "This machine has no
-usable SSH identity yet", which names the symptom and not the cause. Sync itself does not need SSH
-(peers fetch from each other over authenticated git-over-HTTP) and the admin lane is off on Windows
-anyway, so what the requirement protects on this platform is an open question rather than a missing
-implementation. Once host keys are present the rest works: a Windows node and a Linux node paired,
-gossiped and synced a repository in both directions on 2026-09-06.
+**Pairing works on Windows as of `e6a2841`.** It did not before, and the reason is worth keeping:
+a pairing bundle must carry at least one SSH host key, and a Windows machine has none, because
+Windows ships the OpenSSH client rather than the server and the daemon read host keys from
+`/etc/ssh` on every platform. The redeem failed with "This machine has no usable SSH identity yet",
+which named the symptom and not the cause. A Windows node now mints a persistent ed25519 host key
+under its state directory once and advertises that. Advertising a host key for a server the node
+does not run is harmless here: the admin lane is off on Windows and nothing dials it.
+
+The installer folds the Windows account name into something that validator accepts before writing
+`admin.sshUser`, for the same reason. `sanitizeBundle` checks every bundle's `sshUser` against
+`^[a-z_][a-z0-9_-]{0,31}$`, including the local one, so a machine whose user is `Ariel` used to
+fail its own validation with that same unhelpful message.
 
 The machine key and the other private files the daemon writes rely on the installer's ACL rather
 than on mode bits. `Install-Sukarfleet.ps1` restricts `~/.config/sukarfleet` to your SID and lets
