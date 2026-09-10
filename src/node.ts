@@ -18,6 +18,8 @@ import type {
   UiState,
 } from './types';
 import { expandHome, loadConfig, patchConfig, persistLegacyMigration, stateDir } from './config';
+import { Enrollments } from './enroll';
+import { DEFAULT_REPO_URL, EnrollmentIssuer } from './installer';
 import { atomicWrite, clockDriftMs, log, nowMs, run, sdNotify, readJsonFile } from './util';
 
 import { buildAuthHeader, loadOrCreateMachineKey, writeSecretFile } from './keys';
@@ -860,12 +862,37 @@ async function main(): Promise<void> {
     if (!priorEnrolled) enrolledPeers.delete(machine);
   }
 
+  // --- enrollment: the credential behind a console-generated one-click installer ---------------
+  //
+  // Three environment overrides, and all three exist for the same reason get.sh has its own: a
+  // maintainer testing a branch, or a fleet installing from a mirror, must be able to point the
+  // generated installer somewhere other than this project's GitHub release without editing a
+  // generated file by hand.
+  //
+  //   SUKARFLEET_RELEASE_REF   the tag the installer downloads. Bumped at release.
+  //   SUKARFLEET_REPO_URL      the repository the archive URL is built from.
+  //   SUKARFLEET_MESH_PORT     the mesh listener port a fresh machine dials. 11010 is what both
+  //                            installers open and what cli.ts falls back to; it lives in
+  //                            fleet.toml, which is root-owned, so the daemon cannot read it.
+  const enrollments = new Enrollments({ auditAppend, now: nowMs });
+  const enrollIssuer = new EnrollmentIssuer({
+    cfg,
+    enrollments,
+    revealMeshSecret: () => networkSecretPort.reveal(),
+    outputDir: join(stateDir(), 'installers'),
+    repoUrl: Bun.env.SUKARFLEET_REPO_URL ?? DEFAULT_REPO_URL,
+    ref: Bun.env.SUKARFLEET_RELEASE_REF ?? 'v0.1.0',
+    listenPort: Number(Bun.env.SUKARFLEET_MESH_PORT ?? '11010') || 11010,
+    now: nowMs,
+  });
+
   const pairing = new Pairing({
     cfg,
     auditAppend,
     localBundle: () => sshAdmin.localBundle(),
     applyPeer,
     now: nowMs,
+    enrollments,
   });
 
   // secrets.ts owns the credential; this adapter owns its audit trail. The detail is `{ user }`
@@ -1173,6 +1200,12 @@ async function main(): Promise<void> {
     networkSecret: networkSecretPort,
     setLane,
     restartDaemon,
+    enroll: {
+      list: () => enrollments.list(),
+      suggest: () => enrollIssuer.suggest(),
+      issue: (input) => enrollIssuer.issue(input),
+      revoke: (id) => enrollments.revoke(id),
+    },
   });
 
   // A host-key mismatch is only observable by attempting a connection, so it is recorded when the

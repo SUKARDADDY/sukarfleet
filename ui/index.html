@@ -163,6 +163,32 @@
     </article>
 
     <article class="card">
+      <h3>Add a machine</h3>
+      <p class="hint">Generates a one-click installer for a Windows machine that is not here yet. Copy the file to that machine and double-click it: nothing is typed on the other end.</p>
+      <p class="statusline" id="enroll-state">—</p>
+      <form id="enroll-form" class="grid2">
+        <p class="field">
+          <label for="enroll-machine">Machine name</label>
+          <input id="enroll-machine" name="machine" type="text" autocomplete="off" spellcheck="false" required>
+        </p>
+        <p class="field">
+          <label for="enroll-meship">Mesh address</label>
+          <input id="enroll-meship" name="meshIp" type="text" inputmode="numeric" autocomplete="off" spellcheck="false">
+        </p>
+        <p class="hint span2" id="enroll-alloc-note"></p>
+        <p class="actions span2">
+          <button type="submit" class="primary" id="enroll-generate">Generate installer</button>
+          <span class="result" id="enroll-result"></span>
+        </p>
+      </form>
+      <p class="hint"><strong>Treat the generated file like a password.</strong> It carries this fleet's mesh secret and a single-use token, and anyone holding it can join the mesh until it expires. Revoking closes pairing; it does not rotate the mesh secret.</p>
+      <div class="tablewrap"><table id="enroll-table">
+        <thead><tr><th scope="col">Machine</th><th scope="col">Mesh</th><th scope="col">State</th><th scope="col">Expires</th><th scope="col">File</th><th scope="col"><span class="sr">Revoke</span></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </article>
+
+    <article class="card">
       <h3>Repositories</h3>
       <div class="tablewrap"><table id="repos-table">
         <thead><tr><th scope="col">Name</th><th scope="col">Path</th><th scope="col">Last sync</th><th scope="col">Commit</th><th scope="col">Error</th></tr></thead>

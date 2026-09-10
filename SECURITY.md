@@ -27,6 +27,19 @@ The two halves have very different risk profiles and are documented separately b
   the daemon and a captured request is a complete offline oracle: an attacker who has it guesses on
   their own hardware, where the five-attempt burn cannot reach them. Online guessing is still
   bounded by the burn, at five tries against 2^60 codes per code minted.
+- **A pairing can also be authorised in advance, by an enrollment token.** The console can generate
+  a one-click installer for a machine that does not exist yet; that file carries a 256-bit token
+  which keys the same `/pair/hello` handshake in place of the typed code. It is single use, bound at
+  mint to one machine name and one mesh address, expires 24 hours later, and can be revoked from the
+  console that made it. No scrypt here, and that is deliberate rather than a shortcut: the token is
+  never typed, so it is 256 bits, and at 256 bits a memory-hard KDF buys nothing while a 32 MiB
+  derivation on an unauthenticated route buys an attacker a CPU sink.
+- **A generated installer is a bearer credential, and the fleet's mesh secret is in it.** It has to
+  be: a machine cannot join a coordinator-less overlay without the secret. Anyone holding that file
+  can join the mesh network until the token expires, whether or not they ever redeem it. Revoking the
+  token closes pairing; it does **not** rotate the mesh secret. Send the file the way you would send
+  a password, and delete it once the machine is in. What joining the mesh alone buys is bounded by
+  the next point.
 - **Identity is an ECDSA P-256 keypair per machine**, generated locally and never transmitted. The
   private key lives at `~/.config/sukarfleet/machine-key.json`, mode 0600.
 - **Every peer-to-peer message is signed** — gossip envelopes, endpoint files, audit entries — and
@@ -187,6 +200,10 @@ Two content rules are enforced by convention and by review:
 - **The audit log is chained, but not at its tail.** An entry edited or replaced after a machine's
   genesis is detected; a machine truncating its own most recent entries still leaves nothing to
   detect. See "What is recorded" above.
+- **An enrollment token is only as private as the file carrying it.** The daemon stores the derived
+  HMAC key rather than the token, and writes both the state file and the generated installer at mode
+  0600, but the installer then travels by whatever means you choose. There is no transport for it
+  and no expiry shorter than 24 hours.
 - **WAN address discovery calls third parties.** Endpoint publication asks `api.ipify.org` and
   `icanhazip.com` for this machine's public address. That module is inert unless you configure a
   fleet-repo remote, but the calls are outbound traffic you did not explicitly ask for.

@@ -1,5 +1,30 @@
 # Adding a Windows machine
 
+There are two ways in. Pick the first one unless you have a reason not to.
+
+## 1. Generate an installer from the console (nothing to type)
+
+On a machine already in the fleet, open the console, go to **Fleet → Add a machine**, give the new
+machine a name, and press **Generate installer**. The console writes a single file, tells you where
+it put it, and shows it in a list with an expiry and a **revoke** button.
+
+Copy that file to the new machine and double-click it. One UAC prompt, and nothing else: it carries
+the network secret, a mesh address already allocated for it, the peer to dial and a one-shot
+enrollment token, so it installs itself and pairs on its own. Watch the Peers table on the machine
+that generated it.
+
+**The generated file is a bearer credential.** It carries the fleet's mesh secret, because a machine
+cannot join the overlay without one. Anyone holding the file can join the mesh until the token
+expires, whether or not they ever run it. So: send it the way you would send a password, delete it
+once the machine is in, and revoke it from the console if you change your mind. Revoking closes
+pairing; it does not rotate the mesh secret, so a leaked file is a reason to rotate that separately.
+
+The token is single use, expires 24 hours after it is generated, and is bound to the one machine
+name and mesh address it was minted for. The file explains all of this in plain text above the
+payload, along with how to decode and read the payload before running it.
+
+## 2. Run the installer by hand
+
 Double-click `Add-To-Fleet.cmd`. That is the install.
 
 Run it normally, not as administrator. It asks for elevation itself, once, for the only part
@@ -7,9 +32,10 @@ that needs it, and it needs everything else to run as you: your config, your SSH
 scheduled task. A node whose config is owned by an administrator account is a nuisance to
 unpick later.
 
-## Before you start
+### Before you start
 
-Have three things in hand. The installer will ask for all of them and cannot guess any.
+Have three things in hand. The installer will ask for all of them and cannot guess any. A generated
+installer already carries all three, which is the point of it.
 
 The **network secret**, shared by every machine in the fleet. On a Linux fleet machine it is
 the `network_secret` line in `/etc/easytier/fleet.toml`, readable only as root. The setup GUI

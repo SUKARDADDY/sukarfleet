@@ -64,6 +64,8 @@ import type {
 import { log } from './util';
 import { expandHome, secretsDir } from './config';
 import { readCappedBody, BODY_READ_TIMEOUT_MS } from './http';
+import { ENROLL_ID_RE, type EnrollmentView } from './enroll';
+import type { SuggestResult } from './installer';
 
 // ---------------------------------------------------------------------------
 // Static asset allowlist
@@ -131,6 +133,9 @@ const MAX_CREDENTIAL_BODY_BYTES = 4096;
 const MAX_PASSWORD_CHARS = 1024;
 const MAX_MESH_SECRET_CHARS = 512;
 const MAX_HOST_CHARS = 255;
+// Matches the validator in src/installer.ts. Checked in both places on purpose: this one keeps
+// nonsense out of the route, that one is the rule about what a machine name IS.
+const MAX_MACHINE_CHARS = 64;
 
 const DEFAULT_RUNS_LIMIT = 20;
 const MAX_RUNS_LIMIT = 100;
@@ -234,6 +239,20 @@ export interface UiNetworkSecretPort {
   state: () => Promise<MeshSecretState>;
 }
 
+// The console's half of enrollment. node.ts supplies it from EnrollmentIssuer + Enrollments; this
+// module never touches the state file, the config or the mesh secret directly.
+export interface UiEnrollPort {
+  list(): Promise<EnrollmentView[]>;
+  suggest(): Promise<SuggestResult>;
+  issue(input: {
+    machine: string;
+    meshIp?: string;
+    nodePort?: number;
+    role?: 'anchor' | 'roamer';
+  }): Promise<{ ok: true; view: EnrollmentView; bytes: number } | { ok: false; message: string }>;
+  revoke(id: string): Promise<boolean>;
+}
+
 export interface UiRoutesDeps {
   // Read through a getter on every request: node.ts mutates cfg in place after a pair, and the
   // GUI must report what the daemon currently believes rather than what it booted with.
@@ -253,6 +272,9 @@ export interface UiRoutesDeps {
   // takes effect without the Restart button.
   setLane: (patch: LanePatch) => Promise<void>;
   restartDaemon: () => Promise<void>;
+  // Absent on a machine built without it -- the routes then 404 rather than throwing, the same way
+  // uiEnabled:false makes a surface not exist rather than refuse.
+  enroll?: UiEnrollPort;
 }
 
 export interface LanePatch {
@@ -688,6 +710,17 @@ export class UiRoutes {
         return jsonResponse({ entries: await this.deps.tailAudit(limit) });
       }
 
+      case '/api/ui/enroll':
+        if (method === 'GET') return this.getEnroll();
+        if (method === 'POST') return this.postEnroll(req);
+        return methodNotAllowed('GET, POST');
+
+      // A separate path rather than DELETE on the one above: the id is a body field, and a DELETE
+      // carrying a body is the kind of thing an intermediary is entitled to drop.
+      case '/api/ui/enroll/revoke':
+        if (method !== 'POST') return methodNotAllowed('POST');
+        return this.postEnrollRevoke(req);
+
       case '/api/ui/restart':
         if (method !== 'POST') return methodNotAllowed('POST');
         return this.postRestart();
@@ -817,6 +850,67 @@ export class UiRoutes {
       return jsonResponse({ ok: true });
     }
     return badRequest('action must be generate or stage');
+  }
+
+  // -------------------------------------------------------------------------
+  // Enrollment: generating a one-click installer for a machine that is not here yet
+  // -------------------------------------------------------------------------
+
+  // One GET for the whole card: the list it renders and the defaults it pre-fills. Two routes
+  // would let the card show an address allocated against a roster it has already redrawn.
+  private async getEnroll(): Promise<Response> {
+    const port = this.deps.enroll;
+    if (!port) return notFound();
+    const [enrollments, suggest] = await Promise.all([port.list(), port.suggest()]);
+    return jsonResponse({ enrollments, suggest });
+  }
+
+  private async postEnroll(req: Request): Promise<Response> {
+    const port = this.deps.enroll;
+    if (!port) return notFound();
+    const body = await this.readJsonObject(req);
+    if (!body.ok) return body.res;
+    const { machine, meshIp, nodePort, role } = body.value;
+
+    if (typeof machine !== 'string' || !isCleanText(machine.trim(), MAX_MACHINE_CHARS)) {
+      return badRequest('that machine name is not valid');
+    }
+    if (meshIp !== undefined && meshIp !== null && meshIp !== '') {
+      if (typeof meshIp !== 'string' || !isCleanText(meshIp, MAX_HOST_CHARS)) {
+        return badRequest('that mesh address is not valid');
+      }
+    }
+    if (nodePort !== undefined && nodePort !== null) {
+      if (!Number.isInteger(nodePort) || (nodePort as number) < 1 || (nodePort as number) > 65535) {
+        return badRequest('that port is not valid');
+      }
+    }
+    if (role !== undefined && role !== 'anchor' && role !== 'roamer') return badRequest('role must be anchor or roamer');
+
+    // A refusal is a 200 with ok:false, matching redeem: the card renders the message, and an HTTP
+    // error status would throw the sentence away.
+    const result = await port.issue({
+      machine: machine.trim(),
+      ...(typeof meshIp === 'string' && meshIp !== '' ? { meshIp: meshIp.trim() } : {}),
+      ...(typeof nodePort === 'number' ? { nodePort } : {}),
+      ...(role === 'anchor' || role === 'roamer' ? { role } : {}),
+    });
+    return jsonResponse(result);
+  }
+
+  private async postEnrollRevoke(req: Request): Promise<Response> {
+    const port = this.deps.enroll;
+    if (!port) return notFound();
+    const body = await this.readJsonObject(req);
+    if (!body.ok) return body.res;
+    const id = body.value.id;
+    if (typeof id !== 'string' || !ENROLL_ID_RE.test(id)) return badRequest('that installer id is not valid');
+    const revoked = await port.revoke(id);
+    return jsonResponse(
+      revoked
+        ? { ok: true }
+        : { ok: false, message: 'That installer was already used, already revoked, or is no longer on file.' },
+    );
   }
 
   // -------------------------------------------------------------------------

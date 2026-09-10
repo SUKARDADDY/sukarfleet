@@ -14,6 +14,24 @@ other. Anything else has to be read here first.
 
 ### Added
 
+- **One-click enrollment, generated from the console.** The Fleet screen has an "Add a machine" card
+  that writes a single double-clickable `.cmd` for a Windows machine that is not here yet. It
+  carries the fleet's network name, its mesh secret, a mesh address allocated at mint, and a
+  single-use enrollment token. Copy it to the machine, double-click it, accept one UAC prompt, and
+  the machine installs itself and pairs with the one that generated it. Nothing is typed on the
+  other end. New: [`src/enroll.ts`](src/enroll.ts) (the token store),
+  [`src/meshalloc.ts`](src/meshalloc.ts) (the address allocator),
+  [`src/installer.ts`](src/installer.ts) (rendering and issuing), and `/api/ui/enroll` on the
+  console API. **Wire change:** `/pair/hello` accepts an optional `enrollId` in its payload, naming
+  which credential the MAC is taken under. A hello without one canonicalises exactly as before, so
+  a machine on an older version pairs with a machine on this one as it always did.
+  - The token is 256 bits, single use, bound to one machine name and one mesh address, and expires
+    after 24 hours. The daemon stores the key derived from it, never the token.
+  - **The generated file is a bearer credential**: it carries the mesh secret, so anyone holding it
+    can join the mesh until it expires. Revoking closes pairing and does not rotate the secret. The
+    file says so at the top, in plain text, above the payload. See
+    [`SECURITY.md`](SECURITY.md#trust-model).
+
 - **The tray console on Windows.** A Windows machine gets the same tray icon and console window a
   Linux one gets, rather than a URL to paste into a browser.
   [`.github/workflows/tray.yml`](.github/workflows/tray.yml) builds the binary on a Windows runner,
@@ -25,6 +43,24 @@ other. Anything else has to be read here first.
   menu on Linux, which is each platform's own convention and, on Linux, the only option, since SNI
   trays deliver no click events. For a node that is not answering it copies the scheduled task's
   start command on Windows instead of systemd's.
+
+### Fixed
+
+- **A Windows machine with a capitalised account name could not pair at all.** The installer wrote
+  `admin.sshUser` straight from `%USERNAME%`, and `sanitizeBundle` validates every bundle's
+  `sshUser` against `^[a-z_][a-z0-9_-]{0,31}$` — including the machine's own. So a box whose user
+  was `Ariel` failed its own local validation and pairing died with "This machine has no usable SSH
+  identity yet", which named the symptom and not the cause. The installer now folds the account name
+  into a name that validator accepts. The value is inert on Windows anyway: the admin lane is off and
+  nothing dials it.
+- **The Windows installer opened the firewall for the mesh transport but not for the node's own
+  port,** so a machine could join the mesh and answer nothing. It now adds an inbound rule for the
+  node port scoped to the mesh subnet, which is what the Linux elevated stage has always done.
+- **A fresh Windows machine held every commit as "clock unvetted"** because stock W32Time is not
+  running. The elevated stage now starts the time service and asks it to resync. A failure is a
+  warning: an unvetted clock costs commits, not the install.
+- **`docs/PLATFORMS.md` and the installer banner still said pairing does not work on Windows.**
+  `e6a2841` fixed that and validated it end to end on a real Windows 10 node; the prose never moved.
 
 ### Changed
 
