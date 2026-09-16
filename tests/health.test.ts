@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Health, formatDuration } from '../src/health';
@@ -464,6 +464,48 @@ describe('Health.evaluate', () => {
     expect(calls.length).toBe(1);
     expect(calls[0]!.title).toBe('sukarfleet: admin peer unreachable');
     expect(calls[0]!.body).toBe('beta: admin lane unreachable');
+  });
+
+  test('a latched fault takes the new urgency when the daemon reclassifies it', async () => {
+    // The upgrade case, found on a live anchor: a peer-offline fault latched as critical under the
+    // old rules went on saying critical in /status and the tray after the daemon started calling it
+    // normal, because only the message was refreshed on an existing latch. The state file below is
+    // the shape the old daemon wrote.
+    const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+    await writeFile(
+      join(tmpDir, 'health.json'),
+      JSON.stringify({
+        faults: {
+          'peer-offline:beta': {
+            faultClass: 'peer-offline',
+            message: 'beta: offline',
+            urgency: 'critical',
+            firstSeenMs: t0 - 20 * 3600_000,
+            lastNotifiedMs: t0 - 60_000,
+          },
+        },
+        digestDate: null,
+      }),
+    );
+
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(healthyCfg({ peerOfflineAlarmMin: 60, alarmRepeatMin: 30 }), notifier);
+    const peer: PeerView = {
+      name: 'beta',
+      lastSeenMs: t0 - 20 * 3600_000,
+      lastEnvelope: null,
+      online: false,
+      syncStale: true,
+    };
+    await health.evaluate(t0, healthySelf(), [peer]);
+
+    const state = await health.getState();
+    expect(state.faults[0]!.key).toBe('peer-offline:beta');
+    expect(state.faults[0]!.urgency).toBe('normal');
+    expect(state.faults[0]!.message).toBe('beta: offline 20h');
+    // Reclassifying is not an event. The latch keeps its age and says nothing.
+    expect(state.faults[0]!.firstSeenMs).toBe(t0 - 20 * 3600_000);
+    expect(calls.length).toBe(0);
   });
 
   test('anchor-unreachable only raised for roamer role', async () => {
