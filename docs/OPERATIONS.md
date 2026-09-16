@@ -78,6 +78,30 @@ Two things it needs from you:
   removing bad objects fixes. The usual recovery is to re-clone from the peer, which still has the
   history -- sync is git, so the other machine is a complete copy, not a mirror of your damage.
 
+## A machine that is asleep is not a fault
+
+A roamer is shut, carried, and opened somewhere else. That whole arc is normal, so the daemon does
+not alarm on it. `/status` shows the peer offline the moment presence lapses, as it always has, but
+the `peer-offline` fault only appears once the peer has been out of contact for
+`thresholds.peerOfflineAlarmMin` (default 720 minutes, half a day). By then the useful reading is
+"that machine's copy of the work is drifting" rather than "somebody closed a lid".
+
+When it does fire, it fires once. The fault stays latched in `/status` and the tray for as long as
+the peer is away, and speaks again only to report the recovery. A peer the daemon has never heard
+from has no absence to measure and is reported straight away.
+
+Two knobs, for a fleet that is not built around roamers:
+
+```jsonc
+"thresholds": {
+  "peerOfflineFactor": 3,      // presence: how many missed gossip rounds read as "not here"
+  "peerOfflineAlarmMin": 0     // fault: 0 alarms the second presence lapses
+}
+```
+
+An anchor going dark is a different fault and none of this applies to it. A roamer that cannot
+reach the anchor raises `anchor-unreachable` from the transport, immediately, at critical urgency.
+
 ## When a peer looks offline but is not
 
 A signature that stops verifying looks exactly like a peer that went offline: the envelope arrives,

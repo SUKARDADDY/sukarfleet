@@ -231,6 +231,7 @@ describe('config', () => {
       syncStaleMin: 30,
       alarmRepeatMin: 30,
       peerOfflineFactor: 3,
+      peerOfflineAlarmMin: 720,
       clockSkewMaxMs: 5000,
       wedgePolls: 3,
     });
