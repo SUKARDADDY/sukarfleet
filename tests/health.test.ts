@@ -316,7 +316,10 @@ describe('Health.evaluate', () => {
     expect(calls[0]!.urgency).toBe('normal');
   });
 
-  test('offline peer produces a distinct peer-offline fault, not sync-stale wording', async () => {
+  test('a peer offline inside the grace window raises nothing at all', async () => {
+    // The lid-shut case: a roamer that gossiped an hour ago and is now asleep. Under the default
+    // half-day grace this is not a fault, so there is no notification and nothing latched to
+    // recover from when it wakes up.
     const cfg = healthyCfg();
     const { calls, notifier } = fakeNotifier();
     const health = new Health(cfg, notifier);
@@ -330,9 +333,137 @@ describe('Health.evaluate', () => {
       syncStale: true,
     };
     await health.evaluate(t0, self, [peer]);
+    expect(calls.some((c) => c.title.includes('peer offline'))).toBe(false);
+    const state = await health.getState();
+    expect(state.faults.some((f) => f.key === 'peer-offline:beta')).toBe(false);
+  });
+
+  test('a peer offline past the grace window is a normal-urgency fault naming the duration', async () => {
+    const cfg = healthyCfg({ peerOfflineAlarmMin: 720 });
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+    const self = healthySelf();
+    const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+    const peer: PeerView = {
+      name: 'beta',
+      lastSeenMs: t0 - 14 * 3600_000,
+      lastEnvelope: null,
+      online: false,
+      syncStale: true,
+    };
+    await health.evaluate(t0, self, [peer]);
     expect(calls.length).toBe(1);
-    expect(calls[0]!.body).toBe('beta: offline');
-    expect(calls[0]!.urgency).toBe('critical');
+    expect(calls[0]!.body).toBe('beta: offline 14h');
+    expect(calls[0]!.urgency).toBe('normal');
+  });
+
+  test('peerOfflineAlarmMin 0 alarms the moment presence lapses', async () => {
+    const cfg = healthyCfg({ peerOfflineAlarmMin: 0 });
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+    const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+    const peer: PeerView = {
+      name: 'beta',
+      lastSeenMs: t0 - 60_000,
+      lastEnvelope: null,
+      online: false,
+      syncStale: true,
+    };
+    await health.evaluate(t0, healthySelf(), [peer]);
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.body).toBe('beta: offline 1m');
+  });
+
+  test('a peer never heard from is reported without waiting out the grace', async () => {
+    const cfg = healthyCfg();
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+    const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+    const peer: PeerView = { name: 'beta', lastSeenMs: null, lastEnvelope: null, online: false, syncStale: true };
+    await health.evaluate(t0, healthySelf(), [peer]);
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.body).toBe('beta: offline, never seen');
+  });
+
+  test('peer-offline notifies once per absence, not every alarmRepeatMin', async () => {
+    // A machine away for the weekend used to produce a toast every repeat interval for days. It
+    // says it once, stays latched in the fault state the whole time, and speaks again only to
+    // report the recovery.
+    const cfg = healthyCfg({ peerOfflineAlarmMin: 60, alarmRepeatMin: 30 });
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+    const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+    const offline: PeerView = {
+      name: 'beta',
+      lastSeenMs: t0 - 2 * 3600_000,
+      lastEnvelope: null,
+      online: false,
+      syncStale: true,
+    };
+
+    await health.evaluate(t0, healthySelf(), [offline]);
+    expect(calls.length).toBe(1);
+
+    for (let hour = 1; hour <= 48; hour++) {
+      await health.evaluate(t0 + hour * 3600_000, healthySelf(), [offline]);
+    }
+    expect(calls.length).toBe(1);
+    expect((await health.getState()).faults.some((f) => f.key === 'peer-offline:beta')).toBe(true);
+
+    const back: PeerView = {
+      name: 'beta',
+      lastSeenMs: t0 + 49 * 3600_000,
+      lastEnvelope: null,
+      online: true,
+      syncStale: false,
+    };
+    await health.evaluate(t0 + 49 * 3600_000, healthySelf(), [back]);
+    expect(calls.length).toBe(2);
+    // Two days of absence later the tick that sees it back carries the recovery (coalesced with
+    // the day's all-green digest, since nothing is wrong any more).
+    expect(calls[1]!.body).toContain('cleared');
+  });
+
+  test('an offline peer does not also raise admin-lane-unreachable for the same machine', async () => {
+    // One shut laptop, one line. The SSH lane cannot be reachable on a machine that is not there.
+    const cfg = healthyCfg({ peerOfflineAlarmMin: 0 });
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+    const self = healthySelf();
+    self.admin = { credentialStale: false, hostkeyMismatch: [], unreachablePeers: ['beta'], configured: true };
+    const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+    const peer: PeerView = {
+      name: 'beta',
+      lastSeenMs: t0 - 3600_000,
+      lastEnvelope: null,
+      online: false,
+      syncStale: true,
+    };
+    await health.evaluate(t0, self, [peer]);
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.title).toBe('sukarfleet: peer offline');
+    const state = await health.getState();
+    expect(state.faults.some((f) => f.faultClass === 'admin-peer-unreachable')).toBe(false);
+  });
+
+  test('an online peer whose admin lane will not answer still raises it', async () => {
+    const cfg = healthyCfg();
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+    const self = healthySelf();
+    self.admin = { credentialStale: false, hostkeyMismatch: [], unreachablePeers: ['beta'], configured: true };
+    const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+    const peer: PeerView = {
+      name: 'beta',
+      lastSeenMs: t0 - 1000,
+      lastEnvelope: envelopeWithRepoStat('beta', t0 - 1000, t0 - 1000),
+      online: true,
+      syncStale: false,
+    };
+    await health.evaluate(t0, self, [peer]);
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.title).toBe('sukarfleet: admin peer unreachable');
+    expect(calls[0]!.body).toBe('beta: admin lane unreachable');
   });
 
   test('anchor-unreachable only raised for roamer role', async () => {

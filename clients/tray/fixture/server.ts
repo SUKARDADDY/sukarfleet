@@ -50,7 +50,7 @@ function faults(now: number): unknown[] {
   }
   if (scenario === 'critical') {
     return [
-      { key: 'peer-offline:beta', faultClass: 'peer-offline', message: 'peer beta offline for 12m', urgency: 'critical', firstSeenMs: now - 12 * 60_000 },
+      { key: 'peer-offline:beta', faultClass: 'peer-offline', message: 'beta: offline 14h', urgency: 'normal', firstSeenMs: now - 14 * 3600_000 },
       { key: 'self-sync-error:example-repo', faultClass: 'self-sync-error', message: 'example-repo sync error: merge wedge', urgency: 'critical', firstSeenMs: now - 5 * 60_000 },
       { key: 'github-push-stale:example-repo', faultClass: 'github-push-stale', message: 'example-repo GitHub push stale for 7h', urgency: 'normal', firstSeenMs: now - 7 * 3600_000 },
     ];

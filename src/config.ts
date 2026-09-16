@@ -69,6 +69,9 @@ export function defaultConfig(machine: string): FleetConfig {
       syncStaleMin: 30,
       alarmRepeatMin: 30,
       peerOfflineFactor: 3,
+      // Half a day. A roamer is shut overnight, carried, and opened again; that whole arc is
+      // normal and raises nothing. A peer gone across a working day is worth one notification.
+      peerOfflineAlarmMin: 720,
       clockSkewMaxMs: 5000,
       wedgePolls: 3,
     },
@@ -301,6 +304,12 @@ function validate(cfg: FleetConfig): void {
     if (typeof val !== 'number' || !Number.isFinite(val) || val <= 0) {
       fail(`thresholds.${k} must be a positive number`);
     }
+  }
+  // Checked apart from the loop above because zero is a meaningful setting here and not a
+  // mistake: it asks for an alarm the moment a peer stops being present.
+  const offlineAlarm = (th as Record<string, unknown>).peerOfflineAlarmMin;
+  if (typeof offlineAlarm !== 'number' || !Number.isFinite(offlineAlarm) || offlineAlarm < 0) {
+    fail('thresholds.peerOfflineAlarmMin must be a non-negative number');
   }
 
   validateAdmin(cfg.admin as unknown);
