@@ -81,6 +81,12 @@ interface ActiveFault {
   faultClass: FaultClass;
   message: string;
   urgency: Urgency;
+  // Absent or true: the fault re-notifies every alarmRepeatMin for as long as it is active, which
+  // is right for a condition a human is expected to go and fix. False: notify when it is first
+  // raised and then stay quiet until it clears. Reserved for a condition whose repetition carries
+  // no new information and that the operator cannot act on from here -- a machine that is
+  // somewhere else, switched off.
+  repeat?: boolean;
 }
 
 interface PersistedFault {
@@ -231,13 +237,37 @@ function computeActiveFaults(cfg: FleetConfig, self: HealthSelf, peers: PeerView
     }
   }
 
+  // Peers that are not present right now, whether or not their absence has earned a fault yet.
+  // The admin-lane branch below reads this: one machine being off must not light two alarms.
+  const offlinePeers = new Set<string>();
+  const peerOfflineAlarmMs = cfg.thresholds.peerOfflineAlarmMin * 60000;
+
   for (const peer of peers) {
     if (!peer.online) {
+      offlinePeers.add(peer.name);
+      // A roamer that is shut, asleep or in a bag is doing exactly what a roamer does. Absence
+      // only becomes a fault once it has lasted past peerOfflineAlarmMin -- long enough that what
+      // it now means is "this machine's copy of the work is drifting", which is worth knowing,
+      // rather than "somebody closed a lid", which is not. A peer we have never heard from has no
+      // duration to measure and is reported straight away; there is no lid to blame.
+      const sinceMs = peer.lastSeenMs === null ? Number.POSITIVE_INFINITY : now - peer.lastSeenMs;
+      if (sinceMs <= peerOfflineAlarmMs) continue;
       faults.push({
         key: `peer-offline:${peer.name}`,
         faultClass: 'peer-offline',
-        urgency: 'critical',
-        message: `${peer.name}: offline`,
+        // Not critical: by the time this fires the machine has been gone for hours, which makes it
+        // a thing to read, not a thing to wake up for. An anchor going dark is still critical --
+        // that is the separate anchor-unreachable fault, raised from the transport, and this grace
+        // period does not touch it.
+        urgency: 'normal',
+        message: Number.isFinite(sinceMs)
+          ? `${peer.name}: offline ${formatDuration(sinceMs)}`
+          : `${peer.name}: offline, never seen`,
+        // Said once per absence. Repeating "still offline" every alarmRepeatMin for a machine
+        // that is away for the weekend is the noise this whole branch exists to stop; the fault
+        // stays latched and visible in /status and the tray the entire time, and its recovery
+        // notification still fires when the peer comes back.
+        repeat: false,
       });
     } else if (peer.syncStale) {
       const gap = peerStaleMs(peer, now);
@@ -304,6 +334,11 @@ function computeActiveFaults(cfg: FleetConfig, self: HealthSelf, peers: PeerView
       });
     }
     for (const machine of admin.unreachablePeers) {
+      // A machine that is not on the mesh cannot have a reachable SSH lane, so saying both is
+      // saying one thing twice: the operator gets "offline" and "admin lane unreachable" about a
+      // single shut laptop. Presence owns that story. What is left here is the fault worth its
+      // own line -- a peer that IS up and whose lane still will not answer.
+      if (offlinePeers.has(machine)) continue;
       faults.push({
         key: `admin-peer-unreachable:${machine}`,
         faultClass: 'admin-peer-unreachable',
@@ -462,7 +497,7 @@ export class Health {
         existing.message = fault.message;
         changed = true;
       }
-      if (now - existing.lastNotifiedMs >= repeatMs) {
+      if (fault.repeat !== false && now - existing.lastNotifiedMs >= repeatMs) {
         existing.lastNotifiedMs = now;
         changed = true;
         pending.push({ urgency: fault.urgency, title: titleFor(fault.faultClass), body: fault.message });

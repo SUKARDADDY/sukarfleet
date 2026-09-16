@@ -46,6 +46,22 @@ other. Anything else has to be read here first.
 
 ### Fixed
 
+- **A laptop that was simply asleep raised a critical alarm, then kept raising it.** `peer-offline`
+  fired the moment gossip presence lapsed, at critical urgency, and repeated every
+  `alarmRepeatMin` for as long as the machine stayed away. A roamer shut for the weekend was worth
+  a hundred desktop notifications, none of which anyone could act on, which is how an operator
+  learns to ignore the ones that matter. Presence and fault are now two different questions. A
+  peer has to be out of contact for `thresholds.peerOfflineAlarmMin` (new, default 720 minutes)
+  before its absence is a fault at all, that fault is `normal` rather than `critical`, and it
+  notifies once per absence instead of on every repeat. It stays latched and visible in `/status`
+  and the tray the whole time, and it still announces its own recovery. Set the threshold to `0`
+  for a fleet where every machine is meant to be on, and offline is a fault the second presence
+  lapses. An anchor going dark is untouched by any of this: that is `anchor-unreachable`, raised
+  from the transport, still immediate and still critical.
+- **One machine being off lit two alarms.** A peer that is not on the mesh cannot have a reachable
+  SSH admin lane, so `admin-peer-unreachable` was restating `peer-offline` in different words. It
+  is now suppressed for a peer presence already reports as offline, and says what it was for: a
+  machine that is up and whose lane will not answer.
 - **A Windows machine with a capitalised account name could not pair at all.** The installer wrote
   `admin.sshUser` straight from `%USERNAME%`, and `sanitizeBundle` validates every bundle's
   `sshUser` against `^[a-z_][a-z0-9_-]{0,31}$` — including the machine's own. So a box whose user

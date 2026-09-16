@@ -214,3 +214,28 @@ describe('persisting the migration', () => {
     expect(cfg.mcpPort).toBe(7719);
   });
 });
+
+describe('thresholds.peerOfflineAlarmMin: inherited by every config already on disk', () => {
+  test('a deployed-shape config with a thresholds block it predates still gets the grace period', async () => {
+    // The upgrade path that matters: nobody edits a config to stop being nagged. A machine that
+    // has been running since before this threshold existed picks it up on the next daemon start.
+    const raw = deployedShape();
+    raw.thresholds = { syncStaleMin: 30, alarmRepeatMin: 30, peerOfflineFactor: 3, clockSkewMaxMs: 5000, wedgePolls: 3 };
+    const cfg = await loadConfig(writeConfig(raw));
+    expect(cfg.thresholds.peerOfflineAlarmMin).toBe(720);
+    expect(cfg.thresholds.syncStaleMin).toBe(30);
+  });
+
+  test('zero is a setting, not a validation failure', async () => {
+    const raw = deployedShape();
+    raw.thresholds = { peerOfflineAlarmMin: 0 };
+    const cfg = await loadConfig(writeConfig(raw));
+    expect(cfg.thresholds.peerOfflineAlarmMin).toBe(0);
+  });
+
+  test('a negative grace period is rejected', async () => {
+    const raw = deployedShape();
+    raw.thresholds = { peerOfflineAlarmMin: -1 };
+    await expect(loadConfig(writeConfig(raw))).rejects.toThrow(/peerOfflineAlarmMin/);
+  });
+});

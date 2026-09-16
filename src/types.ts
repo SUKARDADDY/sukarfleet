@@ -69,6 +69,13 @@ export interface FleetConfig {
     syncStaleMin: number;
     alarmRepeatMin: number;
     peerOfflineFactor: number;
+    // How long a peer must stay out of contact before its absence is a FAULT, as opposed to a
+    // peer that is simply not online right now (peerOfflineFactor above, which decides presence
+    // and is what /status reports). The two are different questions: a laptop shut for the night
+    // is absent by design, and alarming on it is how an operator learns to ignore the alarms.
+    // 0 means a peer is at fault the moment presence lapses, which is what a fleet of machines
+    // that are all meant to be on wants.
+    peerOfflineAlarmMin: number;
     clockSkewMaxMs: number;
     wedgePolls: number;
   };
