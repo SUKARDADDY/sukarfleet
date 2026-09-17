@@ -25,7 +25,7 @@ import { atomicWrite, clockDriftMs, log, nowMs, run, sdNotify, readJsonFile } fr
 import { buildAuthHeader, loadOrCreateMachineKey, writeSecretFile } from './keys';
 import { Gossip } from './gossip';
 import { Syncer } from './syncer';
-import { Health, type HealthSelf } from './health';
+import { Health, type HealthSelf, type LocalLogDamage } from './health';
 import { Transport, ClockSentinel, SUSPEND_JUMP_MS } from './transport';
 import * as endpoints from './endpoints';
 import * as derive from './derive';
@@ -1461,7 +1461,10 @@ async function main(): Promise<void> {
   // a tampered log that is loudly flagged is worth more than a quietly repaired one. Equally, it
   // must never throw: wedging the sync loop over a bad audit line would turn a forensics problem
   // into an outage.
-  async function crossCheckFlushedEntries(entries: AuditEntry[]): Promise<HealthSelf['auditIntegrity']> {
+  async function crossCheckFlushedEntries(
+    entries: AuditEntry[],
+    localLog: LocalLogDamage,
+  ): Promise<HealthSelf['auditIntegrity']> {
     const report = await crossCheckAuditLog(entries, {
       nowMs: nowMs(),
       publicKeyJwkByMachine: auditSignerKeys(),
@@ -1476,6 +1479,7 @@ async function main(): Promise<void> {
       unacceptedForks: count('seq-fork'),
       seqGaps: count('seq-gap'),
       chainBreaks: count('chain-broken'),
+      localLog,
     };
     if (report.flags.length > 0) {
       log('error', 'audit: cross-check found problems in the replicated log', {
@@ -1550,7 +1554,7 @@ async function main(): Promise<void> {
           repo: auditRepo.name,
           entries: flushResult.entries.length,
         });
-        auditIntegrity = await crossCheckFlushedEntries(flushResult.entries);
+        auditIntegrity = await crossCheckFlushedEntries(flushResult.entries, flushResult.localLog);
       } catch (err) {
         // Deliberately does NOT clear auditIntegrity: a flush that failed this cycle is a reason to
         // keep showing the last verdict, not to silently retract a forgery alarm.
