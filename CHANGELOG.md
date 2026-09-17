@@ -58,6 +58,12 @@ other. Anything else has to be read here first.
   for a fleet where every machine is meant to be on, and offline is a fault the second presence
   lapses. An anchor going dark is untouched by any of this: that is `anchor-unreachable`, raised
   from the transport, still immediate and still critical.
+- **A latched fault kept the severity it was born with.** `evaluate` refreshed an existing fault's
+  message every tick but never its urgency, so a `peer-offline` latched as `critical` under the old
+  rules went on reporting `critical` in `/status`, the tray and any monitor reading the fault list
+  after the daemon had started calling it `normal`. Found on a live anchor minutes after the change
+  above shipped. Urgency is now refreshed the same way the message is. Reclassifying is not an
+  event: the latch keeps its `firstSeenMs` and notifies nobody.
 - **One machine being off lit two alarms.** A peer that is not on the mesh cannot have a reachable
   SSH admin lane, so `admin-peer-unreachable` was restating `peer-offline` in different words. It
   is now suppressed for a peer presence already reports as offline, and says what it was for: a
