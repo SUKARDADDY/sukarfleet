@@ -45,6 +45,7 @@ import {
   flushLocalToUnion,
   crossCheckAuditLog,
   loadForkBaseline,
+  loadGapBaseline,
   type CrossCheckFlagKind,
 } from './audit';
 import { startMcpServer, type McpDeps, type McpServerHandle } from './mcp';
@@ -606,6 +607,12 @@ async function main(): Promise<void> {
     onGithubPushNotApplicable: (repoName) => githubPushOkMs.delete(repoName),
     onConflictArtifact: (repoName, path) => {
       log('warn', 'sync: losing side of a conflict preserved as an artifact', { repo: repoName, path });
+    },
+    // No notification of its own: the repair is what makes the repo's self-sync-error fault go
+    // away, and health.ts already announces a cleared fault ("recovered — ... cleared"). Telling
+    // the operator twice about one event trains them to read neither.
+    onIndexRepaired: (repoName, quarantinedTo) => {
+      log('warn', 'sync: corrupt git index rebuilt from HEAD', { repo: repoName, quarantinedTo });
     },
   });
 
@@ -1459,6 +1466,7 @@ async function main(): Promise<void> {
       nowMs: nowMs(),
       publicKeyJwkByMachine: auditSignerKeys(),
       acceptedForkFingerprints: await loadForkBaseline(),
+      acceptedGapFingerprints: await loadGapBaseline(),
       verifiedDigests: auditVerifiedDigests,
     });
     const count = (kind: CrossCheckFlagKind): number => report.flags.filter((f) => f.kind === kind).length;

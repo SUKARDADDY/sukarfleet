@@ -360,6 +360,108 @@ export async function writeForkBaseline(fingerprints: readonly string[]): Promis
   await atomicWrite(forkBaselinePath(), canonicalJson({ v: 1, fingerprints: [...fingerprints].sort() }));
 }
 
+function gapBaselinePath(): string {
+  return join(stateDir(), 'audit-gap-baseline.json');
+}
+
+// One gap's identity: the machine and the two seqs it sits between. Keyed by its EDGES, so a gap
+// that later widens -- the run either side of it losing entries too -- is a different gap and
+// alarms again. That is the property that makes accepting one safe: accepting "367 to 371 is
+// missing" can never silently absorb a later "367 to 400 is missing".
+export function gapFingerprint(machine: string, fromExclusive: number, toExclusive: number): string {
+  const h = createHash('sha256');
+  h.update(machine);
+  h.update('\0');
+  h.update(String(fromExclusive));
+  h.update('\0');
+  h.update(String(toExclusive));
+  return h.digest('hex');
+}
+
+// Gaps this machine has been told are known-lost. MACHINE-LOCAL, never synced, for the same
+// reason the fork baseline is not: an attacker who can write the shared repo must not also be
+// able to ship the file that declares the entries they removed acceptable.
+//
+// Nothing writes this automatically, and nothing should. A gap means signed entries are missing,
+// which is exactly what a machine quietly deleting its own history looks like; the only thing
+// that can tell "power cut" from "cover-up" is a human who knows what happened. The daemon's job
+// is to keep saying so until that human answers.
+export async function loadGapBaseline(): Promise<Set<string>> {
+  const file = Bun.file(gapBaselinePath());
+  if (!(await file.exists())) return new Set();
+  try {
+    const data = JSON.parse(await file.text()) as { fingerprints?: unknown };
+    if (!Array.isArray(data.fingerprints)) return new Set();
+    return new Set(data.fingerprints.filter((f): f is string => typeof f === 'string'));
+  } catch {
+    // An unreadable baseline accepts NOTHING, mirroring loadForkBaseline: failing open would
+    // silence the alarm exactly when the file guarding it has been corrupted.
+    return new Set();
+  }
+}
+
+export async function writeGapBaseline(fingerprints: readonly string[]): Promise<void> {
+  await atomicWrite(gapBaselinePath(), canonicalJson({ v: 1, fingerprints: [...fingerprints].sort() }));
+}
+
+export interface GapRecord {
+  machine: string;
+  fromExclusive: number;
+  toExclusive: number;
+  missing: number;
+  fingerprint: string;
+  detail: string;
+}
+
+// Every seq gap in one machine's observed sequence, including the leading one (AuditLog.nextSeq
+// always starts a machine's log at 1, so a lowest-observed seq above 1 means the earliest entries
+// are gone). Pure over the seq list; shared by crossCheckAuditLog and by the accept tool, so
+// "which gaps exist" is answered by one function and the baseline can never drift from the alarm.
+export function seqGapsOf(machine: string, seqs: readonly number[]): GapRecord[] {
+  const sorted = [...seqs].sort((a, b) => a - b);
+  const gaps: GapRecord[] = [];
+  const record = (fromExclusive: number, toExclusive: number, detail: string): void => {
+    gaps.push({
+      machine,
+      fromExclusive,
+      toExclusive,
+      missing: toExclusive - fromExclusive - 1,
+      fingerprint: gapFingerprint(machine, fromExclusive, toExclusive),
+      detail,
+    });
+  };
+  if (sorted.length > 0 && sorted[0]! > 1) {
+    const missingLeading = sorted[0]! - 1;
+    record(
+      0,
+      sorted[0]!,
+      `${machine}: audit log starts at seq ${sorted[0]} instead of 1 (missing ${missingLeading} earliest entr${missingLeading === 1 ? 'y' : 'ies'})`,
+    );
+  }
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = sorted[i - 1]!;
+    const cur = sorted[i]!;
+    if (cur - prev > 1) {
+      const missing = cur - prev - 1;
+      record(prev, cur, `${machine}: audit seq gap between ${prev} and ${cur} (missing ${missing} entr${missing === 1 ? 'y' : 'ies'})`);
+    }
+  }
+  return gaps;
+}
+
+// Every gap across every machine in an assembled entry set, in (machine, fromExclusive) order.
+// What the accept tool writes a baseline from.
+export function allSeqGaps(entries: readonly AuditEntry[]): GapRecord[] {
+  const byMachine = new Map<string, number[]>();
+  for (const e of entries) {
+    const list = byMachine.get(e.machine);
+    if (list) list.push(e.seq);
+    else byMachine.set(e.machine, [e.seq]);
+  }
+  const machines = [...byMachine.keys()].sort(codepointCompare);
+  return machines.flatMap((m) => seqGapsOf(m, byMachine.get(m)!));
+}
+
 export interface RegenerateResult {
   entries: AuditEntry[]; // final canonical entries, sorted by (machine, seq)
   changed: boolean; // whether the on-disk bytes were rewritten
@@ -531,6 +633,11 @@ export interface CrossCheckOptions {
   // same thing on both paths -- and a fork that gains a THIRD variant changes fingerprint and
   // alarms again, which is the property that makes accepting one safe.
   acceptedForkFingerprints?: ReadonlySet<string>;
+  // Gap fingerprints this machine has been told are known-lost -- loadGapBaseline(). Same shape
+  // and same reasoning as acceptedForkFingerprints: a gap cannot be repaired (the missing entries
+  // were signed and are gone), so without a way to accept one, a single power cut alarms forever
+  // and the check stops being read. Accepting is a human action -- see loadGapBaseline.
+  acceptedGapFingerprints?: ReadonlySet<string>;
   // Caller-owned cache of canonical-bytes digests already known to verify. READ AND UPDATED IN
   // PLACE. Entries are immutable once signed, so a digest that verified once verifies forever;
   // anything whose bytes differ is a different entry and gets checked. Without it every pass
@@ -733,28 +840,14 @@ export async function crossCheckAuditLog(entries: AuditEntry[], opts: CrossCheck
       }
     }
 
-    const seqs = [...bySeq.keys()].sort((a, b) => a - b);
-    if (seqs.length > 0 && seqs[0]! > 1) {
-      const missingLeading = seqs[0]! - 1;
+    for (const gap of seqGapsOf(machine, [...bySeq.keys()])) {
+      if (opts.acceptedGapFingerprints?.has(gap.fingerprint)) continue;
       flags.push({
         kind: 'seq-gap',
         machine,
-        seqRange: { fromExclusive: 0, toExclusive: seqs[0]! },
-        detail: `${machine}: audit log starts at seq ${seqs[0]} instead of 1 (missing ${missingLeading} earliest entr${missingLeading === 1 ? 'y' : 'ies'})`,
+        seqRange: { fromExclusive: gap.fromExclusive, toExclusive: gap.toExclusive },
+        detail: gap.detail,
       });
-    }
-    for (let i = 1; i < seqs.length; i++) {
-      const prev = seqs[i - 1]!;
-      const cur = seqs[i]!;
-      if (cur - prev > 1) {
-        const missing = cur - prev - 1;
-        flags.push({
-          kind: 'seq-gap',
-          machine,
-          seqRange: { fromExclusive: prev, toExclusive: cur },
-          detail: `${machine}: audit seq gap between ${prev} and ${cur} (missing ${missing} entr${missing === 1 ? 'y' : 'ies'})`,
-        });
-      }
     }
   }
 

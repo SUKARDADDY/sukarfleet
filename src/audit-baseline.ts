@@ -1,11 +1,18 @@
 #!/usr/bin/env bun
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Accepts the same-(machine,seq) forks currently present in a union audit file as known-benign,
-// so regenerateUnionLog stops warning about them and warns only about NEW ones.
+// so regenerateUnionLog stops warning about them and warns only about NEW ones. With --gaps it
+// does the same for seq gaps: runs of entries that are missing and are never coming back.
 //
 // Usage (per machine -- the baseline is machine-local state, never synced):
 //   bun run /path/to/src/audit-baseline.ts /path/to/sukarfleet-audit.jsonl
 //   bun run /path/to/src/audit-baseline.ts /path/to/sukarfleet-audit.jsonl --dry-run
+//   bun run /path/to/src/audit-baseline.ts /path/to/sukarfleet-audit.jsonl --gaps
+//
+// --gaps is opt-in, and stays opt-in. A fork is two signed entries where there should be one,
+// which is odd but recoverable reading. A gap is signed entries that are GONE, which is also what
+// a machine erasing its own history looks like -- run it only when you know what took them (an
+// unclean shutdown is the usual answer, and `journalctl --list-boots` is where you check).
 //
 // Why this exists at all: entries are signed OVER their seq, so a fork that has already been
 // recorded cannot be renumbered away without invalidating the signatures. The historical forks
@@ -17,15 +24,23 @@
 // accepted (machine,seq) alarms again.
 
 import { isAbsolute, join } from 'node:path';
-import { loadForkBaseline, regenerateUnionLog, writeForkBaseline } from './audit';
+import {
+  allSeqGaps,
+  loadForkBaseline,
+  loadGapBaseline,
+  regenerateUnionLog,
+  writeForkBaseline,
+  writeGapBaseline,
+} from './audit';
 import { log } from './util';
 
 async function main(): Promise<number> {
   const args = process.argv.slice(2);
   const dryRun = args.includes('--dry-run');
+  const acceptGaps = args.includes('--gaps');
   const rel = args.find((a) => !a.startsWith('--'));
   if (!rel) {
-    console.error('usage: audit-baseline.ts <union-file-path> [--dry-run]');
+    console.error('usage: audit-baseline.ts <union-file-path> [--dry-run] [--gaps]');
     return 2;
   }
   const path = isAbsolute(rel) ? rel : join(process.cwd(), rel);
@@ -45,12 +60,31 @@ async function main(): Promise<number> {
       keys: fresh.map((f) => f.key).slice(0, 40),
     });
 
-    if (dryRun || fresh.length === 0) return 0;
+    if (acceptGaps) {
+      const gaps = allSeqGaps(res.entries);
+      const acceptedGaps = await loadGapBaseline();
+      const freshGaps = gaps.filter((g) => !acceptedGaps.has(g.fingerprint));
+      log('info', 'audit-baseline: seq gaps in the union file', {
+        gaps: gaps.length,
+        alreadyAccepted: gaps.length - freshGaps.length,
+        newlyAccepted: dryRun ? 0 : freshGaps.length,
+        dryRun,
+        details: freshGaps.map((g) => g.detail).slice(0, 40),
+      });
+      if (!dryRun && freshGaps.length > 0) {
+        await writeGapBaseline([...acceptedGaps, ...freshGaps.map((g) => g.fingerprint)]);
+        log('info', 'audit-baseline: gap baseline written', { accepted: acceptedGaps.size + freshGaps.length });
+      }
+    }
+
+    if (dryRun) return 0;
 
     // Union with what is already accepted: re-running this must never narrow the baseline just
     // because a peer's entries have not synced into this copy of the file yet.
-    await writeForkBaseline([...already, ...fresh.map((f) => f.fingerprint)]);
-    log('info', 'audit-baseline: baseline written', { accepted: already.size + fresh.length });
+    if (fresh.length > 0) {
+      await writeForkBaseline([...already, ...fresh.map((f) => f.fingerprint)]);
+      log('info', 'audit-baseline: fork baseline written', { accepted: already.size + fresh.length });
+    }
     return 0;
   } catch (err) {
     log('error', 'audit-baseline: failed', { path, error: String(err) });

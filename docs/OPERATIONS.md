@@ -78,6 +78,55 @@ Two things it needs from you:
   removing bad objects fixes. The usual recovery is to re-clone from the peer, which still has the
   history -- sync is git, so the other machine is a complete copy, not a mirror of your damage.
 
+## A corrupt git index repairs itself
+
+An unclean shutdown -- a power cut, a hard reset -- can leave `.git/index` as garbage while every
+commit and every file in the working tree is fine. The index holds nothing that is not recoverable
+from HEAD plus the worktree, but git refuses to run without a readable one, and `git status` is the
+first thing the sync cycle does. Before this repair existed, one power cut stopped a repo syncing
+and it stayed stopped for two days, reporting the same fault every half hour.
+
+Now the daemon quarantines the bad file as `.git/index.corrupt-<timestamp>`, rebuilds the index
+from HEAD, and retries the cycle once. You learn about it from a `sync: corrupt git index rebuilt
+from HEAD` line and from the repo's sync fault clearing on its own. The corrupt bytes are kept
+rather than deleted -- they cost 30 KB and they are the only evidence of what happened.
+
+Nothing else in the sync cycle self-heals, and that is deliberate. This repair is safe because the
+index is derived state; it cannot lose a commit, cannot touch a file you edited, and cannot resolve
+a conflict on your behalf. A held `index.lock` (another process is mid-write) and an unmerged index
+(a real conflict, waiting for a human) are both left alone.
+
+## An audit gap that is never coming back
+
+`N gap(s) in an audit sequence` means signed entries are missing from a machine's run. There is no
+repair: entries are signed over their seq, so the missing ones cannot be re-minted or renumbered
+away. The fault stays active and re-notifies every `thresholds.alarmRepeatMin` until you say
+otherwise.
+
+First find out what took them. An unclean shutdown is the common answer, and the entries lost are
+the ones written in the minutes before it:
+
+```bash
+journalctl --list-boots        # a boot that ends with no shutdown sequence is a crash
+```
+
+If that explains it, accept the gaps that exist right now:
+
+```bash
+bun run src/audit-baseline.ts ~/AI_Agent/sukarfleet-audit.jsonl --gaps --dry-run   # look first
+bun run src/audit-baseline.ts ~/AI_Agent/sukarfleet-audit.jsonl --gaps
+```
+
+The baseline is machine-local and never synced, for the same reason the fork baseline is not:
+somebody who can write the shared repo must not also be able to ship the file that declares the
+entries they removed acceptable. Each accepted gap is keyed by its edges, so if more entries later
+vanish from the same run, the gap's edges move and it alarms again. Accepting one hole can never
+bless a bigger one.
+
+`--gaps` is opt-in and stays opt-in. Do not reach for it to quiet a noisy board. A gap is also what
+a machine erasing its own history looks like, and the only thing that can tell that apart from a
+power cut is a human who knows what happened.
+
 ## A machine that is asleep is not a fault
 
 A roamer is shut, carried, and opened somewhere else. That whole arc is normal, so the daemon does
