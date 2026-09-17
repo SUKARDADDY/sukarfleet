@@ -3,7 +3,7 @@
 // Single writer per machine on sync/<machine>. main is never touched here.
 
 import { join, dirname } from 'node:path';
-import { stat } from 'node:fs/promises';
+import { rename, stat } from 'node:fs/promises';
 import type { FleetConfig, RepoConfig, PresenceRepoStat, MachineKey } from './types';
 import { run, runBytes, log, atomicWrite, nowMs, sleep as utilSleep, TransitionGate } from './util';
 import { buildAuthHeader } from './keys';
@@ -22,6 +22,11 @@ export interface SyncerDeps {
   // it keeps the previous behaviour. See pushOrigin for why a null is not good enough.
   onGithubPushNotApplicable?: (repo: string) => void;
   onConflictArtifact: (repo: string, path: string) => void;
+  // Fired after a corrupt .git/index was quarantined and rebuilt from HEAD (see repairIndex).
+  // Optional, additive: a caller that omits it keeps the previous behaviour and learns about the
+  // repair from the log line repairIndex writes anyway. It exists so a caller can surface the
+  // quarantine path somewhere an operator will actually look.
+  onIndexRepaired?: (repo: string, quarantinedTo: string) => void;
   // This machine's signing identity. Required to attach the x-fleet-auth header that
   // gitserve.ts mandates on every peer fetch (see fetchAll below). Contract addition —
   // callers construct this the same way Gossip does, via keys.loadOrCreateMachineKey().
@@ -159,7 +164,25 @@ export class Syncer {
   // is whether origin was reached this cycle, and it was. The later step that failed (merge,
   // postMerge, pushOrigin) is reported through onRepoStat's syncError, and the lease baseline this
   // answer exists to vouch for is genuinely fresh.
+  //
+  // A cycle that fails on a CORRUPT INDEX is retried once, after repairIndex rebuilds it. The
+  // index is derived state -- every byte of it can be recomputed from HEAD plus the worktree --
+  // so a machine that loses it to an unclean shutdown is not damaged, it is merely stuck, and it
+  // stays stuck forever without this: `git status` is the first thing autoCommit runs, so the repo
+  // never syncs, never pushes, and reports the same fault every alarm interval until a human runs
+  // two commands. Nothing else here self-heals, deliberately -- see repairIndex for the line.
   async syncOnce(repo: RepoConfig): Promise<SyncOnceResult> {
+    const first = await this.runCycle(repo);
+    if (!first.corruptIndex) return { originFetchOk: first.originFetchOk };
+    if (!(await this.repairIndex(repo))) return { originFetchOk: first.originFetchOk };
+    const second = await this.runCycle(repo);
+    return { originFetchOk: second.originFetchOk };
+  }
+
+  // One attempt at a full cycle. Reports whether it died on a corrupt index so syncOnce can
+  // decide to repair and re-enter; every other outcome is already fully reported through
+  // onRepoStat before this returns.
+  private async runCycle(repo: RepoConfig): Promise<{ originFetchOk: boolean | null; corruptIndex: boolean }> {
     let originFetchOk: boolean | null = false;
     try {
       const branchR = await this.gitOk(repo.path, ['symbolic-ref', '--short', 'HEAD']);
@@ -183,7 +206,7 @@ export class Syncer {
 
       const lastCommit = await this.head(repo.path);
       this.deps.onRepoStat(repo.name, { lastSyncOkMs: this.now(), lastCommit, syncError: null });
-      return { originFetchOk };
+      return { originFetchOk, corruptIndex: false };
     } catch (err) {
       // Never leave the repo wedged mid-merge.
       await this.git(repo.path, ['merge', '--abort']).catch(() => {});
@@ -191,8 +214,74 @@ export class Syncer {
       const msg = err instanceof Error ? err.message : String(err);
       log('error', 'sync cycle failed', { repo: repo.name, error: msg });
       this.deps.onRepoStat(repo.name, { lastSyncOkMs: null, lastCommit, syncError: msg });
-      return { originFetchOk };
+      return { originFetchOk, corruptIndex: isCorruptIndexError(msg) };
     }
+  }
+
+  // Quarantine a corrupt .git/index and rebuild it from HEAD. Returns whether the rebuild left a
+  // working index -- a false answer means the cycle should NOT be retried, and the original error
+  // stands as the reported fault.
+  //
+  // Why this one repair and nothing else: the index holds no information that is not recoverable
+  // from HEAD and the worktree. Rebuilding it cannot lose committed history, cannot touch a file
+  // in the worktree, and cannot resolve a conflict a human had not already resolved. The single
+  // thing it discards is staged-but-uncommitted intent, which in a sukarfleet repo does not exist
+  // -- autoCommit re-derives the whole changed set from `git status` on every cycle, so the next
+  // one stages exactly what this one would have. No other sync failure has that property, so no
+  // other sync failure is repaired here.
+  //
+  // The corrupt file is moved, never deleted, mirroring the conflict-artifact rule: a machine that
+  // ate its own index during a power cut is a forensics subject, and the evidence costs 30 KB.
+  private async repairIndex(repo: RepoConfig): Promise<boolean> {
+    const indexPathR = await this.git(repo.path, ['rev-parse', '--git-path', 'index']);
+    if (indexPathR.code !== 0) return false;
+    const rel = indexPathR.stdout.trim();
+    if (rel.length === 0) return false;
+    const indexPath = rel.startsWith('/') ? rel : join(repo.path, rel);
+    const quarantine = `${indexPath}.corrupt-${this.fsIso()}`;
+
+    try {
+      await rename(indexPath, quarantine);
+    } catch (err) {
+      log('error', 'index repair: could not quarantine the corrupt index', {
+        repo: repo.name,
+        error: String(err),
+      });
+      return false;
+    }
+
+    // An unborn HEAD (a repo with no commit yet) has no tree to read; an empty index is the
+    // correct rebuild there, and `read-tree HEAD` would just fail.
+    const hasHead = await this.git(repo.path, ['rev-parse', '--verify', '--quiet', 'HEAD']);
+    const rebuild =
+      hasHead.code === 0
+        ? await this.git(repo.path, ['read-tree', 'HEAD'])
+        : await this.git(repo.path, ['read-tree', '--empty']);
+    if (rebuild.code !== 0) {
+      log('error', 'index repair: rebuild from HEAD failed', {
+        repo: repo.name,
+        quarantine,
+        error: rebuild.stderr.trim(),
+      });
+      return false;
+    }
+
+    // Prove the rebuilt index is actually usable before claiming a repair: read-tree can succeed
+    // and still leave something status chokes on, and a false "repaired" here would turn one
+    // honest fault into a retry loop that reports a different error every cycle.
+    const verify = await this.git(repo.path, ['status', '--porcelain', '-z']);
+    if (verify.code !== 0) {
+      log('error', 'index repair: rebuilt index still unusable', {
+        repo: repo.name,
+        quarantine,
+        error: verify.stderr.trim(),
+      });
+      return false;
+    }
+
+    log('warn', 'index repair: rebuilt a corrupt git index from HEAD', { repo: repo.name, quarantine });
+    this.deps.onIndexRepaired?.(repo.name, quarantine);
+    return true;
   }
 
   // (1) auto-commit: write-quiet debounce + per-file (size,mtime) stability re-check.
@@ -616,6 +705,28 @@ export class Syncer {
   private fsIso(): string {
     return this.isoNow().replace(/[:.]/g, '-');
   }
+}
+
+// git's own words when it cannot read .git/index. Every one of these means the file's bytes are
+// not a valid index: a truncated write, a zero-filled block from a lost page cache, or a header
+// git does not recognise. Matched on the message rather than an exit code because git reports all
+// of them as a plain fatal with code 128, the same code a hundred ordinary failures use.
+//
+// Deliberately NOT here: `index.lock` (another process holds it -- waiting is the fix, not
+// rebuilding), and `unmerged` / `needs merge` (a real conflict state a rebuild would paper over).
+const CORRUPT_INDEX_PATTERNS = [
+  'unknown index entry format',
+  'bad index file sha1 signature',
+  'index file corrupt',
+  'index file smaller than expected',
+  'index uses',
+  'malformed index',
+];
+
+export function isCorruptIndexError(message: string): boolean {
+  const m = message.toLowerCase();
+  if (m.includes('index.lock')) return false;
+  return CORRUPT_INDEX_PATTERNS.some((p) => m.includes(p));
 }
 
 async function pathExists(p: string): Promise<boolean> {

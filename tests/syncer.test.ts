@@ -3,7 +3,7 @@ import { test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Syncer, type SyncerDeps, type SyncerOptions } from '../src/syncer';
+import { Syncer, isCorruptIndexError, type SyncerDeps, type SyncerOptions } from '../src/syncer';
 import { defaultConfig } from '../src/config';
 import { run } from '../src/util';
 import type { RunOptions, RunResult } from '../src/util';
@@ -67,6 +67,7 @@ interface Recorder {
   pushes: (number | null)[];
   conflicts: string[];
   notApplicable: string[];
+  repairs: { repo: string; quarantinedTo: string }[];
 }
 
 function recorder(vetted = true): Recorder {
@@ -74,17 +75,20 @@ function recorder(vetted = true): Recorder {
   const pushes: (number | null)[] = [];
   const conflicts: string[] = [];
   const notApplicable: string[] = [];
+  const repairs: { repo: string; quarantinedTo: string }[] = [];
   return {
     stats,
     pushes,
     conflicts,
     notApplicable,
+    repairs,
     deps: {
       isClockVetted: () => vetted,
       onRepoStat: (_r, s) => stats.push(s),
       onGithubPush: (_r, ms) => pushes.push(ms),
       onGithubPushNotApplicable: (r) => notApplicable.push(r),
       onConflictArtifact: (_r, p) => conflicts.push(p),
+      onIndexRepaired: (r, quarantinedTo) => repairs.push({ repo: r, quarantinedTo }),
       machineKey: TEST_MACHINE_KEY,
     },
   };
@@ -883,4 +887,92 @@ test('pushOrigin TIMEOUT_SLACK boundary: elapsed = timeoutMs-251 classifies as a
   // Still warns on the second cycle -- proof it was classified as a real error (code 124 but not
   // "close enough" to gitTimeoutMs), never debounced through the timeout gate at all.
   expect(second.lines.filter((l) => l.msg === 'push to origin failed')[0]!.level).toBe('warn');
+});
+
+
+// --- corrupt index self-repair -------------------------------------------
+// The bytes below are not invented. They reproduce, byte for byte, what a synced repo held on a
+// live node after an unclean shutdown: a v3 index whose one entry claims an extended flag word git
+// does not understand, which git rejects as `fatal: unknown index entry format 0xe2760000`.
+// `git status` is the first thing autoCommit runs, so before this repair that repo stopped syncing
+// entirely and stayed stopped until a human noticed, two days later.
+async function corruptIndex(repoDir: string, name: string): Promise<void> {
+  const nameBytes = new TextEncoder().encode(name);
+  const entry: number[] = [];
+  for (let i = 0; i < 16; i++) entry.push(0); // ctime + mtime
+  const push32 = (v: number) => entry.push((v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255);
+  const push16 = (v: number) => entry.push((v >>> 8) & 255, v & 255);
+  push32(1); // dev
+  push32(1); // ino
+  push32(0o100644); // mode
+  push32(1000); // uid
+  push32(1000); // gid
+  push32(3); // size
+  for (let i = 0; i < 20; i++) entry.push(0x11); // object id
+  push16(0x4000 | nameBytes.length); // name length + the "extended flags follow" bit
+  push16(0xe276); // the extended flag word git rejects
+  for (const b of nameBytes) entry.push(b);
+  entry.push(0);
+  while (entry.length % 8 !== 0) entry.push(0);
+
+  const header = [0x44, 0x49, 0x52, 0x43, 0, 0, 0, 3, 0, 0, 0, 1]; // "DIRC", version 3, 1 entry
+  const body = new Uint8Array([...header, ...entry]);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-1', body));
+  const out = new Uint8Array(body.length + digest.length);
+  out.set(body, 0);
+  out.set(digest, body.length);
+  await writeFile(join(repoDir, '.git', 'index'), out);
+}
+
+test('isCorruptIndexError matches git\'s corruption wording and not a held lock', () => {
+  expect(isCorruptIndexError('git status --porcelain -z failed (code 128): fatal: unknown index entry format 0xe2760000')).toBe(true);
+  expect(isCorruptIndexError('fatal: bad index file sha1 signature')).toBe(true);
+  expect(isCorruptIndexError('fatal: index file smaller than expected')).toBe(true);
+  // A lock is another process, not damage. Rebuilding would race it instead of waiting for it.
+  expect(isCorruptIndexError('fatal: Unable to create \'/r/.git/index.lock\': File exists.')).toBe(false);
+  // An unmerged index is a conflict a human has to finish, and a rebuild would silently drop it.
+  expect(isCorruptIndexError('error: you need to resolve your current index first')).toBe(false);
+  expect(isCorruptIndexError('fatal: could not read Username for https://github.com')).toBe(false);
+});
+
+test('a corrupt index is quarantined, rebuilt from HEAD, and the cycle completes', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+
+  // Work that was waiting to be committed when the index died. It must survive the repair and be
+  // committed by the retried cycle, which is the whole point: the worktree was never damaged.
+  await writeFile(join(dirA, 'a.txt'), 'two');
+  await corruptIndex(dirA, 'a.txt');
+
+  const before = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  await syncA.syncOnce(repoA);
+
+  expect(recA.repairs.length).toBe(1);
+  expect(recA.repairs[0]!.repo).toBe('r');
+
+  // The corrupt bytes are kept, not deleted: a machine that ate its own index is evidence.
+  const quarantined = await readFile(recA.repairs[0]!.quarantinedTo);
+  expect(quarantined.subarray(0, 4).toString()).toBe('DIRC');
+  expect(quarantined[7]).toBe(3);
+
+  // The retried cycle actually worked: it committed the pending edit and reported a clean stat.
+  const after = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  expect(after).not.toBe(before);
+  expect((await git(dirA, ['show', 'HEAD:a.txt'])).stdout).toBe('two');
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect((await git(dirA, ['status', '--porcelain'])).stdout.trim()).toBe('');
+});
+
+test('a sync failure that is not index corruption is never repaired or retried', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  // Single-writer violation: HEAD is not sync/<machine>. A real fault, and not one a rebuilt
+  // index could fix -- repairing here would destroy an index while solving nothing.
+  await git(dirA, ['checkout', '-q', '-b', 'somebody-elses-branch']);
+
+  await syncA.syncOnce(repoA);
+
+  expect(recA.repairs.length).toBe(0);
+  expect(recA.stats.length).toBe(1); // one attempt, not two
+  expect(recA.stats[0]!.syncError).toContain('refusing sync');
+  const entries = await readdir(join(dirA, '.git'));
+  expect(entries.filter((e) => e.startsWith('index.corrupt-')).length).toBe(0);
 });

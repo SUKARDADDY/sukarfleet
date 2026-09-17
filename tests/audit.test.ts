@@ -17,11 +17,16 @@ import {
   AUDIT_KIND_JOB_ISSUED,
   AuditLog,
   GENESIS_PREV,
+  allSeqGaps,
   crossCheckAuditLog,
   flushLocalToUnion,
+  gapFingerprint,
   loadForkBaseline,
+  loadGapBaseline,
   regenerateUnionLog,
+  seqGapsOf,
   writeForkBaseline,
+  writeGapBaseline,
 } from '../src/audit';
 
 let keyDir: string;
@@ -788,6 +793,85 @@ describe('crossCheckAuditLog', () => {
     const gaps = report.flags.filter((f) => f.kind === 'seq-gap');
     expect(gaps).toHaveLength(1);
     expect(gaps[0]!.seqRange).toEqual({ fromExclusive: 1, toExclusive: 4 });
+  });
+
+  test('an accepted gap stops flagging, and a WIDER one at the same place does not inherit that', async () => {
+    // The field case: a power cut took seqs 368-370 with them. Those entries were signed and are
+    // gone, so nothing can repair this -- either the operator can say "I know what took them" once
+    // and be believed, or the check alarms every 30 minutes forever and stops being read.
+    const key = await freshKey('alpha');
+    const e1 = await makeEntry('alpha', key, 1, AUDIT_KIND_JOB_ISSUED, { jobId: 'j1', targetMachine: 'beta' }, 1000);
+    const e4 = await makeEntry('alpha', key, 4, AUDIT_KIND_JOB_ISSUED, { jobId: 'j2', targetMachine: 'beta' }, 2000);
+    const opts = { nowMs: 2000, publicKeyJwkByMachine: { alpha: key.publicKeyJwk } };
+
+    const accepted = new Set([gapFingerprint('alpha', 1, 4)]);
+    const quiet = await crossCheckAuditLog([e1, e4], { ...opts, acceptedGapFingerprints: accepted });
+    expect(quiet.flags.filter((f) => f.kind === 'seq-gap')).toHaveLength(0);
+
+    // Now MORE entries vanish from the same run. The gap's edges moved, so it is a different gap
+    // and the old acceptance says nothing about it. This is the property that makes accepting one
+    // safe: a machine cannot quietly widen an already-blessed hole in its own history.
+    const e7 = await makeEntry('alpha', key, 7, AUDIT_KIND_JOB_ISSUED, { jobId: 'j3', targetMachine: 'beta' }, 3000);
+    const loud = await crossCheckAuditLog([e1, e7], { ...opts, nowMs: 3000, acceptedGapFingerprints: accepted });
+    const gaps = loud.flags.filter((f) => f.kind === 'seq-gap');
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]!.seqRange).toEqual({ fromExclusive: 1, toExclusive: 7 });
+  });
+
+  test('accepting a gap never silences a fork, a chain break or a bad signature', async () => {
+    // Blast radius: the baseline answers exactly one question, and every other check is untouched.
+    const key = await freshKey('alpha');
+    const e1 = await makeEntry('alpha', key, 1, 'probe', { i: 1 }, 1000, GENESIS_PREV);
+    const e4a = await makeEntry('alpha', key, 4, 'probe', { i: '4a' }, 2000, digestOf(e1));
+    const e4b = await makeEntry('alpha', key, 4, 'probe', { i: '4b' }, 2000, digestOf(e1));
+
+    const report = await crossCheckAuditLog([e1, e4a, e4b], {
+      nowMs: 2000,
+      publicKeyJwkByMachine: { alpha: key.publicKeyJwk },
+      acceptedGapFingerprints: new Set([gapFingerprint('alpha', 1, 4)]),
+    });
+    expect(report.flags.filter((f) => f.kind === 'seq-gap')).toHaveLength(0);
+    expect(report.flags.filter((f) => f.kind === 'seq-fork')).toHaveLength(1);
+  });
+
+  test('seqGapsOf reports the leading gap, and allSeqGaps covers every machine', () => {
+    // A log starting above 1 means the EARLIEST entries are gone: AuditLog always mints from 1.
+    const leading = seqGapsOf('alpha', [5, 6, 7]);
+    expect(leading).toHaveLength(1);
+    expect(leading[0]!.fromExclusive).toBe(0);
+    expect(leading[0]!.toExclusive).toBe(5);
+    expect(leading[0]!.missing).toBe(4);
+    expect(seqGapsOf('alpha', [1, 2, 3])).toEqual([]);
+    expect(seqGapsOf('alpha', [])).toEqual([]);
+    // Order of arrival says nothing: the union file is merged from several machines' appends.
+    expect(seqGapsOf('alpha', [4, 1]).map((g) => [g.fromExclusive, g.toExclusive])).toEqual([[1, 4]]);
+  });
+
+  test('the gap baseline is machine-local state, and an unreadable one accepts nothing', async () => {
+    expect(await loadGapBaseline()).toEqual(new Set());
+    await writeGapBaseline([gapFingerprint('alpha', 1, 4), gapFingerprint('beta', 9, 12)]);
+    expect((await loadGapBaseline()).size).toBe(2);
+    expect(await loadGapBaseline()).toContain(gapFingerprint('alpha', 1, 4));
+
+    // Fails CLOSED, mirroring loadForkBaseline: a corrupted baseline must not silence the alarm
+    // it guards, which is exactly when an attacker would want it to.
+    await Bun.write(join(stateRoot, 'audit-gap-baseline.json'), 'not json {');
+    expect(await loadGapBaseline()).toEqual(new Set());
+  });
+
+  test('allSeqGaps finds the gaps the accept tool writes a baseline from', async () => {
+    const alpha = await freshKey('alpha');
+    const beta = await freshKey('beta');
+    const entries = [
+      await makeEntry('alpha', alpha, 1, 'probe', { i: 1 }),
+      await makeEntry('alpha', alpha, 4, 'probe', { i: 4 }),
+      await makeEntry('beta', beta, 1, 'probe', { i: 1 }),
+      await makeEntry('beta', beta, 2, 'probe', { i: 2 }),
+    ];
+    const gaps = allSeqGaps(entries);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]!.machine).toBe('alpha');
+    expect(gaps[0]!.fingerprint).toBe(gapFingerprint('alpha', 1, 4));
   });
 
   test('does not flag a contiguous seq run', async () => {
