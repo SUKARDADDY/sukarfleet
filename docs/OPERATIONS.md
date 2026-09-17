@@ -78,6 +78,27 @@ Two things it needs from you:
   removing bad objects fixes. The usual recovery is to re-clone from the peer, which still has the
   history -- sync is git, so the other machine is a complete copy, not a mirror of your damage.
 
+## A Windows node's host key, and re-pairing after an upgrade
+
+A Windows node cannot read its own SSH host key. `%ProgramData%\ssh` is Administrator-only, and the
+node runs unprivileged: it can list the directory and see `ssh_host_ed25519_key.pub` sitting there,
+and it is refused when it opens it. The `.pub` files are locked down alongside the private ones.
+
+It therefore learns its host keys by asking its own sshd over loopback, which is what an SSH server
+hands to any client that connects. If nothing is listening, it falls back to minting a key under
+the state dir, which keeps a node with no sshd pairable at all.
+
+**A node that paired before this needs re-pairing.** The older behaviour advertised the minted key
+even when sshd was running, so its peers pinned an identity sshd never presents and every approach
+on the admin lane failed `hostkey-mismatch`, permanently. Changing what the node advertises does not
+update a pin somebody else already took. Re-pair the two machines and the new pin carries the key
+sshd actually serves.
+
+How to tell you are looking at this rather than at something hostile: the fingerprint the lane
+reports as "presented" will match what the machine has been serving all along, which you can check
+against any `known_hosts` entry written when someone last connected by hand. A key that changed is a
+different event and deserves the suspicion the refusal implies.
+
 ## A corrupt git index repairs itself
 
 An unclean shutdown -- a power cut, a hard reset -- can leave `.git/index` as garbage while every
