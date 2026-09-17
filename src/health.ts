@@ -537,6 +537,16 @@ export class Health {
         existing.message = fault.message;
         changed = true;
       }
+      // Urgency is recomputed every tick like the message is, so a latch must take the new value
+      // too. It changes under a latched fault more often than it looks: an upgrade that reclassifies
+      // a fault class, an operator editing a threshold, a condition whose own severity moves. The
+      // notification path already uses the freshly computed urgency; without this the SAVED record
+      // keeps the value it was born with, and /status, the tray and any monitor reading the fault
+      // list go on reporting a severity the daemon no longer believes.
+      if (existing.urgency !== fault.urgency) {
+        existing.urgency = fault.urgency;
+        changed = true;
+      }
       if (fault.repeat !== false && now - existing.lastNotifiedMs >= repeatMs) {
         existing.lastNotifiedMs = now;
         changed = true;
