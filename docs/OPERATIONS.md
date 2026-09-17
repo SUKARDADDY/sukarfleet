@@ -96,6 +96,30 @@ index is derived state; it cannot lose a commit, cannot touch a file you edited,
 a conflict on your behalf. A held `index.lock` (another process is mid-write) and an unmerged index
 (a real conflict, waiting for a human) are both left alone.
 
+## The audit log itself is damaged
+
+`this machine's audit log has N unreadable byte(s)` means bytes in `audit-log.jsonl` under the
+state dir are no longer entries. The usual cause is the same unclean shutdown that corrupts a git
+index: the filesystem kept the file's length but lost the data blocks, so a region comes back as
+NULs. NUL is not a newline, so a region that held thousands of entries reads as a single
+unreadable line. That is why the fault counts bytes and not just lines.
+
+It is said once and then stays quiet. The damage is a fixed historical fact, the count never moves,
+and repeating it every half hour would only train you to ignore it. It stays visible in `/status`
+and the tray, and speaks again only to say it cleared.
+
+**Nothing repairs it, on purpose.** Trimming the unreadable region would mean rewriting an audit log
+to silence an alarm about a damaged audit log, which is indistinguishable from a machine trimming
+its own history. What to do instead:
+
+1. Find out what caused it. `journalctl --list-boots`; a boot that ends with no shutdown sequence
+   is a crash, and the entries lost are the ones written in the minutes before it.
+2. Check what was actually lost. Every entry already flushed lives on in the git-synced union file,
+   which other machines also hold, so in the common case the damaged region is redundant and
+   nothing is gone. `sukarfleet-cli audit tail` reads the union file, not this one.
+3. If entries really are missing from the union file too, they show up separately as a seq gap
+   (below). That is the fault that speaks to lost history; this one speaks to a damaged file.
+
 ## An audit gap that is never coming back
 
 `N gap(s) in an audit sequence` means signed entries are missing from a machine's run. There is no

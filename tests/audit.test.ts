@@ -609,6 +609,56 @@ describe('flushLocalToUnion', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  test('reports a NUL-blasted local log instead of silently skipping it', async () => {
+    // Reproduces the shape of real damage. An unclean shutdown loses the page cache but keeps the
+    // inode's size, so the file comes back the right length and full of zeros. NUL is not a
+    // newline, so the whole lost region is ONE unreadable line -- which is why this asserts on
+    // bytes. Before this, the count was computed on this path and thrown away, so a local log
+    // could lose 88% of itself and the daemon would say nothing on that read or any read after.
+    const key = await freshKey('alpha');
+    const alog = new AuditLog('alpha', key);
+    await alog.append(AUDIT_KIND_JOB_ISSUED, { jobId: 'j1', targetMachine: 'beta' });
+    await alog.append(AUDIT_KIND_JOB_ISSUED, { jobId: 'j2', targetMachine: 'beta' });
+
+    const localPath = join(stateRoot, 'audit-log.jsonl');
+    const lines = (await Bun.file(localPath).text()).split('\n');
+    // Zero-fill the region that held seq 1, exactly as a lost page cache does: the file keeps its
+    // length, the bytes become NULs, and the entry that lived there is gone for good.
+    const damaged = `${'\0'.repeat(4096)}\n${lines.slice(1).join('\n')}`;
+    await Bun.write(localPath, damaged);
+
+    const dir = await mkdtemp(join(tmpdir(), 'sukarfleet-audit-damaged-'));
+    const unionPath = join(dir, 'union.jsonl');
+    const res = await flushLocalToUnion(unionPath);
+
+    expect(res.localLog.malformedLines).toBe(1);
+    expect(res.localLog.malformedBytes).toBe(4096);
+    expect(res.localLog.totalBytes).toBe(damaged.length);
+
+    // What survived still flushes. Damage is reported, never a reason to stop copying the readable
+    // entries into the replicated log -- that log is the copy that outlives this machine.
+    expect(res.entries).toHaveLength(1);
+    expect(res.entries[0]!.seq).toBe(2);
+
+    // And nothing was repaired: the damaged bytes are still exactly where they were.
+    expect(await Bun.file(localPath).text()).toBe(damaged);
+
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test('an undamaged local log reports zero damage', async () => {
+    const key = await freshKey('alpha');
+    const alog = new AuditLog('alpha', key);
+    await alog.append(AUDIT_KIND_JOB_ISSUED, { jobId: 'j1', targetMachine: 'beta' });
+
+    const dir = await mkdtemp(join(tmpdir(), 'sukarfleet-audit-undamaged-'));
+    const res = await flushLocalToUnion(join(dir, 'union.jsonl'));
+    expect(res.localLog.malformedLines).toBe(0);
+    expect(res.localLog.malformedBytes).toBe(0);
+    expect(res.localLog.totalBytes).toBeGreaterThan(0);
+    await rm(dir, { recursive: true, force: true });
+  });
+
   test('merges with entries already present from another machine', async () => {
     const popKey = await freshKey('alpha');
     const laptopKey = await freshKey('beta');

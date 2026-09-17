@@ -24,7 +24,8 @@ export type FaultClass =
   | 'admin-hostkey-mismatch'
   | 'admin-peer-unreachable'
   | 'admin-lane-unconfigured'
-  | 'audit-integrity';
+  | 'audit-integrity'
+  | 'audit-log-damaged';
 
 export interface HealthSelf {
   repos: Record<string, { lastSyncOkMs: number | null; lastCommit: string | null; syncError: string | null }>;
@@ -57,7 +58,20 @@ export interface HealthSelf {
     unacceptedForks: number; // same-seq conflicts not in this machine's fork baseline
     seqGaps: number; // missing entries in some machine's sequence
     chainBreaks: number; // entries after a machine's genesis whose `prev` does not name their predecessor
+    // Unreadable bytes in THIS machine's local audit log, as counted on the way past by
+    // flushLocalToUnion. Optional and additive: a caller that does not report it raises no fault,
+    // the same way an absent `admin` block raises no admin faults.
+    localLog?: LocalLogDamage;
   };
+}
+
+// Unreadable bytes in one machine's own audit log. Structurally identical to audit.ts's LogDamage
+// and deliberately declared here too: health.ts reports on the audit lane without importing it, the
+// same way it reports on the sync lane without importing syncer.ts.
+export interface LocalLogDamage {
+  malformedLines: number;
+  malformedBytes: number;
+  totalBytes: number;
 }
 
 export type Notifier = (urgency: Urgency, title: string, body: string) => Promise<void>;
@@ -196,6 +210,8 @@ function titleFor(faultClass: FaultClass): string {
       return 'sukarfleet: admin peer unreachable';
     case 'admin-lane-unconfigured':
       return 'sukarfleet: admin lane unconfigured';
+    case 'audit-log-damaged':
+      return 'sukarfleet: audit log damaged';
     case 'audit-integrity':
       return 'sukarfleet: audit log integrity';
   }
@@ -398,6 +414,30 @@ function computeActiveFaults(cfg: FleetConfig, self: HealthSelf, peers: PeerView
         faultClass: 'audit-integrity',
         urgency: 'normal',
         message: `${audit.unverifiableSigners} audit entr${audit.unverifiableSigners === 1 ? 'y' : 'ies'} from a machine with no enrolled key`,
+      });
+    }
+    // THIS machine's own log file is partly unreadable. Distinct from every flag above: those are
+    // verdicts about the replicated log's CONTENT, this one is about local bytes that are no longer
+    // entries at all -- the signature of a lost page cache, where a zero-filled region swallows
+    // thousands of entries and parses as one malformed line.
+    //
+    // Reported, never repaired. Trimming the unreadable region would be rewriting an audit log to
+    // make an alarm about a damaged audit log go away, which is indistinguishable from what a
+    // machine trimming its own history does. The entries are not necessarily lost -- every one
+    // already flushed lives on in the git-replicated union file, which is the copy that matters.
+    //
+    // Said ONCE, not every alarmRepeatMin: the damage is a fixed historical fact and the count
+    // never moves, so repeating it carries no new information. It stays latched in /status and the
+    // tray, and speaks again only to report that it cleared.
+    const damage = audit.localLog;
+    if (damage && damage.malformedLines > 0) {
+      const pct = damage.totalBytes > 0 ? Math.round((damage.malformedBytes / damage.totalBytes) * 100) : 0;
+      faults.push({
+        key: 'audit-log-damaged:local',
+        faultClass: 'audit-log-damaged',
+        urgency: 'critical',
+        repeat: false,
+        message: `this machine's audit log has ${damage.malformedBytes} unreadable byte(s) in ${damage.malformedLines} line(s) — ${pct}% of the file is not entries`,
       });
     }
     if (audit.seqGaps > 0) {

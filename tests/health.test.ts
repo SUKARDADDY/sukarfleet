@@ -143,6 +143,69 @@ describe('Health.evaluate: audit integrity', () => {
     expect(calls.filter((c) => c.title.includes('audit'))).toHaveLength(0);
   });
 
+  test('unreadable bytes in this machine\'s own log are critical, and say how much of the file is gone', async () => {
+    // The field case: an unclean shutdown zero-filled 296366 of 334836 bytes of a local audit log.
+    // NUL is not a newline, so the whole lost region parses as ONE malformed line -- which is why
+    // the byte count is in the message and the line count alone would have understated it as "1".
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(healthyCfg({}), notifier);
+    const self = healthySelf();
+    self.auditIntegrity = {
+      invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0, chainBreaks: 0,
+      localLog: { malformedLines: 1, malformedBytes: 296366, totalBytes: 334836 },
+    };
+    await health.evaluate(t0, self, []);
+    const damaged = calls.filter((c) => c.title.includes('audit log damaged'));
+    expect(damaged).toHaveLength(1);
+    expect(damaged[0]!.urgency).toBe('critical');
+    expect(damaged[0]!.body).toContain('296366 unreadable byte(s)');
+    expect(damaged[0]!.body).toContain('89% of the file');
+  });
+
+  test('a damaged local log is said ONCE, not every alarm interval', async () => {
+    // The damage is a fixed historical fact and the count never moves, so repeating it adds
+    // nothing. It must still latch -- silence after the first notification is not "recovered".
+    const { calls, notifier } = fakeNotifier();
+    const cfg = healthyCfg({});
+    const health = new Health(cfg, notifier);
+    const self = healthySelf();
+    self.auditIntegrity = {
+      invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0, chainBreaks: 0,
+      localLog: { malformedLines: 1, malformedBytes: 100, totalBytes: 200 },
+    };
+    await health.evaluate(t0, self, []);
+    expect(calls.filter((c) => c.title.includes('audit log damaged'))).toHaveLength(1);
+    expect((await health.getState()).faults.map((f) => f.key)).toContain('audit-log-damaged:local');
+
+    // Five alarm intervals later: still latched, still silent.
+    const repeatMs = cfg.thresholds.alarmRepeatMin * 60000;
+    await health.evaluate(t0 + repeatMs * 5, self, []);
+    expect(calls.filter((c) => c.title.includes('audit log damaged'))).toHaveLength(1);
+    expect((await health.getState()).faults.map((f) => f.key)).toContain('audit-log-damaged:local');
+
+    // And it does clear if the file ever reads whole again. Asserted on state rather than on the
+    // notification title: a tick that clears the last fault also queues the all-green digest, and
+    // two pending items coalesce into one "N fault updates" toast.
+    self.auditIntegrity = { invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0, chainBreaks: 0, localLog: { malformedLines: 0, malformedBytes: 0, totalBytes: 200 } };
+    await health.evaluate(t0 + repeatMs * 6, self, []);
+    expect((await health.getState()).faults.map((f) => f.key)).not.toContain('audit-log-damaged:local');
+  });
+
+  test('a clean local log, and an absent one, raise nothing', async () => {
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(healthyCfg({}), notifier);
+    const self = healthySelf();
+    self.auditIntegrity = {
+      invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0, chainBreaks: 0,
+      localLog: { malformedLines: 0, malformedBytes: 0, totalBytes: 4096 },
+    };
+    await health.evaluate(t0, self, []);
+    // A caller that reports no localLog at all (a pre-existing caller) must raise nothing either.
+    self.auditIntegrity = { invalidSignatures: 0, unverifiableSigners: 0, unacceptedForks: 0, seqGaps: 0, chainBreaks: 0 };
+    await health.evaluate(t0 + 1000, self, []);
+    expect(calls.filter((c) => c.title.includes('audit'))).toHaveLength(0);
+  });
+
   test('chain and signature faults latch separately, so neither hides the other', async () => {
     const { calls, notifier } = fakeNotifier();
     const health = new Health(healthyCfg({}), notifier);
