@@ -470,6 +470,8 @@ export class SshAdmin {
   private readonly rateWindow = new Map<string, number[]>();
   private readonly lastRunMs = new Map<string, number>();
   private stopped = false;
+  // Windows only: this machine's advertised host keys, learned once (see windowsHostKeys).
+  private windowsHostKeyCache: string[] | null = null;
 
   constructor(private readonly deps: SshAdminDeps) {
     this.now = deps.now ?? nowMs;
@@ -1257,19 +1259,74 @@ export class SshAdmin {
   private async localHostKeys(): Promise<string[]> {
     // An explicit directory (test seam, or an operator override) is read exactly as given.
     if (this.deps.sshHostKeyDir) return this.readHostKeyDir(this.deps.sshHostKeyDir);
-    // A Windows node does not run sshd -- the installer needs only the SSH client -- and keeps the
-    // admin lane off, so it can have no host keys at all, and the ones under %ProgramData%\ssh (if
-    // sshd is present) are Administrator-only and not this unprivileged process's to read. Its
-    // pairing identity is therefore a host key it owns and mints once under stateDir(). Advertising
-    // a host key for a service it does not run is harmless: no peer dials a Windows node's admin
-    // lane (it is off), and a pair bundle must still carry >=1 host key (pairing.ts sanitizeBundle).
-    if (this.resolvePlatform() === 'windows') {
-      const minted = await this.ensureNodeHostKey();
-      return minted ? [minted] : [];
-    }
+    if (this.resolvePlatform() === 'windows') return this.windowsHostKeys();
     // POSIX: the system host keys are the identity. An empty /etc/ssh stays empty -- there a
     // missing host key is something the operator should see, not something to paper over.
     return this.readHostKeyDir('/etc/ssh');
+  }
+
+  // A Windows node cannot read its own host key. %ProgramData%\ssh is Administrator-only: this
+  // unprivileged process can LIST the directory and see ssh_host_ed25519_key.pub sitting there,
+  // and is refused when it opens it -- the .pub files are locked down alongside the private ones.
+  //
+  // So it learns the key the only other way there is: it asks sshd. A public host key is what an
+  // SSH server hands to anyone who opens a connection, and this connection goes to the machine's
+  // own loopback, so nothing is exposed that a client on this box could not already see.
+  //
+  // Why this matters. The previous behaviour was to mint a host key under stateDir() and advertise
+  // that, on the stated premise that "a Windows node does not run sshd". When it does -- which is
+  // how anyone administers the box -- pairing pins an identity sshd never presents, so every
+  // approach on the admin lane fails `hostkey-mismatch` forever. Verified on a live Windows node:
+  // the pin held the minted key while sshd served a different one, unchanged since the day it was
+  // installed, and the lane had never once completed a run.
+  //
+  // Minting stays as the fallback, for its real case: a node with no sshd at all, which still
+  // needs >=1 host key or pairing.ts's sanitizeBundle refuses the bundle.
+  private async windowsHostKeys(): Promise<string[]> {
+    if (this.windowsHostKeyCache) return this.windowsHostKeyCache;
+    const scanned = await this.scanLocalSshdHostKeys();
+    if (scanned.length > 0) {
+      log('info', 'sshadmin: learned this machine\'s host keys from its own sshd', { count: scanned.length });
+      this.windowsHostKeyCache = scanned;
+      return scanned;
+    }
+    const minted = await this.ensureNodeHostKey();
+    // Cached either way, including the empty answer. trust() is on the console's polling path, and
+    // a machine with no sshd must not spawn a scan per UI request to keep rediscovering that.
+    // Host keys do not change under a running sshd; installing one later is picked up on restart.
+    this.windowsHostKeyCache = minted ? [minted] : [];
+    return this.windowsHostKeyCache;
+  }
+
+  // `ssh-keyscan <host>` prints one `<host> <type> <base64>` line per host key the server offers.
+  // Never throws and never blocks the pairing path: any failure (no ssh-keyscan on this box, no
+  // sshd listening, a firewall in the way) returns empty and the caller falls back to minting.
+  private async scanLocalSshdHostKeys(): Promise<string[]> {
+    try {
+      const res = await this.runner(['ssh-keyscan', '-T', '5', '-t', 'ed25519,rsa,ecdsa', '127.0.0.1'], {
+        timeoutMs: 15000,
+      });
+      if (res.code !== 0 && res.stdout.trim().length === 0) {
+        log('debug', 'sshadmin: no host keys from local sshd', { code: res.code, error: res.stderr.trim().slice(0, 200) });
+        return [];
+      }
+      const keys = new Set<string>();
+      for (const line of res.stdout.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed.length === 0 || trimmed.startsWith('#')) continue;
+        // Drop the leading host field; what pairing advertises is `<type> <base64>`, the same
+        // shape readHostKeyDir produces from a .pub file.
+        const spaceIdx = trimmed.indexOf(' ');
+        if (spaceIdx < 0) continue;
+        const key = normalizePubKey(trimmed.slice(spaceIdx + 1));
+        if (key) keys.add(key);
+      }
+      // Sorted so the advertised set is deterministic, the way readHostKeyDir's is.
+      return [...keys].sort();
+    } catch (err) {
+      log('debug', 'sshadmin: ssh-keyscan against local sshd failed', { error: String(err) });
+      return [];
+    }
   }
 
   // A persistent ed25519 host key the node owns, kept under stateDir() so it survives restarts and

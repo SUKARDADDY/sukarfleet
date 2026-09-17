@@ -1175,7 +1175,21 @@ describe('ssh identity and peer trust files', () => {
     expect(first.sshPublicKey.split(' ').length).toBe(2);
   });
 
-  test('localHostKeys mints a node host key on Windows when the host-key dir is empty', async () => {
+  // A Windows node cannot read %ProgramData%\ssh, so it asks its own sshd for its host keys.
+  // Whether the machine running these tests has an sshd is not this suite's business, so the scan
+  // is always stubbed; everything else (ssh-keygen, when minting) goes to the real runner.
+  function runnerWith(scanStdout: string | null, counter?: { calls: number }): typeof run {
+    return (async (argv: string[], opts?: RunOptions): Promise<RunResult> => {
+      if (argv[0] === 'ssh-keyscan') {
+        if (counter) counter.calls++;
+        if (scanStdout === null) return { code: 1, stdout: '', stderr: 'connect refused' };
+        return { code: 0, stdout: scanStdout, stderr: '' };
+      }
+      return run(argv, opts);
+    }) as typeof run;
+  }
+
+  test('localHostKeys mints a node host key on Windows when there is no sshd to ask', async () => {
     const cfg = cfgFor('beta');
     const admin = new SshAdmin({
       cfg,
@@ -1183,7 +1197,9 @@ describe('ssh identity and peer trust files', () => {
       peerView: () => null,
       now,
       platform: 'windows',
-      // No sshHostKeyDir: a Windows node with no system host keys mints its own.
+      runner: runnerWith(null),
+      // No sshHostKeyDir, and nothing listening: a Windows node with no readable and no reachable
+      // host key mints its own, which is the case minting exists for.
     });
     const bundle = await admin.localBundle();
     // The exact condition pairing.ts sanitizeBundle enforces: a pairable bundle carries >=1 host key.
@@ -1192,6 +1208,95 @@ describe('ssh identity and peer trust files', () => {
     // Stable identity: a second assembly reuses the minted key rather than rolling a new one.
     const again = await admin.localBundle();
     expect(again.sshHostKeys).toEqual(bundle.sshHostKeys);
+  });
+
+  test('a Windows node advertises the key its own sshd serves, not a minted one', async () => {
+    // The defect this replaces: the node minted a host key and advertised that, so pairing pinned
+    // an identity sshd never presents and every admin-lane approach failed hostkey-mismatch
+    // forever. Confirmed on a live Windows node -- the pin held the minted key, sshd served a
+    // different one, and the lane had never completed a single run.
+    const cfg = cfgFor('beta');
+    const scan = [
+      '# 127.0.0.1:22 SSH-2.0-OpenSSH_for_Windows_8.1',
+      '127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOgOILD7RqIY06B6wdhcl6gEXAMPLEKEYBYTESAAA',
+      '127.0.0.1 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDaqdotd6Xbr0owUrLQoYC2EXAMPLERSAKEYBYTES',
+      '',
+    ].join('\n');
+    const admin = new SshAdmin({
+      cfg,
+      auditAppend: async () => ({}) as AuditEntry,
+      peerView: () => null,
+      now,
+      platform: 'windows',
+      runner: runnerWith(scan),
+    });
+
+    const bundle = await admin.localBundle();
+    expect(bundle.sshHostKeys).toHaveLength(2);
+    // The leading host field is dropped: what pairing carries is `<type> <base64>`, the same shape
+    // a .pub file normalises to. The comment line is ignored.
+    for (const k of bundle.sshHostKeys) expect(k.split(' ')).toHaveLength(2);
+    expect(bundle.sshHostKeys.some((k) => k.startsWith('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOgOILD7'))).toBe(true);
+    expect(bundle.sshHostKeys.some((k) => k.startsWith('ssh-rsa '))).toBe(true);
+    // And nothing minted: a machine whose sshd answered has no use for an invented identity.
+    expect(bundle.sshHostKeys.some((k) => k.includes('sukarfleet-host'))).toBe(false);
+  });
+
+  test('the scan runs once, not per call — trust() is on the console polling path', async () => {
+    const cfg = cfgFor('beta');
+    const counter = { calls: 0 };
+    const scan = '127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOgOILD7RqIY06B6wdhcl6gEXAMPLEKEYBYTESAAA\n';
+    const admin = new SshAdmin({
+      cfg,
+      auditAppend: async () => ({}) as AuditEntry,
+      peerView: () => null,
+      now,
+      platform: 'windows',
+      runner: runnerWith(scan, counter),
+    });
+    const first = await admin.localBundle();
+    const second = await admin.localBundle();
+    const third = await admin.trust();
+    expect(counter.calls).toBe(1);
+    expect(second.sshHostKeys).toEqual(first.sshHostKeys);
+    expect(third.hostKeys).toEqual(first.sshHostKeys);
+  });
+
+  test('an sshd that answers with nothing usable falls back to minting', async () => {
+    // Exit 0 with only noise on stdout: no key was learned, so the bundle must still carry one or
+    // pairing.ts sanitizeBundle refuses it.
+    const cfg = cfgFor('beta');
+    const admin = new SshAdmin({
+      cfg,
+      auditAppend: async () => ({}) as AuditEntry,
+      peerView: () => null,
+      now,
+      platform: 'windows',
+      runner: runnerWith('# 127.0.0.1:22 SSH-2.0-OpenSSH\nnot-a-key\n'),
+    });
+    const bundle = await admin.localBundle();
+    expect(bundle.sshHostKeys).toHaveLength(1);
+    expect(bundle.sshHostKeys[0]!.startsWith('ssh-ed25519 ')).toBe(true);
+  });
+
+  test('POSIX still reads /etc/ssh and never scans', async () => {
+    const cfg = cfgFor('beta');
+    const hkdir = join(dir, 'posixssh');
+    await mkdir(hkdir, { recursive: true });
+    const real = await realKey('posixssh/ssh_host_ed25519_key');
+    const counter = { calls: 0 };
+    const admin = new SshAdmin({
+      cfg,
+      auditAppend: async () => ({}) as AuditEntry,
+      peerView: () => null,
+      now,
+      platform: 'linux',
+      sshHostKeyDir: hkdir,
+      runner: runnerWith('127.0.0.1 ssh-ed25519 AAAAWRONGKEY', counter),
+    });
+    const bundle = await admin.localBundle();
+    expect(counter.calls).toBe(0);
+    expect(bundle.sshHostKeys).toContain(real.pub.split(' ').slice(0, 2).join(' '));
   });
 
   test('localHostKeys prefers real host keys present in the dir over minting', async () => {
