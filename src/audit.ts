@@ -199,9 +199,10 @@ function isAuditEntryShape(v: unknown): v is AuditEntry {
   );
 }
 
-function parseJsonlLines(raw: string): { entries: AuditEntry[]; malformed: number } {
+function parseJsonlLines(raw: string): { entries: AuditEntry[]; malformed: number; malformedBytes: number } {
   const entries: AuditEntry[] = [];
   let malformed = 0;
+  let malformedBytes = 0;
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
     if (trimmed.length === 0) continue;
@@ -211,19 +212,39 @@ function parseJsonlLines(raw: string): { entries: AuditEntry[]; malformed: numbe
         entries.push(value);
       } else {
         malformed++;
+        malformedBytes += line.length;
       }
     } catch {
       malformed++;
+      malformedBytes += line.length;
     }
   }
-  return { entries, malformed };
+  return { entries, malformed, malformedBytes };
 }
 
-async function readJsonlFile(path: string): Promise<{ raw: string; entries: AuditEntry[]; malformed: number }> {
+// What one read of a log file found that was NOT an entry. Bytes as well as lines, because the
+// shape of real damage is one enormous unreadable "line": a lost page cache zero-fills a region
+// that contained thousands of entries, and since NUL is not a newline the whole region parses as a
+// single malformed line. "1 bad line" and "296366 bad bytes" describe the same event, and only the
+// second one tells you the log is gone.
+export interface LogDamage {
+  malformedLines: number;
+  malformedBytes: number;
+  totalBytes: number;
+}
+
+async function readJsonlFile(
+  path: string,
+): Promise<{ raw: string; entries: AuditEntry[]; malformed: number; damage: LogDamage }> {
   const file = Bun.file(path);
   const raw = (await file.exists()) ? await file.text() : '';
-  const { entries, malformed } = parseJsonlLines(raw);
-  return { raw, entries, malformed };
+  const { entries, malformed, malformedBytes } = parseJsonlLines(raw);
+  return {
+    raw,
+    entries,
+    malformed,
+    damage: { malformedLines: malformed, malformedBytes, totalBytes: raw.length },
+  };
 }
 
 // Appends one already-serialized JSONL line to `path`, creating it (and parent dirs, via
@@ -578,15 +599,32 @@ export async function regenerateUnionLog(path: string): Promise<RegenerateResult
 // no-op, so no separate "flushed up to seq N" cursor is needed. Call this before syncer.ts's
 // autoCommit step so the union file's update rides the same commit as everything else that
 // cycle (wiring left to node.ts, which owns the sync-loop/postMerge argv).
-export async function flushLocalToUnion(unionPath: string): Promise<RegenerateResult> {
+export interface FlushResult extends RegenerateResult {
+  // What the LOCAL log looked like on the way past. Reported, never acted on: this function's job
+  // is to copy entries into the union file, and a local log that is partly unreadable still has
+  // every readable entry copied. The caller decides what to say about the rest.
+  localLog: LogDamage;
+}
+
+export async function flushLocalToUnion(unionPath: string): Promise<FlushResult> {
   const local = await readJsonlFile(localLogPath());
+  if (local.damage.malformedLines > 0) {
+    // Loud, every flush, and never repaired here. Before this line the count was computed and
+    // thrown away on this path (only regenerateUnionLog logged its own), so a local log could lose
+    // most of its bytes to an unclean shutdown and the daemon would say nothing at all, on that
+    // read or any read after it.
+    log('error', 'audit: local log contains unreadable bytes -- entries may have been lost', {
+      path: localLogPath(),
+      ...local.damage,
+    });
+  }
   if (local.entries.length > 0) {
     const lines = local.entries.map((e) => canonicalJson(e)).join('\n');
     const existing = await Bun.file(unionPath).exists() ? await Bun.file(unionPath).text() : '';
     const sep = existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
     await atomicWrite(unionPath, existing + sep + lines + '\n');
   }
-  return regenerateUnionLog(unionPath);
+  return { ...(await regenerateUnionLog(unionPath)), localLog: local.damage };
 }
 
 export type CrossCheckFlagKind =
