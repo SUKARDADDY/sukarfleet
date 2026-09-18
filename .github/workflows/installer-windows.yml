@@ -637,20 +637,48 @@ jobs:
       # refusal Install-MachineNode.ps1 takes before it touches anything, and
       # Setup ignores the exit code of a [Run] program -- so for as long as the
       # scripts were launched from [Run], this exact command line installed
-      # nothing, said nothing, and exited 0. What is asserted here is the
-      # sentence and the number: a non-zero Setup exit code, and the script's own
-      # refusal in its log.
+      # nothing, said nothing, and exited 0. Launching them from a BeforeInstall
+      # hook bought the box and the log line but not the number: the runner
+      # showed the exception in the log and Setup exiting 0 all the same.
+      #
+      # So the refusal is taken in PrepareToInstall now, before the first file is
+      # copied, and what is asserted here is the number, the sentence and the
+      # absence: exit code 7, the reason in Setup's own log, and a machine with
+      # no service, no {app}, no uninstall entry and no node directory.
       #
       # /MACHINE is passed for the same reason as the two steps above: a default
       # that follows the runner image makes a smoke that reports something
       # different every month.
-      - name: smoke - a refused machine-wide install exits non-zero
+      - name: smoke - a refused machine-wide install exits 7 and installs nothing
         shell: pwsh
         run: |
           $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
           $log = Join-Path $env:RUNNER_TEMP 'setup-refused.log'
           $scriptLog = Join-Path $env:ProgramData 'sukarfleet\install-machine.log'
+          $nodeDir = Join-Path $env:ProgramData 'sukarfleet\node'
+          $appDir = 'C:\Program Files\sukarfleet\app'
+
+          # The steps above installed and uninstalled a machine-wide node, and a
+          # machine-wide uninstall KEEPS the node directory on purpose. Both of
+          # the absences asserted below are therefore about this run only, so the
+          # leftovers come off first. The uninstaller stub Windows was going to
+          # delete at the next boot is the other one.
           Remove-Item -LiteralPath $scriptLog -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $nodeDir -Recurse -Force -ErrorAction SilentlyContinue
+          for ($i = 0; $i -lt 15; $i++) {
+            if (-not (Test-Path -LiteralPath $appDir)) { break }
+            Remove-Item -LiteralPath $appDir -Recurse -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+          }
+          foreach ($stale in @($nodeDir, $appDir)) {
+            if (Test-Path -LiteralPath $stale) {
+              Write-Host "$stale could not be cleared before the refused install:"
+              Get-ChildItem -LiteralPath $stale -Force | ForEach-Object { Write-Host "  $($_.Name)" }
+              Write-Host 'this step cannot tell what the refused install created from what was already there'
+              exit 1
+            }
+          }
+
           $p = Start-Process -FilePath $exe -PassThru -ArgumentList @(
             '/VERYSILENT', '/SUPPRESSMSGBOXES', '/ALLUSERS',
             '/MACHINE=ci-runner', '/SKIPTRAY', '/NOOPEN',
@@ -670,79 +698,71 @@ jobs:
           }
           $p.WaitForExit()
           Write-Host "installer exit code: $($p.ExitCode)"
+          $setupLog = ''
           if (Test-Path -LiteralPath $log) {
+            $setupLog = Get-Content -Raw -LiteralPath $log
             Write-Host "--- $log ---"
             Get-Content -LiteralPath $log | ForEach-Object { Write-Host "  $_" }
             Write-Host '--- end of setup log ---'
-          }
-          $refusal = ''
-          if (Test-Path -LiteralPath $scriptLog) {
-            $refusal = Get-Content -Raw -LiteralPath $scriptLog
-            Write-Host "--- $scriptLog ---"
-            Write-Host $refusal
-            Write-Host "--- end of $scriptLog ---"
           } else {
-            Write-Host "no script log at $scriptLog"
+            Write-Host "no setup log at $log"
           }
+          if (Test-Path -LiteralPath $scriptLog) {
+            Write-Host "--- $scriptLog ---"
+            Get-Content -LiteralPath $scriptLog | ForEach-Object { Write-Host "  $_" }
+            Write-Host "--- end of $scriptLog ---"
+          }
+
           $failures = @()
-          if ($p.ExitCode -eq 0) {
-            $failures += 'Setup exited 0 for an install its own script refused'
+          # 7 is "The Preparing to Install stage determined that Setup cannot
+          # proceed" (Inno help, "Setup Exit Codes"), which is the only exit code
+          # that means the install was refused rather than merely unhappy.
+          if ($p.ExitCode -ne 7) {
+            $failures += "Setup exited $($p.ExitCode) for an install its own preflight refused; 7 is the refusal"
           }
-          if ($refusal -notmatch 'no -MeshIp') {
-            $failures += "the refusal sentence is not in $scriptLog"
+          if ($setupLog -notmatch 'This machine-wide install would be refused:') {
+            $failures += "the preflight's refusal is not in $log"
+          }
+          if ($setupLog -notmatch 'no -MeshIp') {
+            $failures += "the reason the preflight gave is not in $log"
           }
           if (Get-Service -Name sukarfleet-node -ErrorAction SilentlyContinue) {
             $failures += 'a refused install registered the sukarfleet-node service'
           }
-          # Whatever Setup did put on disk before the script refused comes off
-          # again, so the signing step and any later run start from a clean
-          # machine rather than from half an install.
+          # The preflight reads; it does not create. A node directory here means
+          # it wrote one, which is the whole thing this step exists to catch.
+          if (Test-Path -LiteralPath $nodeDir) {
+            $failures += "a refused install created $nodeDir"
+            Get-ChildItem -LiteralPath $nodeDir -Force -Recurse -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "  $($_.FullName)" }
+          }
+          if (Test-Path -LiteralPath $appDir) {
+            $failures += "a refused install created $appDir"
+            Get-ChildItem -LiteralPath $appDir -Force | ForEach-Object { Write-Host "  $($_.Name)" }
+          }
+          # No cleanup uninstall here, and that is the assertion: a refusal taken
+          # before the Preparing to Install stage finishes leaves nothing to
+          # uninstall. An entry in Apps and features would mean Setup got past
+          # the refusal and copied files.
           $roots = @(
             'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
           )
-          $entry = $null
           foreach ($root in $roots) {
             if (-not (Test-Path -LiteralPath $root)) { continue }
             foreach ($key in Get-ChildItem -LiteralPath $root) {
               $props = Get-ItemProperty -LiteralPath $key.PSPath
               if ($props.DisplayName -and $props.DisplayName -match 'sukarfleet') {
-                $entry = $props
-                break
+                $failures += "a refused install left an uninstall entry: $($key.PSPath)"
               }
             }
-            if ($entry) { break }
-          }
-          if ($entry) {
-            $command = $entry.UninstallString
-            if ($command -match '^"([^"]+)"\s*(.*)$') {
-              $uninstaller = $Matches[1]
-              $rest = $Matches[2]
-            } else {
-              $uninstaller = $command
-              $rest = ''
-            }
-            $argv = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
-            if ($rest) { $argv += ($rest -split '\s+' | Where-Object { $_ }) }
-            Write-Host "cleaning up: $uninstaller $($argv -join ' ')"
-            $u = Start-Process -FilePath $uninstaller -PassThru -ArgumentList $argv
-            $u.WaitForExit()
-            for ($i = 0; $i -lt 150; $i++) {
-              $running = @(Get-Process -ErrorAction SilentlyContinue |
-                Where-Object { $_.ProcessName -like 'unins*' -or $_.ProcessName -like '_iu*' })
-              if ($running.Count -eq 0) { break }
-              Start-Sleep -Seconds 2
-            }
-            Write-Host "cleaned up the refused install (uninstaller exit $($u.ExitCode))"
-          } else {
-            Write-Host 'the refused install left no uninstall entry to clean up'
           }
           if ($failures.Count -gt 0) {
             foreach ($f in $failures) { Write-Host $f }
             exit 1
           }
-          Write-Host "a refused machine-wide install exits $($p.ExitCode) and says why in its log"
+          Write-Host 'a refused machine-wide install exits 7, says why in the setup log, and installs nothing'
 
       # A no-op until the secret exists, and that is the whole point of it being
       # here: the step is written, reviewed and skipped rather than invented in a

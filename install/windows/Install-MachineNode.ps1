@@ -23,6 +23,12 @@
   This script never edits Install-Sukarfleet.ps1. It calls it, once, for the mesh transport, so
   there is one implementation of EasyTier on Windows and not two.
 
+  Run with -Preflight it installs nothing. It takes every refusal it can take before the first
+  write and exits 1 with that refusal as its last line, or 0 with "preflight ok".
+  install\windows\sukarfleet.iss runs it that way from PrepareToInstall, before a single file is
+  copied, so a machine that would be refused ends Setup with exit code 7 and an untouched disk
+  rather than a success code and half an install.
+
 .NOTES
   Windows PowerShell 5.1 only: no ternary, no null-coalescing, no PS7-only syntax. The smoke
   target is a Windows 10 Pro machine with 5.1 and no pwsh at all.
@@ -73,7 +79,19 @@ param(
   # --- behaviour ---
   [switch] $SkipTray,
   [string] $TrayReleaseBase = '',
-  [switch] $NoOpen
+  [switch] $NoOpen,
+
+  # --- preflight ---
+  # Answer "would this machine be refused?" and change nothing. install\windows\sukarfleet.iss
+  # runs this from PrepareToInstall, before the first file is copied, so a refusal ends Setup
+  # with its own exit code 7 rather than leaving a half-written machine behind a success code.
+  # Nothing in this mode creates the node directory, writes an ACL, mints a token, edits a git
+  # config or touches the profile it is asked about.
+  [switch] $Preflight,
+  # Preflight only, and only for the "is there a secret at all" question. The installer writes
+  # its secret file at the start of the install, minutes after the preflight runs, so at
+  # preflight time the file the real run will be handed does not exist yet.
+  [switch] $SecretWillBeStaged
 )
 
 $ErrorActionPreference = 'Stop'
@@ -314,39 +332,315 @@ function Get-ServiceAccountSid {
 }
 
 # ---------------------------------------------------------------------------
-# Step 1-2: refusals
+# Adoption: the half that only reads
+#
+# Everything in this section answers questions about the per-user node being adopted and writes
+# nothing outside the staging directory it is handed. It sits above the refusals below because
+# the refusals call it: a -Preflight pass takes the entire adoption plan without touching this
+# machine, and the real run takes the same plan, from the same function, immediately before the
+# step that stops the old node.
 # ---------------------------------------------------------------------------
 
-Write-Step "sukarfleet machine-wide install on $MachineName"
-
-if (-not (Test-Elevated)) {
-  Write-Die 'this installs a Windows service, writes under C:\ProgramData and C:\Program Files, and edits the system git config. It needs administrator rights. Nothing was installed.'
-}
-
-$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-$doAdopt = [bool] $Adopt
-if ($existingTask -and -not $doAdopt) {
-  Write-Die "this machine already runs a per-user sukarfleet node: the scheduled task '$TaskName' is registered. One identity per PC, or the fleet sees this machine twice and the two halves fight over the same repos. Re-run with -Adopt (the installer's ""adopt the existing node"" checkbox) to move that node's identity, config, state and repos into the machine-wide install, or remove the task first if you want a fresh identity."
-}
-if ($doAdopt -and -not $existingTask) {
-  Write-Warn "-Adopt was passed, but there is no scheduled task named '$TaskName' on this machine. There is nothing to adopt, so this carries on as a fresh machine-wide install."
-  $doAdopt = $false
-}
-
-# A path that was passed is checked here whatever -SkipMesh says. The file is only READ at the
-# mesh stage, minutes later, and a typo that is only noticed there is a typo noticed after the
-# service account, the shared root and the system git config have all been changed.
-if ($MeshSecretFile -and -not (Test-Path -LiteralPath $MeshSecretFile)) {
-  Write-Die "no such file: $MeshSecretFile. That is the file that should hold the network secret, one line. Fix the path, or pass -SkipMesh if the mesh transport is already installed here. Nothing was installed."
-}
-if (-not $SkipMesh) {
-  if (-not $MeshIp) {
-    Write-Die 'no -MeshIp. The mesh stage would sit at a prompt nobody is watching. Pass this machine''s mesh address, or -SkipMesh if the mesh transport is already installed here.'
+function Resolve-AdoptProfile {
+  param($Task)
+  if ($UserProfileDir) { return $UserProfileDir.TrimEnd('\') }
+  $uid = ''
+  if ($Task) { $uid = [string] (Get-Prop -Object $Task.Principal -Name 'UserId' -Default '') }
+  if (-not $uid) {
+    Write-Die "the '$TaskName' task does not say which account it runs as, so there is no profile to adopt from. Re-run with -UserProfileDir pointing at that account's profile folder."
   }
-  if (-not $MeshSecretFile) {
-    Write-Die 'no -MeshSecretFile. The mesh stage would sit at a secret prompt nobody is watching. Pass a file holding the network secret, or -SkipMesh if the mesh transport is already installed here.'
+  $sid = ''
+  if ($uid -match '^S-1-') { $sid = $uid }
+  else {
+    try { $sid = (New-Object Security.Principal.NTAccount($uid)).Translate([Security.Principal.SecurityIdentifier]).Value }
+    catch { Write-Die "could not resolve '$uid', the account behind the '$TaskName' task, into a SID: $($_.Exception.Message). Re-run with -UserProfileDir." }
+  }
+  $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
+  $img = [string] (Get-Prop -Object (Get-ItemProperty -LiteralPath $profileKey -ErrorAction SilentlyContinue) -Name 'ProfileImagePath' -Default '')
+  if (-not $img) {
+    Write-Die "Windows has no profile folder recorded for $uid ($sid), so there is nothing to adopt. Re-run with -UserProfileDir."
+  }
+  return ([Environment]::ExpandEnvironmentVariables($img)).TrimEnd('\')
+}
+
+# Every read of the adopted profile goes through this function or Copy-FileBackup, and both run
+# robocopy in backup mode (/B). That is not a precaution: a per-user config directory is ACL'd to
+# its owner's SID alone, so an administrator reading it plainly is refused, and robocopy without
+# /B walks away having copied a subdirectory and nothing else. /B turns on the backup privilege
+# an administrator already holds, which is exactly the case it exists for.
+#
+# There is no Test-Path guard for the same reason: Test-Path answers "no" to a refused read, so a
+# directory that is there would be reported as one that is not. robocopy's exit code answers
+# instead -- 16 is "no such source directory", which is a normal profile without that directory,
+# and 8 to 15 is a real failure.
+#
+# /COPY:DAT leaves the S flag out on purpose: the copy takes the destination's ACL by
+# inheritance rather than carrying the profile owner's over.
+function Copy-Tree {
+  param([Parameter(Mandatory)] [string] $From, [Parameter(Mandatory)] [string] $To, [string[]] $ExcludeFiles = @())
+  # Not $args: that is an automatic variable and writing to it is a trap waiting for the next
+  # person to add a parameter to this function.
+  $rcArgs = @($From, $To, '/E', '/B', '/COPY:DAT', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+  if ($ExcludeFiles.Count -gt 0) { $rcArgs += @('/XF') + $ExcludeFiles }
+  $r = Invoke-Native -Exe 'robocopy.exe' -Arguments $rcArgs
+  if ($r.ExitCode -ge 16) { return $false }
+  if ($r.ExitCode -ge 8) {
+    Write-Host ($r.Output | Out-String)
+    Write-Die "robocopy failed (exit $($r.ExitCode)) copying $From to $To."
+  }
+  return $true
+}
+
+# One file out of a directory this administrator may not be able to read plainly. Same backup
+# mode and the same reasoning as Copy-Tree. robocopy cannot rename, so the file keeps its name
+# and the caller chooses the directory it lands in. The answer is a Test-Path against the
+# DESTINATION, which is a question that can be asked honestly, because the destination is ours.
+function Copy-FileBackup {
+  param([Parameter(Mandatory)] [string] $From, [Parameter(Mandatory)] [string] $ToDir)
+  $dir = Split-Path -Parent $From
+  $leaf = Split-Path -Leaf $From
+  if (-not (Test-Path -LiteralPath $ToDir)) { [void] (New-Item -ItemType Directory -Force -Path $ToDir) }
+  $r = Invoke-Native -Exe 'robocopy.exe' -Arguments @(
+    $dir, $ToDir, $leaf, '/B', '/COPY:DAT', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+  if ($r.ExitCode -ge 8 -and $r.ExitCode -lt 16) {
+    Write-Host ($r.Output | Out-String)
+    Write-Die "robocopy failed (exit $($r.ExitCode)) copying $From into $ToDir."
+  }
+  return (Test-Path -LiteralPath (Join-Path $ToDir $leaf))
+}
+
+# What adoption does with one repo, and the sentence that says why.
+#
+#   Move   the repo sits directly under the profile root, or under a subdirectory of it that is
+#          not a dot-directory. A service account has no profile to reach into, so the repo goes
+#          to the shared root and a junction stays where it was.
+#   Keep   any part of the path under the profile is a dot-directory, or the repo is not under
+#          that profile at all. A dot-directory belongs to the tool that made it -- an agent's
+#          memory store, a dotfile source tree -- and that tool looks for it there and nowhere
+#          else, so moving it would break the tool to tidy a path. It stays, and is made
+#          reachable where it is instead.
+#
+# Grant is false only for a repo already under the shared root: steps 5 and 6 gave that tree the
+# service account's ACE and its safe.directory entry already.
+function Get-RepoAdoptionPlan {
+  param([Parameter(Mandatory)] [string] $RepoPath, [Parameter(Mandatory)] [string] $ProfileDir)
+  $full = $RepoPath.TrimEnd('\')
+  $root = $ProfileDir.TrimEnd('\')
+  $shared = $SharedRoot.TrimEnd('\')
+  $cmp = [StringComparison]::OrdinalIgnoreCase
+  if ($full.Equals($shared, $cmp) -or $full.StartsWith($shared + '\', $cmp)) {
+    return @{ Move = $false; Grant = $false; Why = 'it is already under the shared root' }
+  }
+  if (-not $full.StartsWith($root + '\', $cmp)) {
+    return @{ Move = $false; Grant = $true; Why = 'it is outside the profile being adopted' }
+  }
+  foreach ($seg in @($full.Substring($root.Length + 1) -split '\\')) {
+    if ($seg.StartsWith('.')) {
+      return @{ Move = $false; Grant = $true; Why = "it sits under '$seg', which belongs to one account rather than to this machine" }
+    }
+  }
+  return @{ Move = $true; Grant = $false; Why = 'a service has no profile to reach into' }
+}
+
+# The whole question "can this per-user node be adopted?", asked and answered without changing
+# anything. The caller hands in the directory the config is staged into: the real run stages it
+# under the node directory, and a -Preflight pass stages it under TEMP and deletes it again,
+# because at preflight time the node directory must not come into existence at all.
+function Get-AdoptionPlan {
+  param([Parameter(Mandatory)] $Task, [Parameter(Mandatory)] [string] $StageDir)
+
+  $profileDir   = Resolve-AdoptProfile -Task $Task
+  $srcConfigDir = Join-Path $profileDir '.config\sukarfleet'
+  $srcConfig    = Join-Path $srcConfigDir 'config.json'
+
+  # That config directory is ACL'd to its owner and to nobody else, so it is staged in backup
+  # mode and read from the copy. A plain read here comes back as access denied, and a plain
+  # Test-Path comes back as "no such file", which is the same answer a missing profile gives.
+  if (Test-Path -LiteralPath $StageDir) { Remove-Item -LiteralPath $StageDir -Recurse -Force -ErrorAction SilentlyContinue }
+  if (-not (Copy-FileBackup -From $srcConfig -ToDir $StageDir)) {
+    Write-Die "there is no config.json at $srcConfig, so the '$TaskName' task's node cannot be adopted. Remove the task and install fresh, or pass -UserProfileDir for the right profile."
+  }
+
+  $raw = Get-Content -LiteralPath (Join-Path $StageDir 'config.json') -Raw
+  if ([string]::IsNullOrWhiteSpace($raw)) { Write-Die "$srcConfig has no JSON in it." }
+  $cfg = $null
+  try { $cfg = $raw | ConvertFrom-Json }
+  catch { Write-Die "could not read $srcConfig as JSON, so nothing was adopted and nothing was moved." }
+
+  # --- the whole plan, BEFORE anything is stopped or moved -------------------
+  # Every refusal that can be known from the config and the disk is taken here, in one pass, while
+  # the old node is still registered and every repository is still where its owner left it. The
+  # loop that moves things further down executes a plan that has already passed: a refusal raised
+  # halfway through that loop would land after the scheduled task was unregistered and after some
+  # repositories had already been renamed, which is the worst moment on this whole path to stop.
+  $repos = @(Get-Prop -Object $cfg -Name 'repos' -Default @())
+  $repoPlans = @()
+  $claimedDests = @{}
+  foreach ($repo in $repos) {
+    $path = [string] (Get-Prop -Object $repo -Name 'path' -Default '')
+    $name = [string] (Get-Prop -Object $repo -Name 'name' -Default '(unnamed)')
+    if (-not $path) { continue }
+    if (-not (Test-Path -LiteralPath (Join-Path $path '.git'))) {
+      Write-Die "repo '$name' is listed at $path, which is not a git repository. Fix the config or remove the entry, then re-run. Nothing was stopped and nothing was moved."
+    }
+    # -c safe.directory=* for this one read-only command. The repo is owned by the account whose
+    # node is being adopted and this script runs as an administrator, so git's dubious-ownership
+    # check would refuse to answer and the refusal would look like a broken repo. An
+    # administrator reading a tree it is about to move is exactly the case that check is not
+    # about, and nothing is written to the repo here.
+    $status = Invoke-Native -Exe 'git' -Arguments @('-c', 'safe.directory=*', '-C', $path, 'status', '--porcelain')
+    if ($status.ExitCode -ne 0) {
+      Write-Host ($status.Output | Out-String)
+      Write-Die "git could not read the state of '$name' at $path. Nothing was stopped and nothing was moved."
+    }
+    $plan = Get-RepoAdoptionPlan -RepoPath $path -ProfileDir $profileDir
+    $dirty = @($status.Output | ForEach-Object { ([string] $_).Trim() } | Where-Object { $_ })
+    if ($dirty.Count -gt 0) {
+      $show = ($dirty | Select-Object -First 10) -join "`n    "
+      # The refusal covers both outcomes. A repo that stays where it is is not moved, but it is
+      # handed to a daemon that will start syncing it, which is no kinder to uncommitted work.
+      $what = 'this install is about to hand that directory to a daemon that syncs it'
+      if ($plan.Move) { $what = 'this install would move that directory' }
+      Write-Die "repo '$name' at $path has $($dirty.Count) uncommitted change(s), and $what. Commit or discard them first, then re-run. Nothing was stopped and nothing was moved.`n    $show"
+    }
+    $dest = ''
+    if ($plan.Move) {
+      $leaf = Split-Path -Leaf $path.TrimEnd('\')
+      $dest = Join-Path $SharedRoot $leaf
+      if ((Test-Path -LiteralPath $dest) -and @(Get-ChildItem -LiteralPath $dest -Force).Count -gt 0) {
+        Write-Die "'$name' would move to $dest, and there is already something there. Move or remove it, then re-run. Nothing was stopped and nothing was moved."
+      }
+      $key = $dest.ToLowerInvariant()
+      if ($claimedDests.ContainsKey($key)) {
+        Write-Die "'$name' and '$($claimedDests[$key])' would both move to $dest, because they have the same folder name in different places. Rename one of them, or point its config entry somewhere else, then re-run. Nothing was stopped and nothing was moved."
+      }
+      $claimedDests[$key] = $name
+      # A rename needs one volume; the move loop below uses [IO.Directory]::Move and nothing else.
+      $srcRoot = [IO.Path]::GetPathRoot($path)
+      $dstRoot = [IO.Path]::GetPathRoot($dest)
+      if ($srcRoot -ne $dstRoot) {
+        Write-Die "'$name' is on $srcRoot and the shared root is on $dstRoot. Adoption moves a repository by renaming it, which needs one volume. Pick a shared root on $srcRoot, or move the repository yourself and point the config at it, then re-run. Nothing was stopped and nothing was moved."
+      }
+    }
+    $repoPlans += @{ Repo = $repo; Name = $name; Path = $path; Plan = $plan; Dest = $dest }
+  }
+
+  return [pscustomobject]@{
+    ProfileDir = $profileDir
+    ConfigDir  = $srcConfigDir
+    ConfigPath = $srcConfig
+    Raw        = $raw
+    Config     = $cfg
+    RepoPlans  = $repoPlans
   }
 }
+
+# ---------------------------------------------------------------------------
+# Step 1-2: refusals
+#
+# Every refusal that can be taken before the first byte is written, in one function, called by
+# the real run before it writes anything and called by -Preflight instead of installing. Two
+# copies of these checks would be two answers to "would this machine be refused?", and the
+# installer asks that question minutes before it asks for the install itself.
+#
+# The contract is read-only. Nothing here creates the node directory, writes an ACL, mints a
+# token, edits a git config or touches the profile being adopted; the only thing written is a
+# copy of the adopted config.json into $StageDir, which the caller makes and removes.
+#
+# Four refusals are NOT here, and cannot be: -AppDir has to look like a sukarfleet tree, and
+# Install-Sukarfleet.ps1, the pins file, the service xml and Pins.ps1 have to be in it. At
+# preflight time the installer has not copied a single file into {app} yet, so those are asked
+# below, on the real run, where the answer means something.
+# ---------------------------------------------------------------------------
+
+function Test-InstallRefusals {
+  param([Parameter(Mandatory)] [string] $StageDir)
+
+  if (-not (Test-Elevated)) {
+    Write-Die 'this installs a Windows service, writes under C:\ProgramData and C:\Program Files, and edits the system git config. It needs administrator rights. Nothing was installed.'
+  }
+
+  # git is asked for here rather than at step 5, where this used to be. Step 5 runs after the
+  # node directory, its ACLs and the console token are already on disk, so a machine without git
+  # was refused only once it had been half written. The elevated stage needs git, the node shells
+  # out to it for every repo it syncs, and the system config edited in step 5 is written with it.
+  if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Write-Die 'git is not on PATH. Install Git for Windows (winget install --id Git.Git), open a new terminal, then re-run. Nothing was installed.'
+  }
+
+  $arch = ''
+  switch ($env:PROCESSOR_ARCHITECTURE) {
+    'AMD64' { $arch = 'x86_64' }
+    'ARM64' { $arch = 'arm64' }
+    default { Write-Die "unsupported processor architecture '$env:PROCESSOR_ARCHITECTURE'." }
+  }
+
+  $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+  $adopt = [bool] $Adopt
+  if ($task -and -not $adopt) {
+    Write-Die "this machine already runs a per-user sukarfleet node: the scheduled task '$TaskName' is registered. One identity per PC, or the fleet sees this machine twice and the two halves fight over the same repos. Re-run with -Adopt (the installer's ""adopt the existing node"" checkbox) to move that node's identity, config, state and repos into the machine-wide install, or remove the task first if you want a fresh identity."
+  }
+  if ($adopt -and -not $task) {
+    Write-Warn "-Adopt was passed, but there is no scheduled task named '$TaskName' on this machine. There is nothing to adopt, so this carries on as a fresh machine-wide install."
+    $adopt = $false
+  }
+
+  # A path that was passed is checked here whatever -SkipMesh says. The file is only READ at the
+  # mesh stage, minutes later, and a typo that is only noticed there is a typo noticed after the
+  # service account, the shared root and the system git config have all been changed.
+  if ($MeshSecretFile -and -not (Test-Path -LiteralPath $MeshSecretFile)) {
+    Write-Die "no such file: $MeshSecretFile. That is the file that should hold the network secret, one line. Fix the path, or pass -SkipMesh if the mesh transport is already installed here. Nothing was installed."
+  }
+  if (-not $SkipMesh) {
+    if (-not $MeshIp) {
+      Write-Die 'no -MeshIp. The mesh stage would sit at a prompt nobody is watching. Pass this machine''s mesh address, or -SkipMesh if the mesh transport is already installed here.'
+    }
+    # -SecretWillBeStaged is the installer saying "the operator typed a secret; it is not on disk
+    # yet". It answers this one question and no other, and only a preflight ever passes it: a run
+    # that took it for a path would be answering for a file nobody has seen.
+    if ((-not $MeshSecretFile) -and (-not $SecretWillBeStaged)) {
+      Write-Die 'no -MeshSecretFile. The mesh stage would sit at a secret prompt nobody is watching. Pass a file holding the network secret, or -SkipMesh if the mesh transport is already installed here.'
+    }
+  }
+
+  # One spelling, so the fallback in step 13 can tell "already LocalService" from "try
+  # LocalService". sc.exe showsid only reads; the account does not have to exist yet.
+  $account = $ServiceAccount
+  if ($account -match '^(NT AUTHORITY\\)?LocalService$') { $account = 'NT AUTHORITY\LocalService' }
+  $sid = Get-ServiceAccountSid -Account $account
+
+  if ($adopt) { [void] (Get-AdoptionPlan -Task $task -StageDir $StageDir) }
+
+  return @{ Task = $task; Adopt = $adopt; Arch = $arch; ServiceAccount = $account; ServiceSid = $sid }
+}
+
+if (-not $Preflight) { Write-Step "sukarfleet machine-wide install on $MachineName" }
+
+# Where the adoption pre-flight stages its copy of the profile config. Under TEMP rather than
+# under the node directory: at this point in the run that directory does not exist yet, and a
+# -Preflight pass must not be the thing that brings it into being.
+$RefusalStage = Join-Path $env:TEMP ('sukarfleet-preflight-' + [Guid]::NewGuid().ToString('N'))
+$Refusals = $null
+try {
+  $Refusals = Test-InstallRefusals -StageDir $RefusalStage
+} finally {
+  # Runs on the way out of a Write-Die too: `exit` inside a try is still an unwind.
+  if (Test-Path -LiteralPath $RefusalStage) { Remove-Item -LiteralPath $RefusalStage -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+if ($Preflight) {
+  # The only line a passing preflight prints. sukarfleet.iss reads the exit code; a person
+  # reading the log wants a sentence. A refused one has already exited 1 from Write-Die, with
+  # the refusal as its last line.
+  Write-Host 'preflight ok'
+  exit 0
+}
+
+$existingTask   = $Refusals.Task
+$doAdopt        = [bool] $Refusals.Adopt
+$arch           = [string] $Refusals.Arch
+$ServiceAccount = [string] $Refusals.ServiceAccount
+$ServiceSid     = [string] $Refusals.ServiceSid
 
 $AppDir = Resolve-AppDir
 Write-Step "sukarfleet source at $AppDir"
@@ -359,17 +653,6 @@ foreach ($needed in @($InstallSukarfleet, $PinsFile, $XmlTemplate, $PinsLib)) {
   if (-not (Test-Path -LiteralPath $needed)) { Write-Die "$needed is missing from the source tree. Nothing was installed." }
 }
 . $PinsLib
-
-$arch = ''
-switch ($env:PROCESSOR_ARCHITECTURE) {
-  'AMD64' { $arch = 'x86_64' }
-  'ARM64' { $arch = 'arm64' }
-  default { Write-Die "unsupported processor architecture '$env:PROCESSOR_ARCHITECTURE'." }
-}
-
-# One spelling, so the fallback below can tell "already LocalService" from "try LocalService".
-if ($ServiceAccount -match '^(NT AUTHORITY\\)?LocalService$') { $ServiceAccount = 'NT AUTHORITY\LocalService' }
-$ServiceSid = Get-ServiceAccountSid -Account $ServiceAccount
 
 # ---------------------------------------------------------------------------
 # Step 3: the node directory and its ACLs
@@ -460,10 +743,7 @@ Write-Step "wrote the service git config to $ServiceGitConfig (hooks off, autocr
 # The system config is the one every INTERACTIVE account on this machine reads, and without it
 # the second account's `git status` in the shared tree exits 128. Appended, never rewritten:
 # this file is not ours, and something else may already be in it.
-$gitOnPath = Get-Command git -ErrorAction SilentlyContinue
-if (-not $gitOnPath) {
-  Write-Die 'git is not on PATH. Install Git for Windows (winget install --id Git.Git), open a new terminal, then re-run. Nothing further was installed.'
-}
+# git is on PATH: Test-InstallRefusals proved it before any of the above was written.
 
 $systemGitText = ''
 if (Test-Path -LiteralPath $SystemGitConfig) { $systemGitText = Get-Content -LiteralPath $SystemGitConfig -Raw }
@@ -706,74 +986,6 @@ function Set-MachineConfigPaths {
   $Cfg.notifications | Add-Member -NotePropertyName os -NotePropertyValue $false -Force
 }
 
-function Resolve-AdoptProfile {
-  param($Task)
-  if ($UserProfileDir) { return $UserProfileDir.TrimEnd('\') }
-  $uid = ''
-  if ($Task) { $uid = [string] (Get-Prop -Object $Task.Principal -Name 'UserId' -Default '') }
-  if (-not $uid) {
-    Write-Die "the '$TaskName' task does not say which account it runs as, so there is no profile to adopt from. Re-run with -UserProfileDir pointing at that account's profile folder."
-  }
-  $sid = ''
-  if ($uid -match '^S-1-') { $sid = $uid }
-  else {
-    try { $sid = (New-Object Security.Principal.NTAccount($uid)).Translate([Security.Principal.SecurityIdentifier]).Value }
-    catch { Write-Die "could not resolve '$uid', the account behind the '$TaskName' task, into a SID: $($_.Exception.Message). Re-run with -UserProfileDir." }
-  }
-  $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
-  $img = [string] (Get-Prop -Object (Get-ItemProperty -LiteralPath $profileKey -ErrorAction SilentlyContinue) -Name 'ProfileImagePath' -Default '')
-  if (-not $img) {
-    Write-Die "Windows has no profile folder recorded for $uid ($sid), so there is nothing to adopt. Re-run with -UserProfileDir."
-  }
-  return ([Environment]::ExpandEnvironmentVariables($img)).TrimEnd('\')
-}
-
-# Every read of the adopted profile goes through this function or Copy-FileBackup, and both run
-# robocopy in backup mode (/B). That is not a precaution: a per-user config directory is ACL'd to
-# its owner's SID alone, so an administrator reading it plainly is refused, and robocopy without
-# /B walks away having copied a subdirectory and nothing else. /B turns on the backup privilege
-# an administrator already holds, which is exactly the case it exists for.
-#
-# There is no Test-Path guard for the same reason: Test-Path answers "no" to a refused read, so a
-# directory that is there would be reported as one that is not. robocopy's exit code answers
-# instead -- 16 is "no such source directory", which is a normal profile without that directory,
-# and 8 to 15 is a real failure.
-#
-# /COPY:DAT leaves the S flag out on purpose: the copy takes the destination's ACL by
-# inheritance rather than carrying the profile owner's over.
-function Copy-Tree {
-  param([Parameter(Mandatory)] [string] $From, [Parameter(Mandatory)] [string] $To, [string[]] $ExcludeFiles = @())
-  # Not $args: that is an automatic variable and writing to it is a trap waiting for the next
-  # person to add a parameter to this function.
-  $rcArgs = @($From, $To, '/E', '/B', '/COPY:DAT', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
-  if ($ExcludeFiles.Count -gt 0) { $rcArgs += @('/XF') + $ExcludeFiles }
-  $r = Invoke-Native -Exe 'robocopy.exe' -Arguments $rcArgs
-  if ($r.ExitCode -ge 16) { return $false }
-  if ($r.ExitCode -ge 8) {
-    Write-Host ($r.Output | Out-String)
-    Write-Die "robocopy failed (exit $($r.ExitCode)) copying $From to $To."
-  }
-  return $true
-}
-
-# One file out of a directory this administrator may not be able to read plainly. Same backup
-# mode and the same reasoning as Copy-Tree. robocopy cannot rename, so the file keeps its name
-# and the caller chooses the directory it lands in. The answer is a Test-Path against the
-# DESTINATION, which is a question that can be asked honestly, because the destination is ours.
-function Copy-FileBackup {
-  param([Parameter(Mandatory)] [string] $From, [Parameter(Mandatory)] [string] $ToDir)
-  $dir = Split-Path -Parent $From
-  $leaf = Split-Path -Leaf $From
-  if (-not (Test-Path -LiteralPath $ToDir)) { [void] (New-Item -ItemType Directory -Force -Path $ToDir) }
-  $r = Invoke-Native -Exe 'robocopy.exe' -Arguments @(
-    $dir, $ToDir, $leaf, '/B', '/COPY:DAT', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
-  if ($r.ExitCode -ge 8 -and $r.ExitCode -lt 16) {
-    Write-Host ($r.Output | Out-String)
-    Write-Die "robocopy failed (exit $($r.ExitCode)) copying $From into $ToDir."
-  }
-  return (Test-Path -LiteralPath (Join-Path $ToDir $leaf))
-}
-
 # Appends one safe.directory line to a git config unless that exact line is already in it. A
 # repeated [safe] section is legal git config, and rewriting either of these two files is not an
 # option: neither of them is entirely ours.
@@ -789,39 +1001,6 @@ function Add-SafeDirectory {
   if ($text -and -not $text.EndsWith("`n")) { $addition = "`r`n" + $addition }
   Write-Utf8File -Path $ConfigPath -Content ($text + $addition)
   return $true
-}
-
-# What adoption does with one repo, and the sentence that says why.
-#
-#   Move   the repo sits directly under the profile root, or under a subdirectory of it that is
-#          not a dot-directory. A service account has no profile to reach into, so the repo goes
-#          to the shared root and a junction stays where it was.
-#   Keep   any part of the path under the profile is a dot-directory, or the repo is not under
-#          that profile at all. A dot-directory belongs to the tool that made it -- an agent's
-#          memory store, a dotfile source tree -- and that tool looks for it there and nowhere
-#          else, so moving it would break the tool to tidy a path. It stays, and is made
-#          reachable where it is instead.
-#
-# Grant is false only for a repo already under the shared root: steps 5 and 6 gave that tree the
-# service account's ACE and its safe.directory entry already.
-function Get-RepoAdoptionPlan {
-  param([Parameter(Mandatory)] [string] $RepoPath, [Parameter(Mandatory)] [string] $ProfileDir)
-  $full = $RepoPath.TrimEnd('\')
-  $root = $ProfileDir.TrimEnd('\')
-  $shared = $SharedRoot.TrimEnd('\')
-  $cmp = [StringComparison]::OrdinalIgnoreCase
-  if ($full.Equals($shared, $cmp) -or $full.StartsWith($shared + '\', $cmp)) {
-    return @{ Move = $false; Grant = $false; Why = 'it is already under the shared root' }
-  }
-  if (-not $full.StartsWith($root + '\', $cmp)) {
-    return @{ Move = $false; Grant = $true; Why = 'it is outside the profile being adopted' }
-  }
-  foreach ($seg in @($full.Substring($root.Length + 1) -split '\\')) {
-    if ($seg.StartsWith('.')) {
-      return @{ Move = $false; Grant = $true; Why = "it sits under '$seg', which belongs to one account rather than to this machine" }
-    }
-  }
-  return @{ Move = $true; Grant = $false; Why = 'a service has no profile to reach into' }
 }
 
 # Resets the ACLs under a tree that has just been renamed into the shared root, so that what is
@@ -902,84 +1081,20 @@ function Grant-RepoInPlace {
 function Invoke-Adoption {
   param([Parameter(Mandatory)] $Task)
 
-  $profileDir = Resolve-AdoptProfile -Task $Task
-  Write-Step "adopting the per-user node in $profileDir"
-
-  $srcConfigDir = Join-Path $profileDir '.config\sukarfleet'
-  $srcConfig    = Join-Path $srcConfigDir 'config.json'
+  # Taken again here, out of the same function the refusals at the top called, and deliberately
+  # not carried over from that pass: minutes have gone by since, a repository can have been
+  # edited in them, and the answer that matters is the one that is true immediately before the
+  # old node is stopped.
+  $adoptPlan    = Get-AdoptionPlan -Task $Task -StageDir $AdoptStage
+  $profileDir   = [string] $adoptPlan.ProfileDir
+  $srcConfigDir = [string] $adoptPlan.ConfigDir
+  $srcConfig    = [string] $adoptPlan.ConfigPath
+  $raw          = [string] $adoptPlan.Raw
+  $cfg          = $adoptPlan.Config
+  $repoPlans    = @($adoptPlan.RepoPlans)
   $srcState     = Join-Path $profileDir '.local\state\sukarfleet'
   $srcSsh       = Join-Path $profileDir '.ssh'
-  # That config directory is ACL'd to its owner and to nobody else, so it is staged in backup
-  # mode and read from the copy. A plain read here comes back as access denied, and a plain
-  # Test-Path comes back as "no such file", which is the same answer a missing profile gives.
-  if (Test-Path -LiteralPath $AdoptStage) { Remove-Item -LiteralPath $AdoptStage -Recurse -Force -ErrorAction SilentlyContinue }
-  if (-not (Copy-FileBackup -From $srcConfig -ToDir $AdoptStage)) {
-    Write-Die "there is no config.json at $srcConfig, so the '$TaskName' task's node cannot be adopted. Remove the task and install fresh, or pass -UserProfileDir for the right profile."
-  }
-
-  $raw = Get-Content -LiteralPath (Join-Path $AdoptStage 'config.json') -Raw
-  if ([string]::IsNullOrWhiteSpace($raw)) { Write-Die "$srcConfig has no JSON in it." }
-  $cfg = $null
-  try { $cfg = $raw | ConvertFrom-Json }
-  catch { Write-Die "could not read $srcConfig as JSON, so nothing was adopted and nothing was moved." }
-
-  # --- the whole plan, BEFORE anything is stopped or moved -------------------
-  # Every refusal that can be known from the config and the disk is taken here, in one pass, while
-  # the old node is still registered and every repository is still where its owner left it. The
-  # loop that moves things further down executes a plan that has already passed: a refusal raised
-  # halfway through that loop would land after the scheduled task was unregistered and after some
-  # repositories had already been renamed, which is the worst moment on this whole path to stop.
-  $repos = @(Get-Prop -Object $cfg -Name 'repos' -Default @())
-  $repoPlans = @()
-  $claimedDests = @{}
-  foreach ($repo in $repos) {
-    $path = [string] (Get-Prop -Object $repo -Name 'path' -Default '')
-    $name = [string] (Get-Prop -Object $repo -Name 'name' -Default '(unnamed)')
-    if (-not $path) { continue }
-    if (-not (Test-Path -LiteralPath (Join-Path $path '.git'))) {
-      Write-Die "repo '$name' is listed at $path, which is not a git repository. Fix the config or remove the entry, then re-run. Nothing was stopped and nothing was moved."
-    }
-    # -c safe.directory=* for this one read-only command. The repo is owned by the account whose
-    # node is being adopted and this script runs as an administrator, so git's dubious-ownership
-    # check would refuse to answer and the refusal would look like a broken repo. An
-    # administrator reading a tree it is about to move is exactly the case that check is not
-    # about, and nothing is written to the repo here.
-    $status = Invoke-Native -Exe 'git' -Arguments @('-c', 'safe.directory=*', '-C', $path, 'status', '--porcelain')
-    if ($status.ExitCode -ne 0) {
-      Write-Host ($status.Output | Out-String)
-      Write-Die "git could not read the state of '$name' at $path. Nothing was stopped and nothing was moved."
-    }
-    $plan = Get-RepoAdoptionPlan -RepoPath $path -ProfileDir $profileDir
-    $dirty = @($status.Output | ForEach-Object { ([string] $_).Trim() } | Where-Object { $_ })
-    if ($dirty.Count -gt 0) {
-      $show = ($dirty | Select-Object -First 10) -join "`n    "
-      # The refusal covers both outcomes. A repo that stays where it is is not moved, but it is
-      # handed to a daemon that will start syncing it, which is no kinder to uncommitted work.
-      $what = 'this install is about to hand that directory to a daemon that syncs it'
-      if ($plan.Move) { $what = 'this install would move that directory' }
-      Write-Die "repo '$name' at $path has $($dirty.Count) uncommitted change(s), and $what. Commit or discard them first, then re-run. Nothing was stopped and nothing was moved.`n    $show"
-    }
-    $dest = ''
-    if ($plan.Move) {
-      $leaf = Split-Path -Leaf $path.TrimEnd('\')
-      $dest = Join-Path $SharedRoot $leaf
-      if ((Test-Path -LiteralPath $dest) -and @(Get-ChildItem -LiteralPath $dest -Force).Count -gt 0) {
-        Write-Die "'$name' would move to $dest, and there is already something there. Move or remove it, then re-run. Nothing was stopped and nothing was moved."
-      }
-      $key = $dest.ToLowerInvariant()
-      if ($claimedDests.ContainsKey($key)) {
-        Write-Die "'$name' and '$($claimedDests[$key])' would both move to $dest, because they have the same folder name in different places. Rename one of them, or point its config entry somewhere else, then re-run. Nothing was stopped and nothing was moved."
-      }
-      $claimedDests[$key] = $name
-      # A rename needs one volume; the move loop below uses [IO.Directory]::Move and nothing else.
-      $srcRoot = [IO.Path]::GetPathRoot($path)
-      $dstRoot = [IO.Path]::GetPathRoot($dest)
-      if ($srcRoot -ne $dstRoot) {
-        Write-Die "'$name' is on $srcRoot and the shared root is on $dstRoot. Adoption moves a repository by renaming it, which needs one volume. Pick a shared root on $srcRoot, or move the repository yourself and point the config at it, then re-run. Nothing was stopped and nothing was moved."
-      }
-    }
-    $repoPlans += @{ Repo = $repo; Name = $name; Path = $path; Plan = $plan; Dest = $dest }
-  }
+  Write-Step "adopting the per-user node in $profileDir"
 
   # --- the rollback copy, before the task stops existing ---------------------
   try {
