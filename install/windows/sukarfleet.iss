@@ -70,8 +70,11 @@ Source: "{#SrcRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Root: HKLM; Subkey: "Software\sukarfleet"; ValueType: string; ValueName: "SharedRoot"; ValueData: "{code:GetSharedRoot}"; Flags: uninsdeletekey; Check: IsAdminInstallMode
 
 [Run]
-Filename: "powershell.exe"; Parameters: "{code:MachineNodeParams}"; StatusMsg: "Installing the machine-wide node. This takes a few minutes."; Flags: waituntilterminated; Check: IsAdminInstallMode
-Filename: "powershell.exe"; Parameters: "{code:UserNodeParams}"; StatusMsg: "Installing the node for this account. This takes a few minutes."; Flags: waituntilterminated; Check: not IsAdminInstallMode
+; Both scripts run through cmd.exe so that everything they print lands in a log file next to
+; what they installed. A silent install has no window to read, and a wizard window closes with
+; the wizard; the log is what remains when something went wrong.
+Filename: "{cmd}"; Parameters: "{code:MachineNodeCmd}"; StatusMsg: "Installing the machine-wide node. This takes a few minutes."; Flags: waituntilterminated runhidden; Check: IsAdminInstallMode
+Filename: "{cmd}"; Parameters: "{code:UserNodeCmd}"; StatusMsg: "Installing the node for this account. This takes a few minutes."; Flags: waituntilterminated runhidden; Check: not IsAdminInstallMode
 
 [UninstallRun]
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install\windows\Uninstall-MachineNode.ps1"" -AppDir ""{app}"" -SharedRoot ""{reg:HKLM\Software\sukarfleet,SharedRoot|C:\AI_Agent}"""; RunOnceId: "RemoveMachineNode"; Flags: waituntilterminated; Check: IsAdminInstallMode
@@ -379,23 +382,43 @@ begin
   Result := s;
 end;
 
-function UserNodeParams(Param: String): String;
+function UserNodeParams(): String;
 var
   App: String;
 begin
   App := ExpandConstant('{app}');
-  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + App + '\install\windows\Install-Sukarfleet.ps1"' +
+  Result := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + App + '\install\windows\Install-Sukarfleet.ps1"' +
     ' -Source "' + App + '"' + CommonNodeArgs();
 end;
 
-function MachineNodeParams(Param: String): String;
+function MachineNodeParams(): String;
 var
   App: String;
 begin
   App := ExpandConstant('{app}');
-  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + App + '\install\windows\Install-MachineNode.ps1"' +
+  Result := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + App + '\install\windows\Install-MachineNode.ps1"' +
     ' -AppDir "' + App + '"' +
     ' -SharedRoot "' + GetSharedRoot('') + '"' + CommonNodeArgs();
   if AdoptWanted() then Result := Result + ' -Adopt';
   if SecretIsOurs then Result := Result + ' -ShredSecretSource';
+end;
+
+// cmd.exe /C "powershell.exe <args> > <log> 2>&1". The outer quotes are cmd's; -NonInteractive
+// makes a prompt fail instead of wait, which is the only honest answer with no keyboard.
+function UserNodeCmd(Param: String): String;
+var
+  LogPath: String;
+begin
+  LogPath := ExpandConstant('{localappdata}\sukarfleet\install-user.log');
+  ForceDirectories(ExtractFileDir(LogPath));
+  Result := '/C "powershell.exe ' + UserNodeParams() + ' > "' + LogPath + '" 2>&1"';
+end;
+
+function MachineNodeCmd(Param: String): String;
+var
+  LogPath: String;
+begin
+  LogPath := ExpandConstant('{commonappdata}\sukarfleet\install-machine.log');
+  ForceDirectories(ExtractFileDir(LogPath));
+  Result := '/C "powershell.exe ' + MachineNodeParams() + ' > "' + LogPath + '" 2>&1"';
 end;
