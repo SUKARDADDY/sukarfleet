@@ -554,11 +554,16 @@ jobs:
           # same reason the per-user step polls rather than trusting the wait.
           # Wait for every uninstaller process to be gone before asking what
           # happened, or the answers below are read mid-uninstall.
+          # The first process exits before its TEMP copy has even started, so one
+          # empty poll proves nothing: the quiet has to last. Five consecutive
+          # empty polls, two seconds apart, is the bar.
           $settled = $false
+          $quiet = 0
           for ($i = 0; $i -lt 150; $i++) {
             $running = @(Get-Process -ErrorAction SilentlyContinue |
               Where-Object { $_.ProcessName -like 'unins*' -or $_.ProcessName -like '_iu*' })
-            if ($running.Count -eq 0) { $settled = $true; break }
+            if ($running.Count -eq 0) { $quiet++ } else { $quiet = 0 }
+            if ($quiet -ge 5) { $settled = $true; break }
             Start-Sleep -Seconds 2
           }
           if (-not $settled) {
@@ -583,11 +588,25 @@ jobs:
           # uninstall script cleans up in. A script that deleted that tree would
           # take unins000.exe with it while it was running, and the directory
           # left here is how that shows up.
+          # Inno deletes its own unins000.exe last, from the TEMP copy, and when
+          # it cannot it schedules the delete for the next boot; a directory
+          # holding nothing but that stub is a finished uninstall. Anything else
+          # left is not. Give the last delete a minute before deciding.
           $appDir = 'C:\Program Files\sukarfleet\app'
+          for ($i = 0; $i -lt 30; $i++) {
+            if (-not (Test-Path -LiteralPath $appDir)) { break }
+            $left = @(Get-ChildItem -LiteralPath $appDir -Force | Where-Object { $_.Name -notlike 'unins000.*' })
+            if ($left.Count -eq 0) { break }
+            Start-Sleep -Seconds 2
+          }
           if (Test-Path -LiteralPath $appDir) {
-            Write-Host "$appDir survived the uninstall; what is in it:"
-            Get-ChildItem -LiteralPath $appDir -Force | ForEach-Object { Write-Host "  $($_.Name)" }
-            exit 1
+            $left = @(Get-ChildItem -LiteralPath $appDir -Force | Where-Object { $_.Name -notlike 'unins000.*' })
+            if ($left.Count -gt 0) {
+              Write-Host "$appDir survived the uninstall; what is in it:"
+              Get-ChildItem -LiteralPath $appDir -Force | ForEach-Object { Write-Host "  $($_.Name)" }
+              exit 1
+            }
+            Write-Host "$appDir holds only the uninstaller stub, which Windows removes at the next boot"
           }
           $stillListed = $null
           foreach ($root in $roots) {
