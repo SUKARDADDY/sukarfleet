@@ -39,6 +39,9 @@ on:
 jobs:
   windows:
     runs-on: windows-2022
+    # A hung installer is the failure this job exists to find; it must not cost
+    # the six hours a job gets by default.
+    timeout-minutes: 75
     # The secrets context is not available in a step's if, so the token is
     # lifted into the job environment and the sign step tests that instead.
     # No secret configured means an empty string, and the step is skipped.
@@ -134,6 +137,29 @@ jobs:
           }
           Write-Host "built: $exe ($((Get-Item -LiteralPath $exe).Length) bytes)"
 
+      - name: hash the installer
+        shell: pwsh
+        run: |
+          $dist = Join-Path $PWD 'dist'
+          $name = 'sukarfleet-setup-windows-x86_64.exe'
+          $sha = (Get-FileHash -LiteralPath (Join-Path $dist $name) -Algorithm SHA256).Hash.ToLower()
+          "$sha  $name" | Set-Content -Encoding ascii (Join-Path $dist 'SHA256SUMS')
+          # Printed as the pin line install/easytier-pins.txt wants, so cutting a
+          # release is a copy rather than a retyping. The version column is the
+          # release tag without its leading v.
+          Write-Host ''
+          Write-Host 'pin line for install/easytier-pins.txt:'
+          Write-Host "  <version>  x86_64  $sha  $name"
+
+      - uses: actions/upload-artifact@v4
+        id: artifact
+        with:
+          name: sukarfleet-setup-windows-x86_64
+          path: |
+            dist/sukarfleet-setup-windows-x86_64.exe
+            dist/SHA256SUMS
+          if-no-files-found: error
+
       # Per-user scope: what a person double-clicking the EXE gets, driven
       # silently. The mesh and the tray are skipped because neither is what this
       # step is asking about: the mesh needs a secret and a peer, and the tray
@@ -148,11 +174,41 @@ jobs:
         run: |
           $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
           $log = Join-Path $env:RUNNER_TEMP 'setup-currentuser.log'
-          $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @(
+          $scriptLogs = @((Join-Path $env:LOCALAPPDATA 'sukarfleet\install-user.log'))
+          $p = Start-Process -FilePath $exe -PassThru -ArgumentList @(
             '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER',
             '/MACHINE=ci-runner', '/SKIPMESH', '/SKIPTRAY', '/NOOPEN',
             "/LOG=$log"
           )
+          # Poll rather than wait: a silent install that never returns has to
+          # be reported with its logs, not discovered when the job times out.
+          $deadline = (Get-Date).AddMinutes(15)
+          $lastReport = Get-Date
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            if (((Get-Date) - $lastReport).TotalSeconds -ge 60) {
+              $lastReport = Get-Date
+              Write-Host "still installing at $((Get-Date).ToString('HH:mm:ss'))"
+              foreach ($sl in $scriptLogs) {
+                if (Test-Path -LiteralPath $sl) {
+                  Write-Host "  last lines of ${sl}:"
+                  Get-Content -LiteralPath $sl -Tail 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+                }
+              }
+              Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'powershell|cmd|bun|ssh-keygen' } |
+                ForEach-Object { Write-Host "  pid $($_.ProcessId): $($_.CommandLine)" }
+            }
+          }
+          if (-not $p.HasExited) {
+            Write-Host 'the installer did not return within 15 minutes; killing it'
+            Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'powershell|cmd|bun|ssh-keygen' } |
+              ForEach-Object { Write-Host "  pid $($_.ProcessId): $($_.CommandLine)" }
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $hung = $true
+          } else {
+            $hung = $false
+          }
+          $p.WaitForExit()
           Write-Host "installer exit code: $($p.ExitCode)"
           if (Test-Path -LiteralPath $log) {
             Write-Host "--- $log ---"
@@ -161,7 +217,16 @@ jobs:
           } else {
             Write-Host "no setup log at $log"
           }
-          if ($p.ExitCode -ne 0) { exit 1 }
+          foreach ($sl in $scriptLogs) {
+            if (Test-Path -LiteralPath $sl) {
+              Write-Host "--- $sl ---"
+              Get-Content -LiteralPath $sl | ForEach-Object { Write-Host "  $_" }
+              Write-Host "--- end of $sl ---"
+            } else {
+              Write-Host "no script log at $sl"
+            }
+          }
+          if ($hung -or $p.ExitCode -ne 0) { exit 1 }
 
       - name: smoke - the per-user node answers
         shell: pwsh
@@ -265,11 +330,41 @@ jobs:
         run: |
           $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
           $log = Join-Path $env:RUNNER_TEMP 'setup-allusers.log'
-          $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @(
+          $scriptLogs = @((Join-Path $env:ProgramData 'sukarfleet\install-machine.log'), (Join-Path $env:ProgramData 'sukarfleet\node\logs\install.log'))
+          $p = Start-Process -FilePath $exe -PassThru -ArgumentList @(
             '/VERYSILENT', '/SUPPRESSMSGBOXES', '/ALLUSERS',
             '/MACHINE=ci-runner', '/SKIPMESH', '/SKIPTRAY', '/NOOPEN',
             "/LOG=$log"
           )
+          # Poll rather than wait: a silent install that never returns has to
+          # be reported with its logs, not discovered when the job times out.
+          $deadline = (Get-Date).AddMinutes(15)
+          $lastReport = Get-Date
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            if (((Get-Date) - $lastReport).TotalSeconds -ge 60) {
+              $lastReport = Get-Date
+              Write-Host "still installing at $((Get-Date).ToString('HH:mm:ss'))"
+              foreach ($sl in $scriptLogs) {
+                if (Test-Path -LiteralPath $sl) {
+                  Write-Host "  last lines of ${sl}:"
+                  Get-Content -LiteralPath $sl -Tail 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+                }
+              }
+              Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'powershell|cmd|bun|ssh-keygen' } |
+                ForEach-Object { Write-Host "  pid $($_.ProcessId): $($_.CommandLine)" }
+            }
+          }
+          if (-not $p.HasExited) {
+            Write-Host 'the installer did not return within 15 minutes; killing it'
+            Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'powershell|cmd|bun|ssh-keygen' } |
+              ForEach-Object { Write-Host "  pid $($_.ProcessId): $($_.CommandLine)" }
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $hung = $true
+          } else {
+            $hung = $false
+          }
+          $p.WaitForExit()
           Write-Host "installer exit code: $($p.ExitCode)"
           if (Test-Path -LiteralPath $log) {
             Write-Host "--- $log ---"
@@ -278,7 +373,16 @@ jobs:
           } else {
             Write-Host "no setup log at $log"
           }
-          if ($p.ExitCode -ne 0) { exit 1 }
+          foreach ($sl in $scriptLogs) {
+            if (Test-Path -LiteralPath $sl) {
+              Write-Host "--- $sl ---"
+              Get-Content -LiteralPath $sl | ForEach-Object { Write-Host "  $_" }
+              Write-Host "--- end of $sl ---"
+            } else {
+              Write-Host "no script log at $sl"
+            }
+          }
+          if ($hung -or $p.ExitCode -ne 0) { exit 1 }
 
       - name: smoke - the service runs, under its own account
         shell: pwsh
@@ -413,29 +517,6 @@ jobs:
             Write-Host "kept after uninstall: $kept -> $(Test-Path -LiteralPath $kept)"
           }
           Write-Host 'machine-wide install removed: service gone'
-
-      - name: hash the installer
-        shell: pwsh
-        run: |
-          $dist = Join-Path $PWD 'dist'
-          $name = 'sukarfleet-setup-windows-x86_64.exe'
-          $sha = (Get-FileHash -LiteralPath (Join-Path $dist $name) -Algorithm SHA256).Hash.ToLower()
-          "$sha  $name" | Set-Content -Encoding ascii (Join-Path $dist 'SHA256SUMS')
-          # Printed as the pin line install/easytier-pins.txt wants, so cutting a
-          # release is a copy rather than a retyping. The version column is the
-          # release tag without its leading v.
-          Write-Host ''
-          Write-Host 'pin line for install/easytier-pins.txt:'
-          Write-Host "  <version>  x86_64  $sha  $name"
-
-      - uses: actions/upload-artifact@v4
-        id: artifact
-        with:
-          name: sukarfleet-setup-windows-x86_64
-          path: |
-            dist/sukarfleet-setup-windows-x86_64.exe
-            dist/SHA256SUMS
-          if-no-files-found: error
 
       # A no-op until the secret exists, and that is the whole point of it being
       # here: the step is written, reviewed and skipped rather than invented in a
