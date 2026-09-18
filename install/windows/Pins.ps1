@@ -32,6 +32,18 @@
 # tell a reader of install/easytier-pins.txt.
 $script:PinUnfilledTokens = @('TODO-S9', 'SHA256-FILLED-AT-RELEASE')
 
+# SHA256 through .NET rather than Get-FileHash: that cmdlet is a script function in the
+# Microsoft.PowerShell.Utility module, and a Windows PowerShell started from PowerShell 7 can
+# inherit a PSModulePath that hides it ("The term 'Get-FileHash' is not recognized", seen on a
+# hosted runner). A stream and a hasher need no module.
+function Get-Sha256Hex {
+  param([Parameter(Mandatory)] [string] $Path)
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $stream = [IO.File]::OpenRead($Path)
+  try { $bytes = $sha.ComputeHash($stream) } finally { $stream.Dispose(); $sha.Dispose() }
+  return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
 function Write-PinStep { param([string] $Message) Write-Host "[pins] $Message" }
 
 function Get-Pin {
@@ -104,7 +116,7 @@ function Get-PinnedAsset {
   }
 
   $want = $pin.Sha.ToLower()
-  $got = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLower()
+  $got = (Get-Sha256Hex -Path $tmp)
   if ($got -ne $want) {
     Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     throw "SHA256 mismatch for $asset against install\easytier-pins.txt: expected $want, got $got. Report a checksum mismatch rather than retrying it."

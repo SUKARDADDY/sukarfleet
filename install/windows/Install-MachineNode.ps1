@@ -92,6 +92,18 @@ $script:Transcribing = $false
 # after they were granted access: the LocalService fallback in step 13 has to reach them again.
 $script:KeptRepoPaths = @()
 
+# SHA256 through .NET rather than Get-FileHash: that cmdlet is a script function in the
+# Microsoft.PowerShell.Utility module, and a Windows PowerShell started from PowerShell 7 can
+# inherit a PSModulePath that hides it ("The term 'Get-FileHash' is not recognized", seen on a
+# hosted runner). A stream and a hasher need no module.
+function Get-Sha256Hex {
+  param([Parameter(Mandatory)] [string] $Path)
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $stream = [IO.File]::OpenRead($Path)
+  try { $bytes = $sha.ComputeHash($stream) } finally { $stream.Dispose(); $sha.Dispose() }
+  return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
 function Get-Elapsed { return [int] ((Get-Date) - $script:Started).TotalSeconds }
 function Write-Step { param([string] $m) Write-Host ("[machine] {0,-6} {1}" -f "t+$(Get-Elapsed)s", $m) }
 function Write-Note { param([string] $m) Write-Host ("[machine] {0,-6} {1}" -f "t+$(Get-Elapsed)s", $m) -ForegroundColor DarkGray }
@@ -517,7 +529,11 @@ Write-Step "shared root $SharedRoot (owned by Administrators; the service and ev
 # ---------------------------------------------------------------------------
 
 if (-not (Test-Path -LiteralPath $ProgramRoot)) { [void] (New-Item -ItemType Directory -Force -Path $ProgramRoot) }
-[void] (Grant-SidAccess -Path $ProgramRoot -Sid $ServiceSid -Rights 'ReadAndExecute' -Inherit -What "letting the service account read $ProgramRoot")
+# Read and execute, plus write-attributes. Bun opens the file it is asked to run with more than
+# read access, and a principal holding only read-and-execute gets "EPERM reading src\node.ts"
+# from it, seen on a real machine as both a service account and an ordinary user. Write-attributes
+# is the smallest addition that satisfies it; write-data does not, and is not granted.
+[void] (Grant-SidAccess -Path $ProgramRoot -Sid $ServiceSid -Rights 'ReadAndExecute, WriteAttributes' -Inherit -What "letting the service account read $ProgramRoot")
 
 if (Test-Path -LiteralPath $BunExe) {
   Write-Note "Bun already at $BunExe - left untouched (delete that folder to force a re-fetch)"
@@ -554,7 +570,7 @@ try { $winswPin = Get-Pin -PinsFile $PinsFile -AssetPrefix 'WinSW-' -Arch $arch 
 catch { Write-Die "$($_.Exception.Message)" }
 $haveWinsw = $false
 if ($winswPin -and -not $winswPin.Unfilled -and (Test-Path -LiteralPath $WinSwExe)) {
-  $onDisk = (Get-FileHash -LiteralPath $WinSwExe -Algorithm SHA256).Hash.ToLower()
+  $onDisk = (Get-Sha256Hex -Path $WinSwExe)
   if ($onDisk -eq $winswPin.Sha.ToLower()) {
     $haveWinsw = $true
     Write-Note "WinSW already at $WinSwExe and on its pin - left untouched"
@@ -1173,7 +1189,7 @@ if (-not $serviceUp -and $ServiceAccount -ne 'NT AUTHORITY\LocalService') {
   Set-NodeDirAcl -Sid $ServiceSid
   Set-SharedRootAcl -Sid $ServiceSid
   Invoke-Icacls -Arguments @($TokenFile, '/grant', "*${SidUsers}:(R)") -What "letting local accounts read $TokenFile"
-  [void] (Grant-SidAccess -Path $ProgramRoot -Sid $ServiceSid -Rights 'ReadAndExecute' -Inherit -What "letting LocalService read $ProgramRoot")
+  [void] (Grant-SidAccess -Path $ProgramRoot -Sid $ServiceSid -Rights 'ReadAndExecute, WriteAttributes' -Inherit -What "letting LocalService read $ProgramRoot")
   # A repo adoption left in place was granted to the account this install has just stopped using,
   # and nothing under a profile inherits from the two roots above.
   foreach ($kept in $script:KeptRepoPaths) { Grant-RepoInPlace -RepoPath $kept }
