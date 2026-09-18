@@ -151,6 +151,38 @@ function Invoke-Icacls {
   }
 }
 
+# icacls looks every SID up before it writes it, and the virtual account's SID has no name until
+# the service exists, which is after the directories it needs are made. Seen on a real machine:
+# "No mapping between account names and security IDs was done", exit 1332. An access rule built
+# from the raw SID goes into the DACL as bytes, so the grant works before the service is born.
+# Only the DACL section is read and written; the owner is icacls' business elsewhere.
+function Grant-SidAccess {
+  param(
+    [Parameter(Mandatory)] [string] $Path,
+    [Parameter(Mandatory)] [string] $Sid,
+    [Parameter(Mandatory)] [string] $Rights,
+    [switch] $Inherit,
+    [switch] $Soft,
+    [Parameter(Mandatory)] [string] $What
+  )
+  try {
+    $item = Get-Item -LiteralPath $Path -Force
+    $sec = $item.GetAccessControl([Security.AccessControl.AccessControlSections]::Access)
+    $id = New-Object Security.Principal.SecurityIdentifier($Sid)
+    $flags = [Security.AccessControl.InheritanceFlags]::None
+    if ($Inherit) { $flags = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit' }
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+      $id, [Security.AccessControl.FileSystemRights] $Rights, $flags,
+      [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+    [void] $sec.AddAccessRule($rule)
+    $item.SetAccessControl($sec)
+  } catch {
+    if ($Soft) { Write-Warn "could not grant $Rights on $Path to $Sid while $What : $($_.Exception.Message)"; return $false }
+    Write-Die "could not grant $Rights on $Path to $Sid while $What : $($_.Exception.Message). Nothing further was changed."
+  }
+  return $true
+}
+
 # A Windows account name is not an SSH account name; src/pairing.ts validates the LOCAL bundle's
 # sshUser against ^[a-z_][a-z0-9_-]{0,31}$ too. Same fold as Install-Sukarfleet.ps1's.
 function ConvertTo-SshUserName {
@@ -331,8 +363,8 @@ function Set-NodeDirAcl {
   Invoke-Icacls -Arguments @(
     $NodeDir, '/grant:r',
     "*${SidSystem}:(OI)(CI)(F)",
-    "*${SidAdmins}:(OI)(CI)(F)",
-    "*${Sid}:(OI)(CI)(M)") -What "granting access to $NodeDir"
+    "*${SidAdmins}:(OI)(CI)(F)") -What "granting access to $NodeDir"
+  [void] (Grant-SidAccess -Path $NodeDir -Sid $Sid -Rights 'Modify' -Inherit -What "granting the service account access to $NodeDir")
   Invoke-Icacls -Arguments @($NodeDir, '/setowner', "*$SidAdmins") -What "taking ownership of $NodeDir"
 }
 
@@ -471,8 +503,8 @@ function Set-SharedRootAcl {
   Invoke-Icacls -Arguments @(
     $SharedRoot, '/grant:r',
     "*${SidAdmins}:(OI)(CI)(F)",
-    "*${Sid}:(OI)(CI)(M)",
     "*${SidUsers}:(OI)(CI)(M)") -What "granting access to $SharedRoot"
+  [void] (Grant-SidAccess -Path $SharedRoot -Sid $Sid -Rights 'Modify' -Inherit -What "granting the service account access to $SharedRoot")
   Invoke-Icacls -Arguments @($SharedRoot, '/setowner', "*$SidAdmins") -What "taking ownership of $SharedRoot"
 }
 
@@ -758,10 +790,9 @@ function Get-RepoAdoptionPlan {
 # changed: the directory belongs to the profile it sits in, not to this install.
 function Grant-RepoInPlace {
   param([Parameter(Mandatory)] [string] $RepoPath)
-  $r = Invoke-Native -Exe 'icacls.exe' -Arguments @($RepoPath, '/grant', "*${ServiceSid}:(OI)(CI)(M)")
-  if ($r.ExitCode -ne 0) {
-    Write-Host ($r.Output | Out-String)
-    Write-Warn "could not give the service account write access to $RepoPath (icacls exited $($r.ExitCode)). The node can read that repo but not sync it until this is fixed."
+  $granted = Grant-SidAccess -Path $RepoPath -Sid $ServiceSid -Rights 'Modify' -Inherit -Soft -What "giving the service account write access to $RepoPath"
+  if (-not $granted) {
+    Write-Warn "the node can read $RepoPath but not sync it until the service account has write access there."
   }
   $gitPath = $RepoPath.TrimEnd('\') -replace '\\', '/'
   [void] (Add-SafeDirectory -ConfigPath $ServiceGitConfig -GitPath $gitPath)
@@ -1120,7 +1151,7 @@ if (-not $serviceUp -and $ServiceAccount -ne 'NT AUTHORITY\LocalService') {
   Set-NodeDirAcl -Sid $ServiceSid
   Set-SharedRootAcl -Sid $ServiceSid
   Invoke-Icacls -Arguments @($TokenFile, '/grant', "*${SidUsers}:(R)") -What "letting local accounts read $TokenFile"
-  Invoke-Icacls -Arguments @($ProgramRoot, '/grant', "*${ServiceSid}:(OI)(CI)(RX)") -What "letting LocalService read $ProgramRoot"
+  [void] (Grant-SidAccess -Path $ProgramRoot -Sid $ServiceSid -Rights 'ReadAndExecute' -Inherit -What "letting LocalService read $ProgramRoot")
   # A repo adoption left in place was granted to the account this install has just stopped using,
   # and nothing under a profile inherits from the two roots above.
   foreach ($kept in $script:KeptRepoPaths) { Grant-RepoInPlace -RepoPath $kept }
