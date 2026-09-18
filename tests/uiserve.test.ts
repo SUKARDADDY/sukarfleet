@@ -12,11 +12,20 @@
 //   - and that no response body can carry the sudo password, including when the store below it
 //     actively tries to hand one back.
 
-import { beforeEach, describe, expect, test } from 'bun:test';
-import { realpathSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { UiRoutes, UI_ASSETS, elevatedInstallCommand, isLoopbackHostHeader, rejectCrossSiteBrowser } from '../src/uiserve';
+import {
+  CONSOLE_TOKEN_REFUSAL,
+  UiRoutes,
+  UI_ASSETS,
+  elevatedInstallCommand,
+  isLoopbackHostHeader,
+  makeConsoleTokenCheck,
+  rejectCrossSiteBrowser,
+} from '../src/uiserve';
 import { REPO_ROOT, makeInstallHarness, runInstallScript } from './support/install-harness';
 import type { CredentialStatusView, LanePatch, UiRoutesDeps } from '../src/uiserve';
 import { defaultConfig } from '../src/config';
@@ -1169,5 +1178,163 @@ describe('elevatedInstallCommand', () => {
       expect(html).toContain('id="mesh-command"');
       expect(html).not.toContain('~/sukarfleet/install/install-elevated.sh');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The console token gate
+//
+// The gate exists for the machine-wide install, where every account on the PC can reach loopback
+// and the loopback check therefore says nothing about who is calling. Four properties are pinned
+// here, and the first two are the contract other lanes code against:
+//
+//   - the 401 body is byte-exact, because the console and the tray both branch on it,
+//   - POST /pair/hello is never gated, at any configuration, because it is a frozen mesh route,
+//   - /ui assets stay open, because the page they serve is what asks for the token,
+//   - and with no tokenCheck dep the whole surface behaves exactly as it did before.
+// ---------------------------------------------------------------------------
+
+describe('console token gate', () => {
+  const TOKEN = 'Fq2n8s-rL4kWZ0mJ7pX1dT6yB3vHcA9e';
+  const REFUSAL = '{"error":"console-token-required","message":"This node is installed machine-wide. Paste its console token."}';
+
+  const tokenFiles: string[] = [];
+
+  function tokenFile(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'sukarfleet-token-'));
+    tokenFiles.push(dir);
+    const p = join(dir, 'console-token');
+    // Written with the trailing newline the installer leaves, so the trim is exercised rather
+    // than assumed.
+    writeFileSync(p, `${contents}\n`);
+    return p;
+  }
+
+  function gated(contents = TOKEN): ReturnType<typeof makeHarness> {
+    return makeHarness({ tokenCheck: makeConsoleTokenCheck(tokenFile(contents)) });
+  }
+
+  function bearer(path: string, token: string): Request {
+    return req(path, { headers: { authorization: `Bearer ${token}` } });
+  }
+
+  afterEach(() => {
+    while (tokenFiles.length) rmSync(tokenFiles.pop()!, { recursive: true, force: true });
+  });
+
+  test('with no tokenCheck dep the API answers exactly as before', async () => {
+    const res = (await local(req('/api/ui/state')))!;
+    expect(res.status).toBe(200);
+    expect(res.headers.get('www-authenticate')).toBeNull();
+    expect(harness.calls.buildState).toBe(1);
+  });
+
+  test('a call with no Authorization header is refused with the exact contract bytes', async () => {
+    const h = gated();
+    const res = (await h.routes.handle(req('/api/ui/state'), server('127.0.0.1')))!;
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toBe('Bearer realm="sukarfleet"');
+    expect(res.headers.get('content-type')).toBe('application/json');
+    expect(await res.text()).toBe(REFUSAL);
+    // Nothing behind the gate ran.
+    expect(h.calls.buildState).toBe(0);
+  });
+
+  test('the correct token is let through', async () => {
+    const h = gated();
+    const res = (await h.routes.handle(bearer('/api/ui/state', TOKEN), server('127.0.0.1')))!;
+    expect(res.status).toBe(200);
+    expect(h.calls.buildState).toBe(1);
+  });
+
+  test('a wrong token is refused with the same bytes', async () => {
+    const h = gated();
+    const res = (await h.routes.handle(bearer('/api/ui/state', 'not-the-token'), server('127.0.0.1')))!;
+    expect(res.status).toBe(401);
+    expect(await res.text()).toBe(REFUSAL);
+    expect(h.calls.buildState).toBe(0);
+  });
+
+  test('a token that is a prefix of the real one is refused', async () => {
+    const h = gated();
+    const res = (await h.routes.handle(bearer('/api/ui/state', TOKEN.slice(0, -1)), server('127.0.0.1')))!;
+    expect(res.status).toBe(401);
+  });
+
+  test('the scheme name is case-insensitive, the token is not', async () => {
+    const h = gated();
+    const lower = (await h.routes.handle(
+      req('/api/ui/state', { headers: { authorization: `bearer ${TOKEN}` } }),
+      server('127.0.0.1'),
+    ))!;
+    expect(lower.status).toBe(200);
+
+    const cased = (await h.routes.handle(bearer('/api/ui/state', TOKEN.toLowerCase()), server('127.0.0.1')))!;
+    expect(cased.status).toBe(401);
+  });
+
+  test('a missing token file refuses everything rather than opening the gate', async () => {
+    const h = makeHarness({ tokenCheck: makeConsoleTokenCheck(join(tmpdir(), 'sukarfleet-token-absent', 'console-token')) });
+    expect((await h.routes.handle(bearer('/api/ui/state', TOKEN), server('127.0.0.1')))!.status).toBe(401);
+  });
+
+  test('a mutating route is gated too, and the token is checked before the body is read', async () => {
+    const h = gated();
+    const refused = (await h.routes.handle(
+      guiPost('/api/ui/setup/identity', { machine: 'laptop-2' }),
+      server('127.0.0.1'),
+    ))!;
+    expect(refused.status).toBe(401);
+    expect(h.calls.identity).toEqual([]);
+
+    const allowed = (await h.routes.handle(
+      guiPost('/api/ui/setup/identity', { machine: 'laptop-2' }, { authorization: `Bearer ${TOKEN}` }),
+      server('127.0.0.1'),
+    ))!;
+    expect(allowed.status).toBe(200);
+    expect(h.calls.identity).toEqual([{ machine: 'laptop-2' }]);
+  });
+
+  // The frozen mesh route. It is authenticated by the MAC on its own payload, so a token gate in
+  // front of it would make pairing with a machine-wide node impossible by construction.
+  test('POST /pair/hello reaches the pairing handler with the gate configured and no header', async () => {
+    const h = gated();
+    const res = (await h.routes.handle(req('/pair/hello', { method: 'POST', body: '{}' }), server('192.0.2.2')))!;
+    expect(res.status).toBe(200);
+    expect(h.calls.hello).toBe(1);
+  });
+
+  test('the /ui assets are served without a header, because the page is what asks for the token', async () => {
+    const h = gated();
+    for (const path of ['/ui', '/ui/', '/ui/index.html', '/ui/app.js', '/ui/style.css']) {
+      const res = (await h.routes.handle(req(path), server('127.0.0.1')))!;
+      expect(res.status).toBe(200);
+    }
+  });
+
+  // Ordering: the gate cannot be used to probe a machine-wide node from off-box, and it cannot be
+  // used to reach a surface its owner switched off.
+  test('locality and uiEnabled still win over a correct token', async () => {
+    const h = gated();
+    expect((await h.routes.handle(bearer('/api/ui/state', TOKEN), server('192.0.2.2')))!.status).toBe(403);
+    expect((await h.routes.handle(hostGet('/api/ui/state', 'evil.test:7710'), server('127.0.0.1')))!.status).toBe(403);
+    h.cfg.admin.uiEnabled = false;
+    expect((await h.routes.handle(bearer('/api/ui/state', TOKEN), server('127.0.0.1')))!.status).toBe(404);
+  });
+
+  // The console branches on `error`, not on the sentence, and the tray fixture answers these exact
+  // bytes. Both are pinned to the one exported constant so they cannot drift apart silently.
+  test('the console and the daemon agree on the refusal the prompt keys off', async () => {
+    expect(CONSOLE_TOKEN_REFUSAL.error).toBe('console-token-required');
+    expect(JSON.stringify(CONSOLE_TOKEN_REFUSAL)).toBe(REFUSAL);
+
+    const js = await readFile(join(import.meta.dir, '..', 'ui', 'app.js'), 'utf8');
+    expect(js).toContain("data.error === 'console-token-required'");
+    expect(js).toContain("'sukarfleetConsoleToken'");
+    expect(js).toContain('Bearer ${sent}');
+
+    const html = await readFile(join(import.meta.dir, '..', 'ui', 'index.html'), 'utf8');
+    expect(html).toContain('id="console-token-form"');
+    expect(html).toContain('id="console-token-input"');
   });
 });

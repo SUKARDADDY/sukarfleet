@@ -77,5 +77,53 @@ bun run fixture      # canned UiState server on 127.0.0.1:7799
 bun run dev -- -- --endpoint http://127.0.0.1:7799
 ```
 
-Port discovery: `~/.config/sukarfleet/config.json` `.nodePort` (or
-`SUKARFLEET_CONFIG`), fallback 7710. `--endpoint` overrides everything.
+A machine-wide node is exercised the same way, with the fixture demanding the
+token the real daemon would:
+
+```
+SUKARFLEET_FIXTURE_TOKEN=fixture-token bun run fixture
+printf 'fixture-token' > /tmp/sukarfleet-console-token
+bun run dev -- -- --endpoint http://127.0.0.1:7799 --token-file /tmp/sukarfleet-console-token
+```
+
+Without the header the fixture answers 401 with `WWW-Authenticate: Bearer
+realm="sukarfleet"` and the daemon's refusal body, so the paths that handle a
+gated node are reachable without installing one. `/status` and `/health` stay
+open there, as they are on the daemon.
+
+## Flags and environment
+
+- `--endpoint http://127.0.0.1:7710`, or `--endpoint=...`, overrides discovery.
+- `--token-file <path>`, or `--token-file=<path>`, names the file holding this
+  node's console token. `SUKARFLEET_TOKEN_FILE` does the same; the flag wins.
+- `SUKARFLEET_CONFIG` locates the daemon config used for port discovery. A
+  value ending in `.json` is the config file itself; anything else is the
+  directory holding `config.json`. The daemon reads this variable as a file and
+  the machine-wide Windows service sets it to one, so both shapes are accepted.
+- Port discovery order: `--endpoint`, then `nodePort` from that config file,
+  then 7710.
+
+## Service mode
+
+A configured token file is what this app means by service mode: it is what the
+machine-wide Windows installer passes and what a per-user install never does.
+That node's daemon answers `/api/ui/*` with 401 unless the request carries
+`Authorization: Bearer <token>`, so in service mode:
+
+- Every request to the daemon carries the header, on the background status poll
+  and through the console bridge alike. The file is read per request and
+  trimmed, so a rotated token takes effect without a restart.
+- An unreadable or empty file is a sentence, never a panic. The tray header
+  carries it, the bridge answers the console locally rather than sending a
+  request that can only fail, and the node is not reported as unreachable: it
+  may be perfectly healthy.
+- The menu gains "Copy console token", which puts the trimmed file contents on
+  the clipboard for a browser console or an `ssh -L` session.
+- The "Start at login" checkbox is replaced by a disabled line naming its owner.
+  Startup is the installer's HKLM Run value, which carries both the endpoint and
+  the token file; a checkbox here would write an HKCU value with neither and
+  start a second, token-less tray.
+- The unreachable-node menu copies `Start-Service sukarfleet-node` and
+  `Get-Service sukarfleet-node` rather than the scheduled-task commands. There
+  is no machine-wide install outside Windows yet, so the systemd user unit
+  commands still stand on Linux.

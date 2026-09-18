@@ -14,7 +14,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadConfig, persistLegacyMigration } from '../src/config';
+import { configDir, defaultConfig, loadConfig, persistLegacyMigration, secretsDir } from '../src/config';
 
 const dirs: string[] = [];
 
@@ -165,6 +165,74 @@ describe('admin.uiAssets (P6): default true, explicit false round-trips', () => 
     const raw = deployedShape();
     (raw.admin as Record<string, unknown>).uiAssets = 'nope';
     await expect(loadConfig(writeConfig(raw))).rejects.toThrow(/admin\.uiAssets must be a boolean/);
+  });
+});
+
+describe('admin.consoleTokenFile: absent means no gate, present is validated', () => {
+  test('a config with no admin.consoleTokenFile leaves it undefined', async () => {
+    const cfg = await loadConfig(writeConfig({ machine: 'alpha' }));
+    expect(cfg.admin.consoleTokenFile).toBeUndefined();
+  });
+
+  test('a real deployed-shape config (no consoleTokenFile key) still has no gate', async () => {
+    const cfg = await loadConfig(writeConfig(deployedShape()));
+    expect(cfg.admin.consoleTokenFile).toBeUndefined();
+  });
+
+  test('an explicit path round-trips through loadConfig', async () => {
+    const raw = deployedShape();
+    (raw.admin as Record<string, unknown>).consoleTokenFile = '/var/lib/sukarfleet/console-token';
+    const cfg = await loadConfig(writeConfig(raw));
+    expect(cfg.admin.consoleTokenFile).toBe('/var/lib/sukarfleet/console-token');
+  });
+
+  test('a non-string consoleTokenFile fails validation', async () => {
+    const raw = deployedShape();
+    (raw.admin as Record<string, unknown>).consoleTokenFile = true;
+    await expect(loadConfig(writeConfig(raw))).rejects.toThrow(/admin\.consoleTokenFile must be a non-empty string/);
+  });
+
+  // A gate switched on with no file behind it can never be passed, which would brick the console
+  // on the machine that needs it most. It is refused at load, where the operator can still read
+  // the reason, rather than at the first request.
+  test('an empty consoleTokenFile fails validation', async () => {
+    const raw = deployedShape();
+    (raw.admin as Record<string, unknown>).consoleTokenFile = '';
+    await expect(loadConfig(writeConfig(raw))).rejects.toThrow(/admin\.consoleTokenFile must be a non-empty string/);
+  });
+});
+
+describe('SUKARFLEET_CONFIG_DIR: the identity directory is relocatable', () => {
+  // A machine-wide node runs as a service account with no usable home, so the machine key, its
+  // sealed twin and the default secrets dir all have to follow one env var.
+  test('configDir honours the env var, and falls back to the home default without it', () => {
+    const previous = process.env.SUKARFLEET_CONFIG_DIR;
+    try {
+      process.env.SUKARFLEET_CONFIG_DIR = '/var/lib/sukarfleet/node';
+      expect(configDir()).toBe('/var/lib/sukarfleet/node');
+      expect(secretsDir()).toBe(join('/var/lib/sukarfleet/node', 'secrets'));
+      expect(defaultConfig('alpha').admin.secretsDir).toBe(join('/var/lib/sukarfleet/node', 'secrets'));
+
+      delete process.env.SUKARFLEET_CONFIG_DIR;
+      expect(configDir()).toMatch(/\.config\/sukarfleet$/);
+    } finally {
+      if (previous === undefined) delete process.env.SUKARFLEET_CONFIG_DIR;
+      else process.env.SUKARFLEET_CONFIG_DIR = previous;
+    }
+  });
+
+  test('an explicit admin.secretsDir still wins over the env var', async () => {
+    const previous = process.env.SUKARFLEET_CONFIG_DIR;
+    try {
+      process.env.SUKARFLEET_CONFIG_DIR = '/var/lib/sukarfleet/node';
+      const raw = deployedShape();
+      (raw.admin as Record<string, unknown>).secretsDir = '/srv/elsewhere/secrets';
+      const cfg = await loadConfig(writeConfig(raw));
+      expect(secretsDir(cfg)).toBe('/srv/elsewhere/secrets');
+    } finally {
+      if (previous === undefined) delete process.env.SUKARFLEET_CONFIG_DIR;
+      else process.env.SUKARFLEET_CONFIG_DIR = previous;
+    }
   });
 });
 

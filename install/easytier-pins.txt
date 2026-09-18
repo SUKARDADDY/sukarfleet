@@ -68,3 +68,32 @@
 # and waiting for the tag that hashes it, and there is no arm64 build at all.
 0.1.0  x86_64   SHA256-FILLED-AT-RELEASE  sukarfleet-tray-windows-x86_64.exe
 0.1.0  arm64    TODO-S9                   sukarfleet-tray-windows-arm64.exe
+
+# Bun on Windows, fetched by install/windows/Install-MachineNode.ps1 into
+#   C:\Program Files\sukarfleet\bun
+# because a service cannot run out of an operator's profile. URL shape:
+#   https://github.com/oven-sh/bun/releases/download/bun-v<version>/<asset>
+# The version is the same one Install-Sukarfleet.ps1 pins for the per-user
+# install and BUN_VERSION pins for Linux: one Bun across the fleet. Computed
+# 2026-09-18 against the real bun-v1.3.14 release (38,366,737 bytes).
+1.3.14  x86_64   0a0620930b6675d7ba440e81f4e0e00d3cfbe096c4b140d3fff02205e9e18922  bun-windows-x64.zip
+
+# WinSW, the service wrapper the machine-wide install registers the node under,
+# fetched to C:\Program Files\sukarfleet\sukarfleet-node.exe. URL shape:
+#   https://github.com/winsw/winsw/releases/download/v<version>/<asset>
+#
+# The asset column is the upstream filename, like every other line here, and
+# Install-MachineNode.ps1 reads it with the prefix 'WinSW-'. The file is renamed
+# on the way in, because WinSW finds its configuration by its own filename, but
+# the rename belongs to the installer and not to this column.
+# Computed 2026-09-18 against the real v2.12.0 release (18,243,033 bytes).
+2.12.0  x86_64  05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da  WinSW-x64.exe
+
+# The Windows installer EXE itself, built by .github/workflows/installer-windows.yml
+# and published on this project's release. Nothing in the repo downloads it: this
+# line exists so the hash of the file people are asked to double-click is written
+# down in the same place as every other binary's, and the workflow prints the line
+# it would become. SHA256-FILLED-AT-RELEASE for the same reason the tray lines
+# carry it -- the binary is built from this tree, so its hash cannot exist until
+# the tag does.
+0.1.0  x86_64   SHA256-FILLED-AT-RELEASE  sukarfleet-setup-windows-x86_64.exe

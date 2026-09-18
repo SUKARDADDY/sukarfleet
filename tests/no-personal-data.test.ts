@@ -28,8 +28,12 @@ const EXCLUDED_FILES = new Set(['live-capture.json', 'no-personal-data.test.ts']
 // licence texts and dependency lockfiles are text too, and a lockfile is exactly the sort of
 // generated thing that quietly records a registry URL or a local path. .yml and .yaml because
 // CI workflows are where a runner name, a self-hosted host or a deployment target gets written
-// down, and .github/ was outside this list until the workflows landed.
-const SCANNED_EXTENSIONS = ['.ts', '.js', '.json', '.md', '.sh', '.toml', '.service', '.html', '.css', '.ps1', '.cmd', '.rs', '.py', '.svg', '.txt', '.lock', '.yml', '.yaml'];
+// down, and .github/ was outside this list until the workflows landed. .iss and .xml for the
+// same reason one step further: an Inno Setup script carries the default install paths, and a
+// service definition carries the account the service runs as, its working directory and every
+// environment variable it is handed -- which is exactly where a machine name or a mesh address
+// would end up.
+const SCANNED_EXTENSIONS = ['.ts', '.js', '.json', '.md', '.sh', '.toml', '.service', '.html', '.css', '.ps1', '.cmd', '.rs', '.py', '.svg', '.txt', '.lock', '.yml', '.yaml', '.iss', '.xml'];
 
 // Patterns describing SHAPES of private data, not one person's specifics -- so this keeps working
 // for the next contributor, whose machine is not named the same thing.

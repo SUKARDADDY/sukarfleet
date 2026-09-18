@@ -119,6 +119,9 @@ const COPY = {
   restarting: 'Restarting. This page reconnects on its own.',
   requestFailed: (status) => `The daemon answered ${status}.`,
   networkFailed: 'The daemon did not answer.',
+  // A machine-wide node wants a console token, and this window has no box to paste one into:
+  // the tray reads the token file it was started with. So the fault is always that file.
+  tokenRefused: 'This node refused the console token. Check the token file the tray was started with (--token-file).',
 
   offlineBanner: 'daemon not responding · retrying',
 };
@@ -351,7 +354,16 @@ async function api(path, opts) {
     throw new ApiError(0, COPY.networkFailed);
   }
   if (!res || typeof res.status !== 'number' || res.status === 0) {
-    throw new ApiError(0, COPY.networkFailed);
+    // The bridge answers status 0 for two different things: the daemon did not answer, and the
+    // request never left the tray because it could not read its token file. The second one
+    // carries a sentence, and it is the one that says what to fix.
+    const local = res && res.body && typeof res.body.message === 'string' ? res.body.message.trim() : '';
+    throw new ApiError(0, local || COPY.networkFailed);
+  }
+  // The node is gated and the tray's token is not the one it holds. No prompt: the tray reads
+  // the file, so this state means the path it was started with is wrong or its contents are.
+  if (res.status === 401 && res.body && res.body.error === 'console-token-required') {
+    throw new ApiError(401, COPY.tokenRefused);
   }
   if (res.status < 200 || res.status >= 300) {
     const msg = res.body && typeof res.body.message === 'string' ? res.body.message : COPY.requestFailed(res.status);

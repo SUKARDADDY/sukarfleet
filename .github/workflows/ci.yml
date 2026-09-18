@@ -50,3 +50,41 @@ jobs:
               shellcheck --severity=warning -s bash "$f"
             fi
           done
+
+  # The Windows installer scripts have no test runner and no lint pass, so this
+  # is the cheapest check that says they are still PowerShell. It runs here, on
+  # the Linux runners the rest of CI already uses, because pwsh is on the image
+  # and a parse needs nothing from Windows.
+  #
+  # It is the weaker half of a pair. PowerShell 7 accepts syntax Windows
+  # PowerShell 5.1 rejects, and 5.1 is all the smoke target has, so
+  # installer-windows.yml parses the same files again under 5.1 on a Windows
+  # runner. This job is what catches a broken script on a pull request that
+  # touches nothing else the Windows workflow watches.
+  pwsh-parse:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: parse install/windows/*.ps1
+        shell: pwsh
+        run: |
+          Write-Host "pwsh: $($PSVersionTable.PSVersion)"
+          $failed = @()
+          foreach ($file in Get-ChildItem -Path install/windows -Filter *.ps1) {
+            $errors = $null
+            $tokens = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              $failed += $file.Name
+              Write-Host "$($file.Name): $($errors.Count) parse error(s)"
+              foreach ($e in $errors) {
+                Write-Host "  line $($e.Extent.StartLineNumber): $($e.Message)"
+              }
+            } else {
+              Write-Host "$($file.Name): parses"
+            }
+          }
+          if ($failed.Count -gt 0) {
+            Write-Host "does not parse: $($failed -join ', ')"
+            exit 1
+          }

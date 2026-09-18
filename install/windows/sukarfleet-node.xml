@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SPDX-License-Identifier: AGPL-3.0-or-later
+
+  WinSW service definition for the machine-wide sukarfleet node.
+
+  This file is a TEMPLATE. Install-MachineNode.ps1 copies it next to the renamed WinSW binary
+  (C:\Program Files\sukarfleet\sukarfleet-node.exe) and replaces every __PLACEHOLDER__ before
+  the service is registered. WinSW finds its configuration by filename, so the copy must be
+  called sukarfleet-node.xml and must sit in the same directory as the exe.
+
+  Placeholders:
+    __BUN_EXE__          full path to bun.exe
+    __APP_DIR__          the sukarfleet tree the node runs from
+    __SERVICE_ACCOUNT__  NT SERVICE\sukarfleet-node, or NT AUTHORITY\LocalService on the
+                         fallback path the installer takes when the virtual account is refused
+    __NODE_DIR__         C:\ProgramData\sukarfleet\node
+    __LOG_DIR__          where WinSW writes stdout, stderr and its own log
+    __DEPEND_BLOCK__     <depend>easytier-fleet</depend>, or nothing at all when the mesh
+                         transport is not installed on this machine: a dependency on a service
+                         that does not exist stops this one from ever starting.
+
+  There is no port placeholder. The node reads nodePort from its config.json, which the
+  installer writes; a second copy of the port in here could disagree with it.
+-->
+<service>
+  <id>sukarfleet-node</id>
+  <name>sukarfleet node</name>
+  <description>Runs the sukarfleet daemon for this machine, with nobody logged in.</description>
+
+  <executable>__BUN_EXE__</executable>
+  <arguments>run src\node.ts</arguments>
+  <workingdirectory>__APP_DIR__</workingdirectory>
+
+  <!-- A virtual account, not SYSTEM. It gets exactly the rights the installer grants it on
+       the node directory and the shared root, and nothing else on the machine. -->
+  <serviceaccount>
+    <username>__SERVICE_ACCOUNT__</username>
+    <allowservicelogon>true</allowservicelogon>
+  </serviceaccount>
+
+  <!-- The daemon's own paths. SUKARFLEET_CONFIG is a file, SUKARFLEET_CONFIG_DIR and
+       SUKARFLEET_STATE are directories. GIT_CONFIG_GLOBAL points git at a config written for
+       this service alone: hooks off, autocrlf off, the shared root marked safe. TEMP and TMP
+       are set because a service account has no profile to fall back on and Bun needs a
+       writable temp directory. -->
+  <env name="SUKARFLEET_CONFIG" value="__NODE_DIR__\config.json"/>
+  <env name="SUKARFLEET_CONFIG_DIR" value="__NODE_DIR__"/>
+  <env name="SUKARFLEET_STATE" value="__NODE_DIR__\state"/>
+  <env name="GIT_CONFIG_GLOBAL" value="__NODE_DIR__\gitconfig"/>
+  <env name="TEMP" value="__NODE_DIR__\tmp"/>
+  <env name="TMP" value="__NODE_DIR__\tmp"/>
+
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>5</keepFiles>
+  </log>
+  <logpath>__LOG_DIR__</logpath>
+
+  <onfailure action="restart" delay="3 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  __DEPEND_BLOCK__
+  <startmode>Automatic</startmode>
+  <stoptimeout>20 sec</stoptimeout>
+</service>

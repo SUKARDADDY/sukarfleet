@@ -179,9 +179,75 @@ Two content rules are enforced by convention and by review:
   stamps a future date wins every non-union conflict. The losing side is preserved under
   `.sync-conflicts/`, so this demotes content rather than destroying it.
 
+## The machine-wide Windows node
+
+The Windows installer offers two scopes, and they do not share a trust model. A per-user install is
+what the rest of this document describes: a daemon running as you, under your account, while you are
+signed in. A machine-wide install is a Windows service that runs whether or not anybody is signed in,
+with one fleet identity for the whole PC. This section is the second one.
+
+**Who may drive it.** Loopback is not a caller identity, and on a machine-wide node every local
+account shares that loopback. So the node requires a bearer token on `/api/ui/*` and on `POST /mcp`.
+The token is 32 random bytes, base64url, generated at install and written to
+`C:\ProgramData\sukarfleet\node\console-token`. A request without it is refused with 401 and a body
+naming `console-token-required`; the browser console asks for the token on that refusal and the tray
+reads the file. `/health`, `/status` and the peer routes are unchanged: `/status` stays loopback-only,
+`/health` stays open, and `POST /pair/hello` is never gated, because a machine that is pairing does
+not have the token yet.
+
+**The token file is readable by every local account, and that is a decision rather than an
+oversight.** Its ACL grants `BUILTIN\Users` read. The reasoning: on a personal machine every account
+is an operator, and an install-time page asking which accounts may drive the node would be answered
+wrong more often than it would be answered well. Stated plainly: **any account that can sign in to
+that PC can operate the node**, which means reading the peer table, the audit log and the config, and
+changing the config.
+
+Narrowing it is one line, run after the install:
+
+```powershell
+icacls C:\ProgramData\sukarfleet\node\console-token /remove:g "BUILTIN\Users" /grant "sukarfleet-operators:(R)"
+```
+
+Create the group first and put the accounts you trust in it. The daemon reads the file on every
+request, so leave the service account's own read entry alone. Nothing else in the install depends on
+`Users` being able to read that file.
+
+**The service is not SYSTEM.** It runs as the virtual account `NT SERVICE\sukarfleet-node`, which has
+no password, cannot sign in interactively, and is granted only what the install gives it: modify on
+`C:\ProgramData\sukarfleet\node`, modify on the shared root, read and execute on the program files.
+Code execution inside the daemon is code execution as that account, not as the machine. Where the
+virtual account cannot be granted the service logon right, the installer falls back to `LocalService`
+and says so in its log, and `sc qc sukarfleet-node` is how you check which one you got.
+
+**git hooks do not run under the service account.** The service is handed a `GIT_CONFIG_GLOBAL` of its
+own, and that file points `core.hooksPath` at an empty directory. A peer that commits a `post-merge`
+script into a synced repository gets nothing on a machine-wide Windows node. **This does not disable
+the `postMerge` hook in this project's own config**, which is argv you wrote in your config file: the
+amplification described under "The sync lane" is unchanged, and so is the advice to keep hook targets
+outside the directories you sync.
+
+**The shared root is writable by every local account.** A machine-wide install keeps the synced
+repositories in one tree, `C:\AI_Agent`, and grants `BUILTIN\Users` modify on it, because two accounts
+working in one tree is the whole point of the scope. Whatever any local account writes there is
+committed by the daemon and reaches every paired machine. Read write access to that directory as
+write access to the fleet's synced content.
+
+**"Same-user processes are trusted" reads differently in each scope.** Per-user, it is the sentence at
+the top of "Known limitations": code running as you has what you have. Machine-wide, the daemon's user
+is a service account nobody signs in as, so the equivalent sentence is about the token and the tree:
+code running as any local account can read the token, drive the node, and write into the synced
+content the whole fleet receives.
+
 ## Known limitations
 
 - **Same-user processes are trusted.** This is the big one; see above.
+- **A machine-wide Windows node is operated by every local account on that PC.** The console
+  token is readable by `BUILTIN\Users` by default and one `icacls` line narrows it to a group;
+  the shared root is writable by them too. See "The machine-wide Windows node" above.
+- **The Windows installer is not signed yet.** SmartScreen warns on a downloaded EXE and there
+  is nothing in the file itself that says where it came from. The SHA256 the build prints, and
+  the pin recorded in `install/easytier-pins.txt`, are the whole of the check until a signing
+  certificate exists.
 - **No FDE detection.** See above.
 - **`confirm` mode does not exist yet.** See above.
 - **Non-Linux platforms are experimental.** Every platform-specific seam is gated by a live

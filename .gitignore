@@ -10,3 +10,7 @@ tests/freeze/live-capture.json
 # ignored by clients/tray/.gitignore, which git reads relative to that directory.
 # Listed here so a reader at the root knows where it is handled, not duplicated.
 # tests/no-personal-data.test.ts skips the same two directory names.
+
+# The Windows installer's build output. install/windows/sukarfleet.iss sets OutputDir to
+# <repo>\dist, so compiling the EXE by hand drops it here; CI uploads it as an artifact.
+dist/

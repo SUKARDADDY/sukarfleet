@@ -208,8 +208,10 @@ otherwise it prints this.
 
 The numbered lines and `--pending=` are new (**new in S7**), and they are the point of decision 2:
 the user reads what the password buys before typing it. The path is hardcoded nowhere; the daemon
-derives it from `stateDir()`, which honours `SUKARFLEET_STATE` (`src/config.ts:18-20`), and the
-banner and console print that same real path. Both consoles print a wrong one today:
+derives it from `stateDir()`, which honours `SUKARFLEET_STATE` (`src/config.ts:22-24`), and the
+banner and console print that same real path. `configDir()` honours `SUKARFLEET_CONFIG_DIR`
+(`src/config.ts:18-20`) the same way: that is the directory holding `config.json`, the machine key
+and the default secrets directory. Both consoles print a wrong one today:
 `ui/index.html:108` and `clients/tray/src/index.html:116` hardcode `sudo
 ~/sukarfleet/install/install-elevated.sh --adopt-pending-secret`, which is neither where `get.sh`
 puts the checkout nor a flag the script accepts (`install-elevated.sh:50-59` rejects it as an

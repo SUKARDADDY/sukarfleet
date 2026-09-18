@@ -7,6 +7,11 @@
 //   curl -X POST 127.0.0.1:7799/scenario/critical   # green|degraded|critical|setup|restart|ui-off
 //
 // `restart` rewinds uptimeSec so the tray's resume-grace path fires.
+//
+// SUKARFLEET_FIXTURE_TOKEN=<token> makes this a machine-wide node: every
+// /api/ui/* request must carry `Authorization: Bearer <token>` or it gets the
+// daemon's 401 refusal, byte for byte. /status and /health stay open, as they
+// are on the real daemon.
 
 const port = Number(process.argv[2] ?? 7799);
 // --proxy http://127.0.0.1:7710 : forward /api/ui/* to a REAL daemon (server-side
@@ -14,6 +19,7 @@ const port = Number(process.argv[2] ?? 7799);
 // Rust bridge does). Console page still served from here (same-origin).
 const proxyIx = process.argv.indexOf('--proxy');
 const proxyBase = proxyIx > 0 ? process.argv[proxyIx + 1] : null;
+const consoleToken = process.env.SUKARFLEET_FIXTURE_TOKEN ?? '';
 let scenario = 'green';
 let uptimeBase = Date.now() / 1000 - 3600; // fixture booted "an hour ago"
 
@@ -138,6 +144,18 @@ Bun.serve({
       ['/fonts/IBMPlexSans-Medium.woff2', 'fonts/IBMPlexSans-Medium.woff2', 'font/woff2'],
     ] as const) {
       if (p === route) return new Response(Bun.file(SRC + file), { headers: { 'content-type': type } });
+    }
+
+    // --- console token gate (machine-wide node) ---
+    if (consoleToken && p.startsWith('/api/ui/')) {
+      const header = req.headers.get('authorization') ?? '';
+      const offered = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+      if (offered !== consoleToken) {
+        return new Response(
+          JSON.stringify({ error: 'console-token-required', message: 'This node is installed machine-wide. Paste its console token.' }),
+          { status: 401, headers: { 'content-type': 'application/json', 'WWW-Authenticate': 'Bearer realm="sukarfleet"' } },
+        );
+      }
     }
 
     if (proxyBase && p.startsWith('/api/ui/')) {
@@ -269,4 +287,6 @@ Bun.serve({
     return json({ error: 'not found' }, 404);
   },
 });
-console.log(`fixture daemon on http://127.0.0.1:${port} (scenario: ${scenario})`);
+console.log(
+  `fixture daemon on http://127.0.0.1:${port} (scenario: ${scenario}${consoleToken ? ', console token required' : ''})`,
+);

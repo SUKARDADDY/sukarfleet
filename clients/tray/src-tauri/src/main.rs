@@ -15,6 +15,7 @@ use health::{Engine, EngineOutput, Observation, TrayState};
 use model::{format_duration, Snapshot};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
@@ -41,6 +42,9 @@ fn trace(stage: &str) {
 
 pub struct Shared {
     pub endpoint: String,
+    /// Machine-wide install only: the file holding this node's console token.
+    /// Its presence is what "service mode" means everywhere in this app.
+    pub token_file: Option<PathBuf>,
     pub summary: Mutex<String>,
     pub last_model: Mutex<Option<tray::MenuModel>>,
     pub refresh: tokio::sync::Notify,
@@ -56,10 +60,11 @@ const DOWN_BACKOFF_SECS: [u64; 6] = [1, 2, 4, 8, 16, 30];
 
 fn main() {
     trace("main");
-    let endpoint = config::endpoint();
+    let resolved = config::resolve();
     trace("endpoint resolved");
     let shared = Arc::new(Shared {
-        endpoint,
+        endpoint: resolved.endpoint,
+        token_file: resolved.token_file,
         summary: Mutex::new(String::new()),
         last_model: Mutex::new(None),
         refresh: tokio::sync::Notify::new(),
@@ -106,7 +111,7 @@ fn main() {
 }
 
 async fn poll_loop(app: AppHandle, shared: Arc<Shared>) {
-    let client = Client::new(shared.endpoint.clone());
+    let client = Client::new(shared.endpoint.clone(), shared.token_file.clone());
     let mut engine = Engine::new(POLL_INTERVAL);
     let mut notifier = notify::Notifier::load(config::state_dir());
     let mut last_hash: u64 = 0;
@@ -119,7 +124,7 @@ async fn poll_loop(app: AppHandle, shared: Arc<Shared>) {
         let now = Instant::now();
         let wall = SystemTime::now();
 
-        let (obs, snap) = match outcome {
+        let (obs, snap, blocked) = match outcome {
             PollOutcome::Up(s) => {
                 down_streak = 0;
                 last_up_wall = Some(wall);
@@ -132,16 +137,21 @@ async fn poll_loop(app: AppHandle, shared: Arc<Shared>) {
                         uptime_sec: s.uptime_sec(),
                     },
                     Some(s),
+                    None,
                 )
             }
             PollOutcome::Down => {
                 down_streak += 1;
-                (Observation::Failure, None)
+                (Observation::Failure, None, None)
+            }
+            PollOutcome::Blocked(why) => {
+                down_streak += 1;
+                (Observation::Failure, None, Some(why))
             }
         };
 
         let out = engine.observe(&obs, now, wall);
-        let m = build_menu_model(&snap, &out, &shared.endpoint, last_up_wall, wall);
+        let m = build_menu_model(&snap, &out, &shared.endpoint, blocked.as_deref(), last_up_wall, wall);
         if let Ok(mut s) = shared.summary.lock() {
             *s = m.summary.clone();
         }
@@ -185,6 +195,7 @@ fn build_menu_model(
     snap: &Option<Snapshot>,
     out: &EngineOutput,
     endpoint: &str,
+    blocked: Option<&str>,
     last_up_wall: Option<SystemTime>,
     wall: SystemTime,
 ) -> tray::MenuModel {
@@ -196,7 +207,9 @@ fn build_menu_model(
             .and_then(|t| wall.duration_since(t).ok())
             .map(|d| format_duration(Some(d.as_millis() as i64)))
             .unwrap_or_else(|| "never".into());
-        let header = if out.displayed == TrayState::Unknown {
+        let header = if let Some(why) = blocked {
+            format!("sukarfleet · {why}")
+        } else if out.displayed == TrayState::Unknown {
             "sukarfleet — connecting…".to_string()
         } else {
             format!("sukarfleet — daemon not responding · last seen {ago}")
@@ -208,7 +221,8 @@ fn build_menu_model(
             faults: vec![],
             peers: vec![],
             repos: vec![],
-            unreachable: out.displayed == TrayState::Unreachable,
+            // A token this node will not take is not a node to go and start.
+            unreachable: blocked.is_none() && out.displayed == TrayState::Unreachable,
             console_url,
             summary,
         };

@@ -128,22 +128,50 @@ beside the files. "Plex" is a Reserved Font Name under condition 3.
 
 ## The Windows lane
 
-The Windows installer uses operating-system components that Microsoft ships with Windows. They are
-not dependencies in the packaging sense: nothing is fetched, nothing is bundled, and there is no
-licence obligation on this project for any of them.
+The Windows installer is an EXE, built by
+[`.github/workflows/installer-windows.yml`](.github/workflows/installer-windows.yml) on a Windows
+runner and uploaded as a build artifact, which a release then publishes deliberately. It bundles one
+third-party component and fetches two, so this lane is no longer the "nothing fetched, nothing
+bundled" case the earlier draft of this file described.
 
-| Component | What it does here |
-|---|---|
-| Windows PowerShell 5.1 and PowerShell 7 | The installer itself. It is written to run under both. |
-| DPAPI (`ProtectedData`, CurrentUser scope) | The credential store backend, in place of `systemd-creds`. |
-| Task Scheduler (`Register-ScheduledTask`) | Starts the daemon at logon, in place of a systemd user unit. |
+**Bundled: the Inno Setup stub.** The installer is compiled by Inno Setup, and every EXE it compiles
+carries Inno's own setup loader inside it. Those are third-party bytes inside an artifact this project
+publishes, which is the definition of bundled at the top of this file. The Inno Setup licence permits
+redistribution in binary form provided the copyright notice and the web addresses already in the
+software stay in place, so the full text travels with the project as
+[`LICENSES/InnoSetup.txt`](LICENSES/InnoSetup.txt). The compiler itself is a build tool on the CI
+runner and ships in nothing.
+
+**Fetched: WinSW and Bun.** A machine-wide install needs a Windows service, and the daemon is a
+console program: WinSW is the wrapper that makes one out of the other. Bun is the runtime, fetched
+when the machine does not already have it. Both are downloaded from their own upstream releases and
+refused unless the SHA256 matches the pin in
+[`install/easytier-pins.txt`](install/easytier-pins.txt). A pin that has not been computed is not a
+pin, and an unfilled one is a refusal rather than an unverified download. This is the same position
+the project takes on EasyTier above, for the same reasons, and it is subject to the same caveat: it
+has not been reviewed by a lawyer.
+
+| Component | Licence | How it is used |
+|---|---|---|
+| **Inno Setup** (setup loader inside the EXE) | Inno Setup licence, permissive | **Bundled.** Text in [`LICENSES/InnoSetup.txt`](LICENSES/InnoSetup.txt). |
+| **WinSW** 2.12.0 | MIT | **Fetched** against a pin, installed as `sukarfleet-node.exe` beside `install/windows/sukarfleet-node.xml`. It is the service wrapper for the machine-wide scope. |
+| **Bun** (Windows build) | MIT | **Fetched** against a pin when the machine has no Bun. The same runtime `install/quickstart.sh` installs on Linux. |
+| Windows PowerShell 5.1 and PowerShell 7 | ships with Windows | Invoked. The installer scripts run under both, and CI parses them under both. |
+| DPAPI (`ProtectedData`, CurrentUser scope) | ships with Windows | Invoked. The credential store backend, in place of `systemd-creds`. |
+| Task Scheduler (`Register-ScheduledTask`) | ships with Windows | Invoked. Starts the daemon at logon for a per-user install, in place of a systemd user unit. |
+| Service Control Manager (`sc.exe`, virtual service accounts) | ships with Windows | Invoked. Runs the daemon as `NT SERVICE\sukarfleet-node` for a machine-wide install. |
+
+Nothing Microsoft ships with Windows carries a licence obligation on this project. The two fetched
+components do, and both are MIT: their notices travel with the copies on the user's machine, and
+neither is relinked, repackaged or modified.
 
 The honest gap on that platform is in [`docs/PLATFORMS.md`](docs/PLATFORMS.md), not here: there is
 no privilege-elevation tool that reads a password from stdin, so the admin lane refuses by name.
 
 ## Summary
 
-One AGPL-3.0 daemon, MIT edges, one bundled font under OFL-1.1, and one LGPL-3.0 mesh transport
-that is fetched from its upstream against a checksum and never shipped by this project. The only
-open question in the stack is whether that fetch counts as redistribution, and this file says which
-way the project has answered it and on what basis.
+One AGPL-3.0 daemon, MIT edges, one bundled font under OFL-1.1, one permissively licensed setup
+loader bundled inside the Windows installer, and three components fetched from their own upstreams
+against checksums and never shipped by this project: EasyTier under LGPL-3.0, WinSW and Bun under
+MIT. The only open question in the stack is whether that fetch counts as redistribution, and this
+file says which way the project has answered it and on what basis.

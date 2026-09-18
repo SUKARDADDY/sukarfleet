@@ -32,6 +32,7 @@ import type {
   PeerView,
 } from './types';
 import { log } from './util';
+import { consoleTokenRefusal, type ConsoleTokenCheck } from './uiserve';
 
 export const MCP_LOOPBACK_HOST = '127.0.0.1';
 export const MCP_LOOPBACK_PORT = 7719;
@@ -71,6 +72,11 @@ export interface McpDeps {
   // compile rather than serve an agent surface that silently does nothing.
   adminRun: (req: AdminRunRequest) => Promise<AdminRunResult>;
   adminStatus: () => Promise<AdminStatusEntry[]>;
+  // Console token gate, shared with the GUI transport (see uiserve.ts's console token section).
+  // Absent means no gate, which is every per-user install: loopback stays the whole boundary.
+  // Present -- a machine-wide node, where loopback says nothing about which account is calling --
+  // means POST /mcp needs the same `Authorization: Bearer <token>` the console sends.
+  tokenCheck?: ConsoleTokenCheck;
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +455,11 @@ export function createMcpFetchHandler(deps: McpDeps): (req: Request) => Promise<
       // Streamable-HTTP GET (SSE stream open) has nothing to serve.
       return new Response('method not allowed', { status: 405, headers: { Allow: 'POST' } });
     }
+
+    // On a machine-wide node this surface is reachable by every local account, and it drives the
+    // admin lane. Same token, same refusal bytes as the console: an agent that can read the token
+    // file is an operator of this node, and one that cannot is told exactly what is missing.
+    if (deps.tokenCheck && !(await deps.tokenCheck(req))) return consoleTokenRefusal();
 
     // This server binds loopback and authenticates nothing beyond that. Loopback is a network
     // boundary, not a caller identity: a page in a browser on this machine can POST here, and

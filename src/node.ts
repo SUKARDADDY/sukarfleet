@@ -61,7 +61,13 @@ import { randomBytes } from 'node:crypto';
 import { SshAdmin } from './sshadmin';
 import { Pairing } from './pairing';
 import { currentPlatform } from './platform';
-import { UiRoutes, elevatedInstallCommand, type UiRoutesDeps } from './uiserve';
+import {
+  UiRoutes,
+  elevatedInstallCommand,
+  makeConsoleTokenCheck,
+  type ConsoleTokenCheck,
+  type UiRoutesDeps,
+} from './uiserve';
 import * as secrets from './secrets';
 
 const LOOPBACK_ADDRS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
@@ -1192,6 +1198,18 @@ async function main(): Promise<void> {
     };
   }
 
+  // The console token gate. Off unless the config names a token file, which only a machine-wide
+  // installer writes: a per-user node keeps loopback as its whole boundary, exactly as before. One
+  // check object serves both gated surfaces, so the console and the MCP port can never disagree
+  // about which token is current.
+  let tokenCheck: ConsoleTokenCheck | undefined;
+  if (cfg.admin.consoleTokenFile) {
+    tokenCheck = makeConsoleTokenCheck(cfg.admin.consoleTokenFile);
+    log('info', 'uiserve: console token gate on -- /api/ui/* and POST /mcp require its bearer token', {
+      consoleTokenFile: cfg.admin.consoleTokenFile,
+    });
+  }
+
   const uiRoutes = new UiRoutes({
     cfg,
     // Adapts node.ts's isLoopback (which takes the fuller server shape this file uses) to
@@ -1213,6 +1231,7 @@ async function main(): Promise<void> {
       issue: (input) => enrollIssuer.issue(input),
       revoke: (id) => enrollments.revoke(id),
     },
+    tokenCheck,
   });
 
   // A host-key mismatch is only observable by attempting a connection, so it is recorded when the
@@ -1274,6 +1293,7 @@ async function main(): Promise<void> {
       tailAudit,
       adminRun: (req) => sshAdmin.runAdmin(req),
       adminStatus: () => sshAdmin.status(),
+      tokenCheck,
     },
     { port: cfg.mcpPort },
   );

@@ -49,6 +49,7 @@
 
 import { join } from 'node:path';
 import { isIPv6 } from 'node:net';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import type {
   AdminRunRequest,
   AdminRunView,
@@ -275,6 +276,10 @@ export interface UiRoutesDeps {
   // Absent on a machine built without it -- the routes then 404 rather than throwing, the same way
   // uiEnabled:false makes a surface not exist rather than refuse.
   enroll?: UiEnrollPort;
+  // Absent means no console token gate, which is every per-user install and every existing caller
+  // that builds these deps by hand. node.ts supplies makeConsoleTokenCheck(admin.consoleTokenFile)
+  // when, and only when, that key is set.
+  tokenCheck?: ConsoleTokenCheck;
 }
 
 export interface LanePatch {
@@ -310,6 +315,87 @@ function methodNotAllowed(allow: string): Response {
     status: 405,
     headers: { 'content-type': 'application/json', 'cache-control': 'no-store', allow },
   });
+}
+
+// ---------------------------------------------------------------------------
+// The console token
+//
+// A per-user node is reachable only by the account that runs it, so loopback is the whole gate. A
+// machine-wide node is reachable by every account on the PC, and loopback then proves nothing about
+// WHO is calling. admin.consoleTokenFile names a file whose contents are the shared answer: the
+// installer writes it with an ACL, and holding it is what makes a caller an operator of this node.
+//
+// Read on every check rather than cached at boot, because the token is one short line and rotating
+// it must not need a daemon restart. A missing or empty file refuses everything: a gate that is
+// configured but cannot be satisfied fails closed.
+// ---------------------------------------------------------------------------
+
+// Answers the one question `tokenCheck` asks; injected as a dependency so the route layer keeps
+// touching no filesystem of its own and a test can pass a plain predicate.
+export type ConsoleTokenCheck = (req: Request) => boolean | Promise<boolean>;
+
+// The refusal, byte for byte. Both surfaces that carry the gate (this file's /api/ui/* and mcp.ts's
+// POST /mcp) answer with these exact bytes, so the console and the tray recognise it by the `error`
+// field alone and can prompt instead of showing a failure.
+export const CONSOLE_TOKEN_REFUSAL = Object.freeze({
+  error: 'console-token-required',
+  message: 'This node is installed machine-wide. Paste its console token.',
+});
+
+export function consoleTokenRefusal(): Response {
+  return new Response(JSON.stringify(CONSOLE_TOKEN_REFUSAL), {
+    status: 401,
+    headers: {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+      'www-authenticate': 'Bearer realm="sukarfleet"',
+    },
+  });
+}
+
+// Digest both sides first, then compare fixed-width buffers. timingSafeEqual throws on a length
+// mismatch, which would itself leak the token's length; hashing removes the branch entirely.
+function constantTimeEqual(a: string, b: string): boolean {
+  const left = createHash('sha256').update(a, 'utf8').digest();
+  const right = createHash('sha256').update(b, 'utf8').digest();
+  return timingSafeEqual(left, right);
+}
+
+// The scheme name is case-insensitive per RFC 7235; the token itself is not.
+function bearerCredential(header: string | null): string | null {
+  if (header === null) return null;
+  const match = /^Bearer[ \t]+(\S+)[ \t]*$/i.exec(header);
+  return match ? match[1]! : null;
+}
+
+// Builds the check node.ts injects. `path` is a config value and may be '~'-prefixed like every
+// other admin path.
+export function makeConsoleTokenCheck(path: string): ConsoleTokenCheck {
+  const file = expandHome(path);
+  // The console polls every three seconds, so an unreadable file would otherwise write the same
+  // line into the log forever. Latched, and cleared by a successful read, so the recovery and any
+  // later failure are both still visible.
+  let readFailureLogged = false;
+  return async (req: Request): Promise<boolean> => {
+    const presented = bearerCredential(req.headers.get('authorization'));
+    if (presented === null) return false;
+    let expected: string;
+    try {
+      expected = (await Bun.file(file).text()).trim();
+    } catch (err) {
+      if (!readFailureLogged) {
+        readFailureLogged = true;
+        log('error', 'uiserve: console token file could not be read; refusing every console call', {
+          file,
+          error: String(err),
+        });
+      }
+      return false;
+    }
+    readFailureLogged = false;
+    if (!expected) return false;
+    return constantTimeEqual(expected, presented);
+  };
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -631,6 +717,13 @@ export class UiRoutes {
 
   private async apiRoute(req: Request, url: URL, path: string): Promise<Response> {
     const method = req.method;
+    // Identity before shape. Every route below this line answers from, or writes to, this machine's
+    // admin lane, and on a machine-wide node loopback no longer says which account is asking. The
+    // check sits here rather than in route() so the two things that must never be gated stay
+    // ungated: POST /pair/hello (answered before this method is reached, and authenticated by the
+    // MAC on its own payload) and the /ui assets (the page that asks for the token).
+    if (this.deps.tokenCheck && !(await this.deps.tokenCheck(req))) return consoleTokenRefusal();
+
     if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
       const rejected = rejectCrossSiteBrowser(req, this.cfg.nodePort);
       if (rejected) return rejected;

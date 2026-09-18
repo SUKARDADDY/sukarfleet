@@ -23,6 +23,9 @@ pub const TRAY_ID: &str = "main";
 #[cfg(target_os = "windows")]
 mod cmds {
     pub const START: &str = "Start-ScheduledTask -TaskName sukarfleet";
+    // Machine-wide scope: the node is a WinSW service, not a logon task.
+    pub const SERVICE_START: &str = "Start-Service sukarfleet-node";
+    pub const SERVICE_CHECK: &str = "Get-Service sukarfleet-node";
     // The task's output goes nowhere. Windows has no journal, and the installer
     // registers `bun run src\node.ts` as the task action rather than behind a
     // shell that could redirect it, so there is no log file to tail and saying
@@ -37,6 +40,33 @@ mod cmds {
     pub const START: &str = "systemctl --user start sukarfleet.service";
     pub const CHECK: &str = "journalctl --user -u sukarfleet -n 200";
     pub const CHECK_LABEL: &str = "Copy log command";
+    // There is no machine-wide install outside Windows yet, so a token file
+    // here still means the user unit. Naming a system unit nobody installs
+    // would be a confidently wrong answer.
+    pub const SERVICE_START: &str = START;
+    pub const SERVICE_CHECK: &str = CHECK;
+}
+
+/// Service mode is exactly "a console token file was configured": that is what
+/// a machine-wide install passes and a per-user install never does.
+fn service_mode(app: &AppHandle) -> bool {
+    app.try_state::<Arc<Shared>>().map(|s| s.token_file.is_some()).unwrap_or(false)
+}
+
+fn start_cmd(service: bool) -> &'static str {
+    if service {
+        cmds::SERVICE_START
+    } else {
+        cmds::START
+    }
+}
+
+fn check_cmd(service: bool) -> &'static str {
+    if service {
+        cmds::SERVICE_CHECK
+    } else {
+        cmds::CHECK
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize)]
@@ -122,6 +152,7 @@ pub fn apply(app: &AppHandle, model: &MenuModel) {
 }
 
 fn build_menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<Wry>> {
+    let service = service_mode(app);
     let menu = Menu::new(app)?;
     menu.append(&MenuItem::with_id(app, "header", &m.header, false, None::<&str>)?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -170,16 +201,39 @@ fn build_menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<Wry>> {
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(app, "open-window", "Open fleet console", true, None::<&str>)?)?;
     menu.append(&MenuItem::with_id(app, "copy-status", "Copy status", true, None::<&str>)?)?;
+    if service {
+        menu.append(&MenuItem::with_id(
+            app,
+            "copy-token",
+            "Copy console token",
+            true,
+            None::<&str>,
+        )?)?;
+    }
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
-    menu.append(&CheckMenuItem::with_id(
-        app,
-        "autostart",
-        "Start at login",
-        true,
-        autostart_on,
-        None::<&str>,
-    )?)?;
+    if service {
+        // The machine-wide install owns startup through an HKLM Run value that
+        // carries the endpoint and the token file. A checkbox here writes an
+        // HKCU value with neither, which is a second, token-less tray. So the
+        // checkbox is gone and a disabled line says who owns the setting.
+        menu.append(&MenuItem::with_id(
+            app,
+            "autostart-managed",
+            "Start at login (managed by the machine-wide install)",
+            false,
+            None::<&str>,
+        )?)?;
+    } else {
+        let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
+        menu.append(&CheckMenuItem::with_id(
+            app,
+            "autostart",
+            "Start at login",
+            true,
+            autostart_on,
+            None::<&str>,
+        )?)?;
+    }
     menu.append(&MenuItem::with_id(app, "refresh", "Refresh now", true, None::<&str>)?)?;
     menu.append(&MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?)?;
     Ok(menu)
@@ -187,6 +241,7 @@ fn build_menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<Wry>> {
 
 fn handle_menu_event(app: &AppHandle, id: &str) {
     let shared = app.state::<Arc<Shared>>();
+    let service = shared.token_file.is_some();
     match id {
         "quit" => app.exit(0),
         "refresh" => shared.refresh.notify_one(),
@@ -204,10 +259,22 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             let _ = app.clipboard().write_text(text);
         }
         "copy-start" => {
-            let _ = app.clipboard().write_text(cmds::START);
+            let _ = app.clipboard().write_text(start_cmd(service));
         }
         "copy-logs" => {
-            let _ = app.clipboard().write_text(cmds::CHECK);
+            let _ = app.clipboard().write_text(check_cmd(service));
+        }
+        "copy-token" => {
+            // The operator's own account may not be able to read the file (the
+            // installer's default grants every local user, an icacls line can
+            // narrow it), so say which it was rather than copying nothing.
+            match shared.token_file.as_ref().map(|p| crate::config::read_token(p)) {
+                Some(Ok(token)) => {
+                    let _ = app.clipboard().write_text(token);
+                }
+                Some(Err(e)) => eprintln!("sukarfleet-tray: {e}"),
+                None => {}
+            }
         }
         _ => {}
     }

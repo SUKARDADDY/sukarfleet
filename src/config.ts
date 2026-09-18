@@ -11,8 +11,12 @@ import { ensureDir, log, readJsonFile } from './util';
 
 const CONFIG_FILE_MODE = 0o600;
 
+// SUKARFLEET_CONFIG_DIR names the DIRECTORY this machine keeps its identity in: the machine key,
+// its sealed .cred twin, the default secrets dir, and the config.json that SUKARFLEET_CONFIG (a
+// FILE path) can still point somewhere else. It exists for a daemon that runs as a service account
+// with no usable home, which is what a machine-wide install is.
 export function configDir(): string {
-  return join(homedir(), '.config', 'sukarfleet');
+  return process.env.SUKARFLEET_CONFIG_DIR ?? join(homedir(), '.config', 'sukarfleet');
 }
 
 export function stateDir(): string {
@@ -99,6 +103,9 @@ export function defaultConfig(machine: string): FleetConfig {
       ratePerMin: 20,
       uiEnabled: true,
       uiAssets: true,
+      // Absent by default: a per-user install has no gate, exactly as before. Only an installer
+      // that put this node where every local account can reach it writes a path here.
+      consoleTokenFile: undefined,
     },
   };
 }
@@ -325,6 +332,14 @@ function validateAdmin(raw: unknown): void {
   // fills in -- only a present-but-wrong-typed value is rejected.
   if (admin.uiAssets !== undefined && typeof admin.uiAssets !== 'boolean') {
     fail('admin.uiAssets must be a boolean');
+  }
+  // Same additive rule as uiAssets: absent means no console token gate at all, and only a
+  // present-but-wrong-typed value is rejected. An empty string is rejected too -- it reads as
+  // "gate on" while naming no file, which is a gate nobody can ever pass.
+  if (admin.consoleTokenFile !== undefined) {
+    if (typeof admin.consoleTokenFile !== 'string' || !admin.consoleTokenFile) {
+      fail('admin.consoleTokenFile must be a non-empty string');
+    }
   }
   // sshUser may legitimately be empty before the installer fills it in; the origin leg refuses
   // rather than the daemon failing to boot.

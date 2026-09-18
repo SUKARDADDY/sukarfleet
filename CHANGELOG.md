@@ -32,6 +32,46 @@ other. Anything else has to be read here first.
     file says so at the top, in plain text, above the payload. See
     [`SECURITY.md`](SECURITY.md#trust-model).
 
+- **A Windows installer that can install machine-wide.** One EXE,
+  `sukarfleet-setup-windows-x86_64.exe`, built by
+  [`.github/workflows/installer-windows.yml`](.github/workflows/installer-windows.yml) and asking
+  which scope you want. **Per-user** is the install Windows has always had here: a scheduled task
+  named `sukarfleet`, running as you, gone when you sign out. **Machine-wide** is new: a Windows
+  service named `sukarfleet-node`, start type `Automatic`, running as the virtual account
+  `NT SERVICE\sukarfleet-node` rather than as SYSTEM, up at boot with nobody signed in. It keeps one
+  fleet identity for the PC in `C:\ProgramData\sukarfleet\node` and one shared checkout at
+  `C:\AI_Agent`, and it can adopt an existing per-user install in place rather than pairing again.
+  New: `install/windows/sukarfleet.iss`, `Install-MachineNode.ps1`, `Uninstall-MachineNode.ps1`,
+  `Pins.ps1` and `sukarfleet-node.xml`. `Add-To-Fleet.cmd` and `Install-Sukarfleet.ps1` are
+  unchanged, and one-click enrollment still generates the `.cmd`.
+  - The EXE is **not signed**. SmartScreen warns, and the SHA256 the build prints is the check that
+    is available until a certificate exists.
+  - Uninstall removes the service, the program and the registry entries and keeps the node
+    directory, the shared checkout and the mesh service, and says so.
+
+- **A console token, for a node more than one account can reach.** A machine-wide node shares its
+  loopback with every account on the PC, and loopback is not a caller identity, so `/api/ui/*` and
+  `POST /mcp` now accept an optional bearer token. Set `admin.consoleTokenFile` and the node reads
+  that file and compares in constant time; leave it absent and nothing changes, which is what a
+  per-user install does. A refused request is `401` with `error: "console-token-required"`; the
+  browser console asks for the token on exactly that, holds it in `sessionStorage`, and the tray
+  takes `--token-file`. `POST /pair/hello`, `/health`, `/status` and the peer routes are untouched:
+  a machine that is pairing does not have the token yet. **Who may read that file on a machine-wide
+  install, and how to narrow it, is in [`SECURITY.md`](SECURITY.md).**
+
+- **`SUKARFLEET_CONFIG_DIR`.** The directory holding the machine key, the sealed credential and the
+  secrets directory can now be moved, which `SUKARFLEET_CONFIG` and `SUKARFLEET_STATE` could not do.
+  Absent, it is `~/.config/sukarfleet` exactly as before. The Windows service is what needed it: a
+  service account has no profile worth writing an identity into.
+
+- **CI builds the Windows installer and installs with it.**
+  `.github/workflows/installer-windows.yml` parses every `install/windows/*.ps1` under Windows
+  PowerShell 5.1 and PowerShell 7, compiles the EXE, then runs it silently in both scopes on the
+  runner and checks what it left behind: a scheduled task and a `/health` of 200 for per-user, a
+  running service and a `401` that turns into a `200` with the token for machine-wide. `ci.yml`
+  gains a `pwsh-parse` job so the same parse runs on every pull request. The scripts had no test
+  cover of any kind before this.
+
 - **The tray console on Windows.** A Windows machine gets the same tray icon and console window a
   Linux one gets, rather than a URL to paste into a browser.
   [`.github/workflows/tray.yml`](.github/workflows/tray.yml) builds the binary on a Windows runner,
@@ -89,6 +129,12 @@ other. Anything else has to be read here first.
 - The Linux tray pin lookup asks for `sukarfleet-tray-linux-` rather than `sukarfleet-tray-`, which
   the Windows lines also match. Two pins for one version and architecture are refused, not guessed
   between, so leaving it would have cost Linux its tray the moment Windows got one.
+- The Windows lane now fetches and bundles third-party code, which it did not before, so
+  [`THIRD-PARTY.md`](THIRD-PARTY.md) says so: the Inno Setup loader is bundled inside the EXE this
+  project publishes (licence text in [`LICENSES/InnoSetup.txt`](LICENSES/InnoSetup.txt)), and WinSW
+  2.12.0 and Bun are fetched against SHA256 pins in
+  [`install/easytier-pins.txt`](install/easytier-pins.txt), on the same terms as EasyTier. An
+  unfilled pin is a refusal, not an unverified download.
 
 ## [0.1.0] - 2026-09-05
 
