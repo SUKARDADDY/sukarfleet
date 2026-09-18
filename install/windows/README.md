@@ -177,9 +177,9 @@ value. It deliberately leaves three things and says so on the way out:
 - the shared root, which holds every repository the node was syncing.
 - the `easytier-fleet` service, which other machines may be routing through.
 
-A per-user uninstall removes the installed source tree. The scheduled task, the config, the key
-and the tray are per-user state, and the manual removal at the end of this file is what takes
-them out.
+A per-user uninstall stops and unregisters the `sukarfleet` scheduled task, stops the tray and
+removes its autostart value, then removes the installed source tree. It leaves the config, the
+machine key, the SSH key and every synced repository, and prints where they are.
 
 Whichever scope you removed, do one thing elsewhere: drop this machine from the other machines'
 `peers[]`, or they keep calling a number that no longer answers.

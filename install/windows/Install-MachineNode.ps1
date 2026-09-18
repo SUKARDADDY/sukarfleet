@@ -939,12 +939,18 @@ function Invoke-Adoption {
       Write-Die "'$name' would move to $dest, and there is already something there. Move or remove it, then re-run."
     }
     Write-Step "moving '$name' from $path to $dest : $($plan.Why)"
-    $r = Invoke-Native -Exe 'robocopy.exe' -Arguments @(
-      $path, $dest, '/MOVE', '/E', '/COPY:DAT', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
-    if ($r.ExitCode -ge 8) {
-      Write-Host ($r.Output | Out-String)
-      Write-Die "robocopy failed (exit $($r.ExitCode)) moving '$name'. The repo is in $path, $dest or both; check before re-running."
+    # A rename, never a copy: one volume, one atomic call, links kept as links. robocopy /MOVE
+    # deleted files out of the source as it copied them and then refused the tree's symlinks
+    # ("the path cannot be traversed because it contains an untrusted mount point", error 448),
+    # which left a real repository split across both paths. A rename either happens or does not.
+    $srcRoot = [IO.Path]::GetPathRoot($path)
+    $dstRoot = [IO.Path]::GetPathRoot($dest)
+    if ($srcRoot -ne $dstRoot) {
+      Write-Die "'$name' is on $srcRoot and the shared root is on $dstRoot. Adoption moves a repository by renaming it, which needs one volume. Pick a shared root on $srcRoot, or move the repository yourself and point the config at it, then re-run."
     }
+    if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue }
+    try { [IO.Directory]::Move($path, $dest) }
+    catch { Write-Die "could not move '$name' from $path to $dest : $($_.Exception.Message). Nothing was moved." }
     Invoke-Icacls -Arguments @($dest, '/reset', '/T', '/C', '/Q') -What "resetting the ACL on $dest"
     # A junction at the old path, so the account that owned this tree keeps its habits: its
     # shell, its editor and its agent sessions all still find it where it used to be.
