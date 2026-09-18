@@ -214,7 +214,8 @@ request, so leave the service account's own read entry alone. Nothing else in th
 
 **The service is not SYSTEM.** It runs as the virtual account `NT SERVICE\sukarfleet-node`, which has
 no password, cannot sign in interactively, and is granted only what the install gives it: modify on
-`C:\ProgramData\sukarfleet\node`, modify on the shared root, read and execute on the program files.
+`C:\ProgramData\sukarfleet\node`, modify on the shared root, and read, execute and write-attributes on the
+program files (Bun opens the file it runs with more than read access; write-data is not granted).
 Code execution inside the daemon is code execution as that account, not as the machine. Where the
 virtual account cannot be granted the service logon right, the installer falls back to `LocalService`
 and says so in its log, and `sc qc sukarfleet-node` is how you check which one you got.
