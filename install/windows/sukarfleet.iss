@@ -273,6 +273,11 @@ end;
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
+  // A silent install walks every page with nobody at the keyboard, and a MsgBox raised from
+  // [Code] is not one of the boxes /SUPPRESSMSGBOXES answers: it waits forever. Seen on a
+  // hosted runner and reproduced on a real machine. Silent runs take their answers from the
+  // command line, and the scripts refuse for themselves when an answer is missing.
+  if WizardSilent then Exit;
   if CurPageID = PageIdentity.ID then
   begin
     if Trim(PageIdentity.Values[0]) = '' then
