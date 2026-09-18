@@ -399,6 +399,25 @@ jobs:
           }
           if ($svc.Status -ne 'Running') {
             Write-Host "service sukarfleet-node is $($svc.Status) after 60 seconds"
+            # The service controller says why a service would not start, and it says
+            # it in the System event log, not to the process that asked. Logon
+            # failure, a wrapper that died before its first line, a timeout: each
+            # is a different fix, and the wrapper log cannot tell them apart.
+            Write-Host '--- Service Control Manager events (last 15 minutes) ---'
+            Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; StartTime = (Get-Date).AddMinutes(-15) } -ErrorAction SilentlyContinue |
+              Where-Object { $_.Message -match 'sukarfleet' } |
+              ForEach-Object { Write-Host "  $($_.TimeCreated) id=$($_.Id) $($_.Message -replace '\s+', ' ')" }
+            Write-Host '--- Application log errors (last 15 minutes) ---'
+            Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 1, 2; StartTime = (Get-Date).AddMinutes(-15) } -ErrorAction SilentlyContinue |
+              Select-Object -First 12 |
+              ForEach-Object { Write-Host "  $($_.TimeCreated) $($_.ProviderName): $(($_.Message -replace '\s+', ' ').Substring(0, [Math]::Min(400, ($_.Message -replace '\s+', ' ').Length)))" }
+            Write-Host '--- sc qc / showsid ---'
+            sc.exe qc sukarfleet-node
+            sc.exe showsid sukarfleet-node
+            Write-Host '--- ACLs ---'
+            icacls.exe 'C:\ProgramData\sukarfleet\node'
+            icacls.exe 'C:\Program Files\sukarfleet'
+            icacls.exe 'C:\Program Files\sukarfleet\sukarfleet-node.xml'
             $logs = 'C:\ProgramData\sukarfleet\node\logs'
             if (Test-Path -LiteralPath $logs) {
               Get-ChildItem -LiteralPath $logs | ForEach-Object {
