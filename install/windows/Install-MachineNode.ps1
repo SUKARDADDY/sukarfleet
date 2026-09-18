@@ -589,6 +589,12 @@ if (-not $haveWinsw) {
     Start-Sleep -Seconds 2
   }
   Move-Item -LiteralPath $winswTmp -Destination $WinSwExe -Force
+  # A file moved within a volume keeps the ACL of the directory it came from, so a binary that
+  # arrived from a temp directory carries none of the entries Program Files would have given it
+  # and the service controller answers "Access is denied" when it tries to start it. Seen on a
+  # fresh hosted runner; a second run on a real machine had already re-propagated the grant and
+  # hid it. A reset makes the file inherit from where it now lives.
+  Invoke-Icacls -Arguments @($WinSwExe, '/reset', '/Q') -What "resetting the ACL on $WinSwExe"
   Write-Step "installed WinSW as $WinSwExe (SHA256 pinned)"
 }
 
@@ -1282,6 +1288,8 @@ if ($SkipTray) {
       Start-Sleep -Seconds 1
     }
     Move-Item -LiteralPath $trayTmp -Destination $TrayExe -Force
+    # Same reason as the WinSW binary above: every account on the machine starts this tray.
+    Invoke-Icacls -Arguments @($TrayExe, '/reset', '/Q') -What "resetting the ACL on $TrayExe"
     $tray.Installed = $true
     Write-Step "installed $TrayExe (SHA256 pinned)"
   } catch {
