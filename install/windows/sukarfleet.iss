@@ -81,9 +81,6 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Fil
 
 [Code]
 
-const
-  AbsentMarker = '@@absent@@';
-
 var
   PageIdentity: TInputQueryWizardPage;
   PageRole: TInputOptionWizardPage;
@@ -103,11 +100,25 @@ begin
   Result := ExpandConstant('{param:' + Name + '|' + Default + '}');
 end;
 
-// A switch with no '=' still counts as present: {param:X|marker} gives back an empty string for
-// /X and the marker only when /X was never passed at all.
+// A bare switch such as /SKIPMESH never reaches {param:}: that constant only sees name=value
+// pairs, and answered "absent" for every switch on the first real run. So the command line is
+// walked by hand, accepting both /NAME and /NAME=anything, case-insensitively.
 function HasSwitch(const Name: String): Boolean;
+var
+  I: Integer;
+  P: String;
 begin
-  Result := ParamValue(Name, AbsentMarker) <> AbsentMarker;
+  Result := False;
+  for I := 1 to ParamCount do
+  begin
+    P := ParamStr(I);
+    if (CompareText(P, '/' + Name) = 0) or
+       (CompareText(Copy(P, 1, Length(Name) + 2), '/' + Name + '=') = 0) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
 end;
 
 // What the wizard collected beats what the command line said, because a person who just typed
