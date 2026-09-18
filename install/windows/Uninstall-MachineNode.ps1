@@ -7,13 +7,18 @@
   Run by the uninstaller of install/windows/sukarfleet.iss in its machine-wide scope, and safe to
   run by hand.
 
-  It takes away the moving parts: the service, the WinSW wrapper, the Bun it fetched, the tray
-  binary and the registry value that started it. It leaves the data, on purpose, because an
-  uninstall that deletes a fleet identity and a synced tree is not an uninstall, it is a loss:
+  It takes away the moving parts, each named rather than swept: the service, the WinSW wrapper and
+  its xml, the Bun it fetched, the tray binary and the registry value that started it. It does not
+  remove the directory those sit in, because Inno's own uninstaller is running from a subdirectory
+  of it. It leaves the data, on purpose, because an uninstall that deletes a fleet identity and a
+  synced tree is not an uninstall, it is a loss:
 
     C:\ProgramData\sukarfleet\node   identity, config, state, audit log, console token
     the shared root                  every repo the node was syncing
     easytier-fleet                   the mesh transport, which other machines may route through
+    C:\ProgramData\Git\config        the safe.directory line every account reads
+    profile directories              the traverse entries that open the path to a repo adopted
+                                     in place
 
   It says all of that at the end, and it says the thing people forget: every other machine in the
   fleet still lists this one in its peers[], and will keep calling a number that stops answering.
@@ -55,8 +60,12 @@ function Test-Elevated {
 $ServiceId    = 'sukarfleet-node'
 $MeshService  = 'easytier-fleet'
 $ProgramRoot  = Join-Path $env:ProgramFiles 'sukarfleet'
+$BunDir       = Join-Path $ProgramRoot 'bun'
 $WinSwExe     = Join-Path $ProgramRoot 'sukarfleet-node.exe'
+$WinSwXml     = Join-Path $ProgramRoot 'sukarfleet-node.xml'
+$TrayExe      = Join-Path $ProgramRoot 'sukarfleet-tray.exe'
 $NodeDir      = Join-Path $env:ProgramData 'sukarfleet\node'
+$SystemGitConfig = Join-Path $env:ProgramData 'Git\config'
 $HklmRunKey   = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
 $RunValueName = 'sukarfleet-tray'
 $StartMenuLnk = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\sukarfleet console.lnk'
@@ -114,13 +123,32 @@ if (Test-Path -LiteralPath $StartMenuLnk) {
 }
 
 # --- the binaries -----------------------------------------------------------
-if (Test-Path -LiteralPath $ProgramRoot) {
+# By name, one at a time, and never the tree they sit in. Inno installs the application into
+# {app}, which is a subdirectory of $ProgramRoot, and unins000.exe -- the process running this
+# script -- lives in there with it. A recursive Remove-Item on $ProgramRoot deletes the
+# uninstaller out from under itself mid-run and leaves an uninstall entry pointing at nothing.
+# Inno removes {app} and the uninstaller once this script returns, and the [UninstallDelete]
+# entry in sukarfleet.iss takes $ProgramRoot itself away after that, if it is empty by then.
+$installedByUs = @(
+  $BunDir,
+  $WinSwExe,
+  $WinSwXml,
+  $TrayExe
+)
+$removed = @()
+foreach ($item in $installedByUs) {
+  if (-not (Test-Path -LiteralPath $item)) { continue }
   try {
-    Remove-Item -LiteralPath $ProgramRoot -Recurse -Force
-    Write-Step "removed $ProgramRoot (the service wrapper, Bun and the tray)"
+    Remove-Item -LiteralPath $item -Recurse -Force
+    $removed += (Split-Path -Leaf $item)
   } catch {
-    Write-Warn "could not remove $ProgramRoot : $($_.Exception.Message). Something still has a file in there open; delete it after a reboot."
+    Write-Warn "could not remove $item : $($_.Exception.Message). Something still has it open; delete it after a reboot."
   }
+}
+if ($removed.Count -gt 0) {
+  Write-Step "removed $($removed -join ', ') from $ProgramRoot"
+} else {
+  Write-Note "nothing of the machine-wide install left to remove from $ProgramRoot"
 }
 
 # --- what is deliberately still here ----------------------------------------
@@ -130,7 +158,7 @@ if ($mesh) { $meshState = [string] $mesh.Status }
 
 Write-Host ''
 Write-Host '  ------------------------------------------------------------------------'
-Write-Host '  The machine-wide sukarfleet node is removed. Three things were left alone,'
+Write-Host '  The machine-wide sukarfleet node is removed. These were left alone,'
 Write-Host '  because deleting them would be losing data rather than uninstalling software:'
 Write-Host ''
 Write-Host "    $NodeDir"
@@ -142,6 +170,15 @@ Write-Host '      Every repository the node was syncing. Nothing in it was touch
 Write-Host ''
 Write-Host "    the '$MeshService' service ($meshState)"
 Write-Host '      The mesh transport. Other machines may be routing through this one.'
+Write-Host ''
+Write-Host "    the safe.directory line in $SystemGitConfig"
+Write-Host '      It is what lets every account on this machine run git in the shared tree.'
+Write-Host '      That file is not ours to rewrite, and the line is harmless on its own.'
+Write-Host ''
+Write-Host '    the traverse entries on the profile directories above any repository that was'
+Write-Host '    adopted in place'
+Write-Host '      One access entry per directory, for the service account, opening the path and'
+Write-Host '      nothing in it. They are left because the repositories they lead to are left.'
 Write-Host ''
 Write-Host '  Delete them by hand if you mean it:'
 Write-Host "    Remove-Item -Recurse `"$NodeDir`""

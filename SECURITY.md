@@ -187,13 +187,24 @@ signed in. A machine-wide install is a Windows service that runs whether or not 
 with one fleet identity for the whole PC. This section is the second one.
 
 **Who may drive it.** Loopback is not a caller identity, and on a machine-wide node every local
-account shares that loopback. So the node requires a bearer token on `/api/ui/*` and on `POST /mcp`.
-The token is 32 random bytes, base64url, generated at install and written to
-`C:\ProgramData\sukarfleet\node\console-token`. A request without it is refused with 401 and a body
+account shares that loopback. So the node requires a bearer token on `/api/ui/*`, on `POST /mcp` and
+on `GET /exec/audit/tail`. The token is 32 random bytes, base64url, generated at install and written
+to `C:\ProgramData\sukarfleet\node\console-token`. A request without it is refused with 401 and a body
 naming `console-token-required`; the browser console asks for the token on that refusal and the tray
-reads the file. `/health`, `/status` and the peer routes are unchanged: `/status` stays loopback-only,
-`/health` stays open, and `POST /pair/hello` is never gated, because a machine that is pairing does
-not have the token yet.
+reads the file.
+
+Three loopback routes stay ungated on a machine-wide node, and that is the whole list:
+
+| Route | Why it is not gated |
+| --- | --- |
+| `GET /health` | `{ ok: true }` and nothing else. It is what a service manager polls, and it says nothing a local account could not learn from `Get-Service`. |
+| `GET /status` | Loopback-only, as before: this machine's own presence, peers and faults, which is the read every local account already gets from the console after pasting the token. It carries no secret and no admin verb. |
+| `POST /pair/hello` | A frozen mesh route, authenticated by the MAC on its own payload. A machine that is pairing does not have this node's console token and never will, so a gate here would make pairing with a machine-wide node impossible by construction. |
+
+`GET /exec/audit/tail` is **gated**, and was not before this scope existed. It returns this
+machine's whole signed audit log: every admin call, every peer it has talked to. On a per-user node
+that is the owner's own record; on a machine-wide node, reachable by every account on the PC, it is
+the node's operating history, and it is behind the same token as the console.
 
 **The token file is readable by every local account, and that is a decision rather than an
 oversight.** Its ACL grants `BUILTIN\Users` read. The reasoning: on a personal machine every account

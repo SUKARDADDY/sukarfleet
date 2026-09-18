@@ -231,9 +231,11 @@ async function generateMachineKey(machine: string): Promise<MachineKey> {
 // A key belonging to a different machine name is still returned as-is (identity is bound to
 // the key material, not the config-supplied name); a mismatch is logged, not fixed silently.
 //
-// `opts.keyPath` is an additive, non-contract test seam: configDir() has no env override
-// (unlike stateDir()), so tests need a way to avoid touching the real machine's
-// ~/.config/sukarfleet/machine-key.json. Omit it for normal use.
+// `opts.keyPath` is an additive, non-contract test seam. configDir() does read
+// SUKARFLEET_CONFIG_DIR -- a machine-wide install points it at the node's own directory -- but
+// that variable belongs to whoever started the daemon, and a test that set it would be changing
+// the process's own environment to move one file. This seam moves the one file. Omit it for
+// normal use.
 //
 // `opts.decryptCred` is likewise an additive test seam for the sealed-blob path (see
 // trySealedMachineKey above) -- omit it for normal use, where the real `systemd-creds decrypt`

@@ -63,6 +63,7 @@ import { Pairing } from './pairing';
 import { currentPlatform } from './platform';
 import {
   UiRoutes,
+  consoleTokenRefusal,
   elevatedInstallCommand,
   makeConsoleTokenCheck,
   type ConsoleTokenCheck,
@@ -82,6 +83,42 @@ const HOSTKEY_ALERTS_FILE = 'admin-hostkey-alerts.json';
 // Operator-facing loopback routes, matched EXACTLY. A prefix test here shadowed the mesh route
 // /exec/membership-witness (see the dispatch site for the full account).
 const OPERATOR_LOOPBACK_ROUTES = new Set(['/exec/audit/tail']);
+
+// The operator loopback route family, lifted out of the fetch handler so it can be driven by a
+// test without standing a daemon up. Three gates, in this order:
+//
+//   locality  loopback is a network boundary, and off-box is answered before anything else,
+//   CSRF      a page in a browser on this machine is a local caller too (see rejectCrossSite),
+//   identity  and on a machine-wide node loopback stops saying WHICH local account is calling.
+//
+// That last one is why `tokenCheck` is here. `audit tail` returns this machine's whole signed
+// audit log -- every admin call, every peer it has talked to -- and on a machine-wide install
+// every account on the PC can reach 127.0.0.1. It carries the same gate as /api/ui/* and POST
+// /mcp, from the same check object, and answers the same refusal bytes. Absent, which is every
+// per-user install, it passes: loopback stays the whole boundary, exactly as before.
+export async function handleOperatorLoopbackRoute(
+  req: Request,
+  url: URL,
+  deps: {
+    isLoopback: () => boolean;
+    readAudit: () => Promise<AuditEntry[]>;
+    tokenCheck?: ConsoleTokenCheck;
+  },
+): Promise<Response> {
+  if (!deps.isLoopback()) return new Response('forbidden', { status: 403 });
+  const csrf = rejectCrossSite(req);
+  if (csrf) return csrf;
+  if (deps.tokenCheck && !(await deps.tokenCheck(req))) return consoleTokenRefusal();
+
+  if (req.method === 'GET' && url.pathname === '/exec/audit/tail') {
+    const limitParam = Number(url.searchParams.get('limit'));
+    const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.floor(limitParam) : 20;
+    const all = await deps.readAudit();
+    return jsonResponse({ entries: all.slice(-limit).reverse() }); // most-recent-first
+  }
+
+  return new Response('not found', { status: 404 });
+}
 
 // Rejects any request that a browser could have issued cross-origin. Loopback-only is a network
 // boundary, not an authentication boundary: a web page the operator visits can POST to
@@ -1372,18 +1409,11 @@ async function main(): Promise<void> {
     // and would otherwise land here with operator authority, so any Origin or cross-site fetch
     // marker is rejected outright.
     if (OPERATOR_LOOPBACK_ROUTES.has(url.pathname)) {
-      if (!isLoopback(srv, req)) return new Response('forbidden', { status: 403 });
-      const csrf = rejectCrossSite(req);
-      if (csrf) return csrf;
-
-      if (req.method === 'GET' && url.pathname === '/exec/audit/tail') {
-        const limitParam = Number(url.searchParams.get('limit'));
-        const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.floor(limitParam) : 20;
-        const all = await auditLog.readAll();
-        return jsonResponse({ entries: all.slice(-limit).reverse() }); // most-recent-first
-      }
-
-      return new Response('not found', { status: 404 });
+      return await handleOperatorLoopbackRoute(req, url, {
+        isLoopback: () => isLoopback(srv, req),
+        readAudit: () => auditLog.readAll(),
+        tokenCheck,
+      });
     }
 
     if (url.pathname.startsWith('/git/')) {

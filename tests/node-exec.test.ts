@@ -2,12 +2,16 @@
 // Pure decision points extracted from node.ts's loops, pinned here without spinning up the daemon
 // (the import.meta.main guard on node.ts is what makes importing it for these functions safe).
 
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   anchorDaemonOnlineFromGossip,
   buildAdminLaneView,
   chooseBindHost,
   classifyBindError,
+  handleOperatorLoopbackRoute,
   meshBindFallbackWarning,
   nextAnchorDownStreak,
   nextWatchdogGrace,
@@ -16,9 +20,11 @@ import {
   TAKEOVER_STREAK,
   watchdogShouldPing,
 } from '../src/node';
+import { makeConsoleTokenCheck } from '../src/uiserve';
 import { clockDriftMs } from '../src/util';
 import { SUSPEND_JUMP_MS } from '../src/transport';
 import { defaultConfig } from '../src/config';
+import type { AuditEntry } from '../src/types';
 import { networkInterfaces } from 'node:os';
 
 describe('shouldPushThisTick (P3 single-pusher policy, Class A: gossip-keyed takeover)', () => {
@@ -480,5 +486,104 @@ describe('the real Bun.serve failure this fix reads', () => {
     expect(meshBindFallbackWarning('192.0.2.5')).toBe(
       'node: mesh address 192.0.2.5 is not on any interface yet -- listening on all interfaces until the mesh is up and the daemon restarts',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The audit tail is an operator surface, and on a machine-wide node loopback no longer says which
+// account is on the other end of it. What is pinned here is the additive rule: no check
+// configured (every per-user install, and every caller that existed before the gate) answers
+// exactly as it did before, and a configured check refuses without the bearer token and answers
+// with it. The 401 body is the same one the console and the tray branch on.
+// ---------------------------------------------------------------------------
+
+describe('handleOperatorLoopbackRoute (the console token gate on /exec/audit/tail)', () => {
+  const TOKEN = 'Fq2n8s-rL4kWZ0mJ7pX1dT6yB3vHcA9e';
+  const REFUSAL =
+    '{"error":"console-token-required","message":"This node is installed machine-wide. Paste its console token."}';
+  const TAIL = new URL('http://127.0.0.1:7710/exec/audit/tail');
+
+  const entries: AuditEntry[] = [
+    { v: 1, machine: 'alpha', seq: 1, tsMs: 1000, kind: 'admin.run', detail: {}, sigB64: 'sig-1' },
+    { v: 1, machine: 'alpha', seq: 2, tsMs: 2000, kind: 'admin.run', detail: {}, sigB64: 'sig-2' },
+  ];
+
+  const dirs: string[] = [];
+  afterEach(() => {
+    while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  function tokenFile(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'sukarfleet-audit-token-'));
+    dirs.push(dir);
+    const file = join(dir, 'console-token');
+    // The trailing newline the installer writes, so the trim is exercised rather than assumed.
+    writeFileSync(file, `${contents}\n`);
+    return file;
+  }
+
+  function deps(gated: boolean, loopback = true) {
+    return {
+      isLoopback: () => loopback,
+      readAudit: async () => entries,
+      tokenCheck: gated ? makeConsoleTokenCheck(tokenFile(TOKEN)) : undefined,
+    };
+  }
+
+  function get(headers: Record<string, string> = {}): Request {
+    return new Request(TAIL.toString(), { method: 'GET', headers });
+  }
+
+  test('no check configured: 200 and the tail, exactly as before', async () => {
+    const res = await handleOperatorLoopbackRoute(get(), TAIL, deps(false));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { entries: AuditEntry[] };
+    expect(body.entries.map((e) => e.seq)).toEqual([2, 1]);
+  });
+
+  test('check configured, no Authorization header: 401 with the contract bytes', async () => {
+    const d = deps(true);
+    let read = 0;
+    const res = await handleOperatorLoopbackRoute(get(), TAIL, {
+      ...d,
+      readAudit: async () => {
+        read += 1;
+        return entries;
+      },
+    });
+    expect(res.status).toBe(401);
+    expect(await res.text()).toBe(REFUSAL);
+    expect(res.headers.get('www-authenticate')).toBe('Bearer realm="sukarfleet"');
+    // The log was never opened for a caller that could not name itself.
+    expect(read).toBe(0);
+  });
+
+  test('check configured, the right token: 200 and the tail', async () => {
+    const res = await handleOperatorLoopbackRoute(
+      get({ authorization: `Bearer ${TOKEN}` }),
+      TAIL,
+      deps(true),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { entries: AuditEntry[] };
+    expect(body.entries.map((e) => e.seq)).toEqual([2, 1]);
+  });
+
+  test('check configured, the wrong token: 401', async () => {
+    const res = await handleOperatorLoopbackRoute(
+      get({ authorization: 'Bearer not-the-token' }),
+      TAIL,
+      deps(true),
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test('off-box is 403 before the token is even looked at', async () => {
+    const res = await handleOperatorLoopbackRoute(
+      get({ authorization: `Bearer ${TOKEN}` }),
+      TAIL,
+      deps(true, false),
+    );
+    expect(res.status).toBe(403);
   });
 });
