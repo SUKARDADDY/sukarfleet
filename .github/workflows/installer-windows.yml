@@ -39,6 +39,11 @@ on:
 jobs:
   windows:
     runs-on: windows-2022
+    # The secrets context is not available in a step's if, so the token is
+    # lifted into the job environment and the sign step tests that instead.
+    # No secret configured means an empty string, and the step is skipped.
+    env:
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -445,10 +450,10 @@ jobs:
       # signing changes the bytes, so the release that ships a signed EXE pins
       # the hash of what it uploaded, not of what this run built.
       - name: sign the installer
-        if: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+        if: ${{ env.SIGNPATH_API_TOKEN != '' }}
         uses: signpath/github-action-submit-signing-request@v1
         with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          api-token: ${{ env.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
           project-slug: sukarfleet
           signing-policy-slug: test-signing
