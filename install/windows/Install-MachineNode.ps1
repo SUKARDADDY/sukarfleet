@@ -517,7 +517,7 @@ Write-Step "shared root $SharedRoot (owned by Administrators; the service and ev
 # ---------------------------------------------------------------------------
 
 if (-not (Test-Path -LiteralPath $ProgramRoot)) { [void] (New-Item -ItemType Directory -Force -Path $ProgramRoot) }
-Invoke-Icacls -Arguments @($ProgramRoot, '/grant', "*${ServiceSid}:(OI)(CI)(RX)") -What "letting the service account read $ProgramRoot"
+[void] (Grant-SidAccess -Path $ProgramRoot -Sid $ServiceSid -Rights 'ReadAndExecute' -Inherit -What "letting the service account read $ProgramRoot")
 
 if (Test-Path -LiteralPath $BunExe) {
   Write-Note "Bun already at $BunExe - left untouched (delete that folder to force a re-fetch)"
