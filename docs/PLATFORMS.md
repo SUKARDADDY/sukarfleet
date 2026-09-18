@@ -95,9 +95,43 @@ refuses to give.
 So: the seam says **unsupported** out loud, and sync is unaffected. Run the sync half on Windows and
 drive admin from a Linux machine.
 
-The installer is [`install/windows/`](../install/windows/README.md): double-click
-`Add-To-Fleet.cmd`. It writes `admin.enabled: false` rather than leaving a lane switched on that
-refuses at the first real call.
+**Installing: two scopes, one EXE.** `sukarfleet-setup-windows-x86_64.exe` from the release asks
+which one you want, and they install different things.
+
+- **Per-user.** The daemon runs as you, from a scheduled task named `sukarfleet`, started when you
+  sign in and gone when you sign out. The program sits in `%LOCALAPPDATA%\sukarfleet\app` and the
+  config, identity and state under your profile. This is what every Windows install before this one
+  did, and it needs no administrator.
+- **Machine-wide.** The daemon runs as a Windows service named `sukarfleet-node`, start type
+  `Automatic`, up at boot whether or not anybody signs in. It runs as the virtual account
+  `NT SERVICE\sukarfleet-node`, not as SYSTEM. The program sits in `C:\Program Files\sukarfleet`,
+  the config, identity and state in `C:\ProgramData\sukarfleet\node`, and the synced repositories in
+  one shared tree at `C:\AI_Agent`, so two accounts on the PC work in the same checkout. One fleet
+  identity per PC rather than one per account. It costs one UAC prompt, and it can adopt an existing
+  per-user install rather than pairing again.
+
+Either scope writes `admin.enabled: false` rather than leaving a lane switched on that refuses at the
+first real call.
+
+A machine-wide node is reachable on loopback by every account on the PC, so it gates `/api/ui/*` and
+`POST /mcp` behind a token file at `C:\ProgramData\sukarfleet\node\console-token`. Who may read that
+file by default, and the one `icacls` line that narrows it, are in
+[`SECURITY.md`](../SECURITY.md#the-machine-wide-windows-node).
+
+**The EXE is not signed.** SmartScreen shows a "Windows protected your PC" page on a downloaded
+installer and hides the run button behind "More info". The check that is available is the SHA256:
+the build prints it, and a release pins it in
+[`install/easytier-pins.txt`](../install/easytier-pins.txt). Signing waits on a code-signing
+certificate the project does not have yet.
+
+[`install/windows/Add-To-Fleet.cmd`](../install/windows/README.md) is still there and still works. It
+is the per-user install as one double-clickable file, and it is what the console's one-click
+enrollment generates for a machine that is not in the fleet yet.
+
+**Where the logs are.** A machine-wide node writes to `C:\ProgramData\sukarfleet\node\logs`, rolled
+by size, five files kept. A per-user node writes nowhere: it is a scheduled task rather than a
+service, and Windows has no journal, so to read what a per-user node is saying, stop the task and run
+it in the foreground.
 
 The console is the tray, as on Linux. The binary is built on a Windows runner by
 [`.github/workflows/tray.yml`](../.github/workflows/tray.yml), because a Windows binary
@@ -108,10 +142,9 @@ window itself is a WebView2 host: Windows 11 ships that runtime, Windows 10 may 
 installer looks for it and says so rather than letting the window silently never appear.
 
 Two differences you will notice. Left click opens the console here and opens the menu on Linux,
-which is each platform's own convention. And the tray's offer to copy a log command for a node that
-has stopped answering copies `Get-ScheduledTaskInfo` instead: Windows has no journal and nothing
-captures the node's output, so there is no log file to name. To read what the node is saying, stop
-the task and run it in the foreground.
+which is each platform's own convention. And the tray's offer to copy a command for a node that has
+stopped answering copies Windows commands rather than systemd's: `Get-ScheduledTaskInfo` for a
+per-user node, `Get-Service sukarfleet-node` for a machine-wide one.
 
 **Pairing works on Windows as of `e6a2841`.** It did not before, and the reason is worth keeping:
 a pairing bundle must carry at least one SSH host key, and a Windows machine has none, because
@@ -142,6 +175,11 @@ Two Linux tools the daemon used to reach for are simply absent here, so it reads
 from `node:os` rather than `ip -json addr` and vets its clock with `w32tm /query /status` rather
 than `timedatectl`, reporting a stopped or unreadable time service as unknown, which holds
 auto-commit and logs the reason instead of stopping the daemon.
+
+**The smoke target is a Windows 10 Pro laptop** with Windows PowerShell 5.1 and no PowerShell 7,
+because that is the oldest thing in this fleet and 5.1 rejects syntax 7 accepts. CI parses every
+installer script under both, and installs with the EXE in both scopes on a Windows runner, before any
+of it reaches that laptop.
 
 **Observed on a Windows 11 Pro VM, 2026-09-05.** `Install-Sukarfleet.ps1` completed both its user
 stage and its elevated stage under Windows PowerShell 5.1.26100 and under pwsh 7.6.5, as the real

@@ -137,6 +137,12 @@ const COPY = {
   restarting: 'Restarting. This page reconnects on its own.',
   requestFailed: (status) => `The daemon answered ${status}.`,
   networkFailed: 'The daemon did not answer.',
+
+  // The prompt's own heading is whatever the daemon said in the refusal body, so the console and
+  // the tray always read the same sentence. These are the strings only this page has.
+  consoleTokenNeeded: 'This node needs its console token.',
+  consoleTokenEmpty: 'Paste the token first.',
+  consoleTokenRejected: 'That token was not accepted. Paste it again.',
 };
 
 // A client-side tripwire, honestly labelled: it makes a destructive command a deliberate act,
@@ -256,6 +262,66 @@ function yesNo(v) {
   return v ? 'yes' : 'no';
 }
 
+// ── console token ─────────────────────────────────────────────────────────
+//
+// A machine-wide node is reachable by every account on the PC, so it answers the console API with
+// 401 console-token-required until the caller presents its token. The token is kept in
+// sessionStorage and nowhere else: it dies with the tab, it is never written to disk by this page,
+// and a forwarded tab keeps its own copy per port, which is the same rule every other path here
+// follows. sessionStorage throws in a few hardened configurations, so every touch is guarded.
+
+const CONSOLE_TOKEN_KEY = 'sukarfleetConsoleToken';
+
+function readConsoleToken() {
+  try {
+    return sessionStorage.getItem(CONSOLE_TOKEN_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function writeConsoleToken(token) {
+  try {
+    if (token) sessionStorage.setItem(CONSOLE_TOKEN_KEY, token);
+    else sessionStorage.removeItem(CONSOLE_TOKEN_KEY);
+  } catch {
+    // Nothing to do: the request below still carries the token, the next one prompts again.
+  }
+}
+
+// `message` is the daemon's own refusal sentence, so the heading says what the daemon said.
+function promptConsoleToken(message, note, noteKind) {
+  const form = $('console-token-form');
+  if (!form) return;
+  if (message) setText('console-token-label', message);
+  result('console-token-result', note || '', noteKind || '');
+  const opening = form.hidden;
+  show(form, true);
+  // The poll runs every three seconds while the gate is closed, so this never clears the field and
+  // never takes focus twice. Only the first prompt moves the cursor.
+  const input = $('console-token-input');
+  if (opening && input) input.focus();
+}
+
+function wireConsoleToken() {
+  const form = $('console-token-form');
+  if (!form) return;
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const input = $('console-token-input');
+    const token = ((input && input.value) || '').trim();
+    if (!token) { result('console-token-result', COPY.consoleTokenEmpty, 'bad'); return; }
+    writeConsoleToken(token);
+    result('console-token-result', '', '');
+    // A call that gets through hides this form (see api). A wrong token re-prompts through the same
+    // path, so the form still being here is the whole failure report.
+    await pollState();
+    if (!form.hidden) return;
+    if (input) input.value = '';
+    await refreshScreen(activeScreen());
+  });
+}
+
 // ── transport ─────────────────────────────────────────────────────────────
 
 class ApiError extends Error {
@@ -279,6 +345,8 @@ async function api(path, opts) {
     init.headers['content-type'] = 'application/json';
     init.body = JSON.stringify(o.body);
   }
+  const sent = readConsoleToken();
+  if (sent) init.headers.authorization = `Bearer ${sent}`;
   let res;
   try {
     res = await fetch(path, init);
@@ -290,10 +358,24 @@ async function api(path, opts) {
   if (text) {
     try { data = JSON.parse(text); } catch { data = null; }
   }
+  if (res.status === 401 && data && data.error === 'console-token-required') {
+    // Drop the stored token only when this very request carried the one still on file. A poll that
+    // left before the operator finished typing must not wipe what they just pasted.
+    const stale = Boolean(sent) && sent === readConsoleToken();
+    if (stale) writeConsoleToken('');
+    promptConsoleToken(
+      typeof data.message === 'string' ? data.message : COPY.consoleTokenNeeded,
+      stale ? COPY.consoleTokenRejected : '',
+      stale ? 'bad' : '',
+    );
+    throw new ApiError(401, typeof data.message === 'string' ? data.message : COPY.consoleTokenNeeded);
+  }
   if (!res.ok) {
     const msg = data && typeof data.message === 'string' ? data.message : COPY.requestFailed(res.status);
     throw new ApiError(res.status, msg);
   }
+  // An answered call is the only proof the gate is open, or that there is no gate at all.
+  show($('console-token-form'), false);
   return data;
 }
 
@@ -1345,6 +1427,7 @@ setInterval(() => {
 }, 1000);
 
 wireNav();
+wireConsoleToken();
 wireSetup();
 wirePair();
 wireCredentials();

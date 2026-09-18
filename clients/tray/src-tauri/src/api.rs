@@ -63,6 +63,14 @@ fn network_error() -> ApiResponse {
     }
 }
 
+/// The request never left this process, so it carries no daemon status. Status
+/// 0 is the bridge's existing "no answer" value; the message names the reason.
+/// Nothing is logged here: this function serves the credentials route too, and
+/// the poll loop reports the same fault on the tray itself.
+fn local_error(message: String) -> ApiResponse {
+    ApiResponse { status: 0, body: serde_json::json!({ "message": message }) }
+}
+
 #[tauri::command]
 pub async fn api_call(
     state: tauri::State<'_, Arc<Shared>>,
@@ -84,6 +92,15 @@ pub async fn api_call(
         "DELETE" => http.delete(&url),
         _ => return Err("refused: unsupported method".into()),
     };
+    // A machine-wide node gates /api/ui/* behind a bearer token. Read the file
+    // per call so a rotated token needs no restart, and report an unreadable
+    // file as a refusal rather than firing a request that can only 401.
+    if let Some(p) = &state.token_file {
+        match crate::config::read_token(p) {
+            Ok(t) => req = req.bearer_auth(t),
+            Err(e) => return Ok(local_error(e)),
+        }
+    }
     // JSON bodies always declare application/json; bodyless requests carry no
     // Content-Type at all (a body with no CT is a 415 at the daemon).
     if let Some(b) = body {

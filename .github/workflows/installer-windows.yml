@@ -1,0 +1,458 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Builds the Windows installer and then installs with it, twice, in both scopes.
+#
+# The build is the easy half. The half worth a runner is the smoke: the installer
+# is PowerShell driven by an Inno Setup script, neither of which any test can
+# reach, so the only honest check is to run it on a Windows machine and ask the
+# machine what happened. Per-user must end with a scheduled task and a node
+# answering on loopback. Machine-wide must end with a service running under its
+# own account and a node that refuses an unauthenticated console call.
+#
+# The scripts are parsed twice before any of that, under Windows PowerShell 5.1
+# and under PowerShell 7. The smoke target is a Windows 10 laptop that has 5.1
+# and nothing else, and 5.1 rejects syntax 7 accepts. A parse under 7 alone would
+# pass a script that cannot run where it has to run.
+#
+# The upload is an artifact, never a release asset, for the same reason as
+# tray.yml: cutting a release is a deliberate act by a person, and it is the step
+# that fills the SHA256 this job prints into install/easytier-pins.txt.
+name: installer-windows
+
+on:
+  push:
+    paths:
+      - 'install/windows/**'
+      - 'install/easytier-pins.txt'
+      - 'src/**'
+      - 'ui/**'
+      - '.github/workflows/installer-windows.yml'
+  pull_request:
+    paths:
+      - 'install/windows/**'
+      - 'install/easytier-pins.txt'
+      - 'src/**'
+      - 'ui/**'
+      - '.github/workflows/installer-windows.yml'
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # Printed because an installer is only as reproducible as the toolchain
+      # that built it, and because "which PowerShell" is the first question a
+      # failed parse raises.
+      - name: toolchain
+        shell: pwsh
+        run: |
+          Write-Host "pwsh: $($PSVersionTable.PSVersion)"
+          powershell -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe' }
+          Write-Host "iscc: $iscc"
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            Write-Host 'Inno Setup is not on this image. The runner image README says it is;'
+            Write-Host 'if that changed, install it here before this step.'
+            exit 1
+          }
+
+      # ParseFile rather than a lint pass: a parse error is the failure mode that
+      # matters, and it is the one 5.1 and 7 disagree about.
+      - name: parse the scripts under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $failed = @()
+          foreach ($file in Get-ChildItem -Path install\windows -Filter *.ps1) {
+            $errors = $null
+            $tokens = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              $failed += $file.Name
+              Write-Host "$($file.Name): $($errors.Count) parse error(s)"
+              foreach ($e in $errors) {
+                Write-Host "  line $($e.Extent.StartLineNumber): $($e.Message)"
+              }
+            } else {
+              Write-Host "$($file.Name): parses"
+            }
+          }
+          if ($failed.Count -gt 0) {
+            Write-Host "does not parse under 5.1: $($failed -join ', ')"
+            exit 1
+          }
+
+      - name: parse the scripts under PowerShell 7
+        shell: pwsh
+        run: |
+          $failed = @()
+          foreach ($file in Get-ChildItem -Path install\windows -Filter *.ps1) {
+            $errors = $null
+            $tokens = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              $failed += $file.Name
+              Write-Host "$($file.Name): $($errors.Count) parse error(s)"
+              foreach ($e in $errors) {
+                Write-Host "  line $($e.Extent.StartLineNumber): $($e.Message)"
+              }
+            } else {
+              Write-Host "$($file.Name): parses"
+            }
+          }
+          if ($failed.Count -gt 0) {
+            Write-Host "does not parse under 7: $($failed -join ', ')"
+            exit 1
+          }
+
+      # /O overrides whatever OutputDir the script sets, so the path below is the
+      # one this workflow depends on rather than one that can move underneath it.
+      - name: build the installer
+        shell: pwsh
+        run: |
+          $dist = Join-Path $PWD 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe' }
+          & $iscc "/O$dist" install\windows\sukarfleet.iss
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "iscc exited $LASTEXITCODE"
+            exit 1
+          }
+          $exe = Join-Path $dist 'sukarfleet-setup-windows-x86_64.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            Write-Host "iscc did not produce sukarfleet-setup-windows-x86_64.exe. What it did produce:"
+            Get-ChildItem -Recurse $dist | ForEach-Object { Write-Host "  $($_.FullName)" }
+            exit 1
+          }
+          Write-Host "built: $exe ($((Get-Item -LiteralPath $exe).Length) bytes)"
+
+      # Per-user scope: what a person double-clicking the EXE gets, driven
+      # silently. The mesh and the tray are skipped because neither is what this
+      # step is asking about: the mesh needs a secret and a peer, and the tray
+      # pin is unfilled until a release fills it. /NOOPEN keeps a browser from
+      # being launched on a runner that has nobody at it.
+      #
+      # /MACHINE is passed even though a silent per-user install defaults it,
+      # because a default that changes with the runner image is a smoke that
+      # reports something different every month.
+      - name: smoke - per-user silent install
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
+          $log = Join-Path $env:RUNNER_TEMP 'setup-currentuser.log'
+          $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER',
+            '/MACHINE=ci-runner', '/SKIPMESH', '/SKIPTRAY', '/NOOPEN',
+            "/LOG=$log"
+          )
+          Write-Host "installer exit code: $($p.ExitCode)"
+          if (Test-Path -LiteralPath $log) {
+            Write-Host "--- $log ---"
+            Get-Content -LiteralPath $log | ForEach-Object { Write-Host "  $_" }
+            Write-Host '--- end of setup log ---'
+          } else {
+            Write-Host "no setup log at $log"
+          }
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: smoke - the per-user node answers
+        shell: pwsh
+        run: |
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            try {
+              $r = Invoke-WebRequest -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 3 `
+                   -Uri 'http://127.0.0.1:7710/health'
+              if ($r.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ok) {
+            Write-Host 'no 200 from http://127.0.0.1:7710/health within 60 seconds'
+            Get-ScheduledTask -TaskName sukarfleet -ErrorAction SilentlyContinue |
+              Format-List TaskName, State | Out-String | Write-Host
+            exit 1
+          }
+          Write-Host 'health: 200'
+          $task = Get-ScheduledTask -TaskName sukarfleet -ErrorAction SilentlyContinue
+          if (-not $task) {
+            Write-Host 'the node answered but scheduled task sukarfleet is not registered:'
+            Write-Host 'the per-user install left nothing that survives a sign-out'
+            exit 1
+          }
+          Write-Host "scheduled task sukarfleet: $($task.State)"
+
+      # The machine-wide smoke below asserts a node on the same port, so a
+      # per-user node left running would make it a false green. The uninstall is
+      # therefore checked, not just run.
+      - name: smoke - uninstall the per-user install
+        shell: pwsh
+        run: |
+          $roots = @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+          )
+          $entry = $null
+          foreach ($root in $roots) {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            foreach ($key in Get-ChildItem -LiteralPath $root) {
+              $props = Get-ItemProperty -LiteralPath $key.PSPath
+              if ($props.DisplayName -and $props.DisplayName -match 'sukarfleet') {
+                $entry = $props
+                Write-Host "uninstall entry: $($key.PSPath)"
+                break
+              }
+            }
+            if ($entry) { break }
+          }
+          if (-not $entry) {
+            Write-Host 'the install registered no uninstaller: there is no supported way to remove it'
+            exit 1
+          }
+          # Inno records the scope it was installed in as a switch on the
+          # uninstall string, and dropping it sends the uninstaller looking in
+          # the wrong registry hive. Keep whatever is there and add ours.
+          $command = $entry.UninstallString
+          if ($command -match '^"([^"]+)"\s*(.*)$') {
+            $uninstaller = $Matches[1]
+            $rest = $Matches[2]
+          } else {
+            $uninstaller = $command
+            $rest = ''
+          }
+          $argv = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
+          if ($rest) { $argv += ($rest -split '\s+' | Where-Object { $_ }) }
+          Write-Host "running: $uninstaller $($argv -join ' ')"
+          Start-Process -FilePath $uninstaller -Wait -ArgumentList $argv
+          # Inno's uninstaller re-launches itself from a temp copy and the first
+          # process returns straight away, so the wait above proves nothing. Poll
+          # the port instead, which is the thing the next step needs free.
+          $stopped = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            $r = $null
+            try {
+              $r = Invoke-WebRequest -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 2 `
+                   -Uri 'http://127.0.0.1:7710/health'
+            } catch { $stopped = $true; break }
+            if (-not $r) { $stopped = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $stopped) {
+            Write-Host 'the per-user node still answers on 7710 after uninstall:'
+            Write-Host 'the machine-wide smoke below would be reading the wrong node'
+            exit 1
+          }
+          if (Get-ScheduledTask -TaskName sukarfleet -ErrorAction SilentlyContinue) {
+            Write-Host 'scheduled task sukarfleet survived the uninstall'
+            exit 1
+          }
+          Write-Host 'per-user install removed: port free, task gone'
+
+      # Machine-wide scope. The runner account is already an administrator, so
+      # /ALLUSERS needs no elevation prompt here; on a real machine it is one UAC
+      # click.
+      - name: smoke - machine-wide silent install
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
+          $log = Join-Path $env:RUNNER_TEMP 'setup-allusers.log'
+          $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/ALLUSERS',
+            '/MACHINE=ci-runner', '/SKIPMESH', '/SKIPTRAY', '/NOOPEN',
+            "/LOG=$log"
+          )
+          Write-Host "installer exit code: $($p.ExitCode)"
+          if (Test-Path -LiteralPath $log) {
+            Write-Host "--- $log ---"
+            Get-Content -LiteralPath $log | ForEach-Object { Write-Host "  $_" }
+            Write-Host '--- end of setup log ---'
+          } else {
+            Write-Host "no setup log at $log"
+          }
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: smoke - the service runs, under its own account
+        shell: pwsh
+        run: |
+          $svc = $null
+          for ($i = 0; $i -lt 60; $i++) {
+            $svc = Get-Service -Name sukarfleet-node -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Running') { break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $svc) {
+            Write-Host 'service sukarfleet-node was never registered'
+            exit 1
+          }
+          if ($svc.Status -ne 'Running') {
+            Write-Host "service sukarfleet-node is $($svc.Status) after 60 seconds"
+            $logs = 'C:\ProgramData\sukarfleet\node\logs'
+            if (Test-Path -LiteralPath $logs) {
+              Get-ChildItem -LiteralPath $logs | ForEach-Object {
+                Write-Host "--- $($_.FullName) ---"
+                Get-Content -LiteralPath $_.FullName -Tail 80 | ForEach-Object { Write-Host "  $_" }
+              }
+            }
+            exit 1
+          }
+          Write-Host 'service sukarfleet-node: Running'
+          # The account is the point of the machine-wide scope: a node running as
+          # SYSTEM would be a different security decision than the one documented.
+          sc.exe qc sukarfleet-node
+
+      - name: smoke - the console token gates the machine-wide node
+        shell: pwsh
+        run: |
+          $state = 'http://127.0.0.1:7710/api/ui/state'
+          $r = $null
+          for ($i = 0; $i -lt 60; $i++) {
+            try {
+              $r = Invoke-WebRequest -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 3 -Uri $state
+              break
+            } catch { }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $r) {
+            Write-Host "no answer at all from $state within 60 seconds"
+            exit 1
+          }
+          Write-Host "without a header: $($r.StatusCode)"
+          Write-Host "  body: $($r.Content)"
+          if ($r.StatusCode -ne 401) {
+            Write-Host 'a machine-wide node answered an unauthenticated console call:'
+            Write-Host 'every local account can drive it, which is the hole the token closes'
+            exit 1
+          }
+          $body = $r.Content | ConvertFrom-Json
+          if ($body.error -ne 'console-token-required') {
+            Write-Host "401 body error is '$($body.error)', expected 'console-token-required'"
+            Write-Host 'the console and the tray both branch on that exact string'
+            exit 1
+          }
+          $tokenFile = 'C:\ProgramData\sukarfleet\node\console-token'
+          if (-not (Test-Path -LiteralPath $tokenFile)) {
+            Write-Host "the node is gated and there is no token file at $tokenFile"
+            exit 1
+          }
+          $token = (Get-Content -Raw -LiteralPath $tokenFile).Trim()
+          Write-Host "token file: $tokenFile ($($token.Length) characters)"
+          $ok = Invoke-WebRequest -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 5 -Uri $state `
+                -Headers @{ Authorization = "Bearer $token" }
+          Write-Host "with the header: $($ok.StatusCode)"
+          if ($ok.StatusCode -ne 200) {
+            Write-Host "  body: $($ok.Content)"
+            Write-Host 'the token in the file the installer wrote does not open the console'
+            exit 1
+          }
+          icacls.exe $tokenFile
+
+      - name: smoke - uninstall the machine-wide install
+        shell: pwsh
+        run: |
+          $roots = @(
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+          )
+          $entry = $null
+          foreach ($root in $roots) {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            foreach ($key in Get-ChildItem -LiteralPath $root) {
+              $props = Get-ItemProperty -LiteralPath $key.PSPath
+              if ($props.DisplayName -and $props.DisplayName -match 'sukarfleet') {
+                $entry = $props
+                Write-Host "uninstall entry: $($key.PSPath)"
+                break
+              }
+            }
+            if ($entry) { break }
+          }
+          if (-not $entry) {
+            Write-Host 'the machine-wide install registered no uninstaller'
+            exit 1
+          }
+          # Inno records the scope it was installed in as a switch on the
+          # uninstall string, and dropping it sends the uninstaller looking in
+          # the wrong registry hive. Keep whatever is there and add ours.
+          $command = $entry.UninstallString
+          if ($command -match '^"([^"]+)"\s*(.*)$') {
+            $uninstaller = $Matches[1]
+            $rest = $Matches[2]
+          } else {
+            $uninstaller = $command
+            $rest = ''
+          }
+          $argv = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
+          if ($rest) { $argv += ($rest -split '\s+' | Where-Object { $_ }) }
+          Write-Host "running: $uninstaller $($argv -join ' ')"
+          Start-Process -FilePath $uninstaller -Wait -ArgumentList $argv
+          $gone = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            if (-not (Get-Service -Name sukarfleet-node -ErrorAction SilentlyContinue)) {
+              $gone = $true
+              break
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $gone) {
+            Write-Host 'service sukarfleet-node survived the uninstall'
+            exit 1
+          }
+          # Uninstall removes the software and keeps the data, which is the
+          # documented contract. Both of these are meant to still be here.
+          foreach ($kept in @('C:\ProgramData\sukarfleet\node')) {
+            Write-Host "kept after uninstall: $kept -> $(Test-Path -LiteralPath $kept)"
+          }
+          Write-Host 'machine-wide install removed: service gone'
+
+      - name: hash the installer
+        shell: pwsh
+        run: |
+          $dist = Join-Path $PWD 'dist'
+          $name = 'sukarfleet-setup-windows-x86_64.exe'
+          $sha = (Get-FileHash -LiteralPath (Join-Path $dist $name) -Algorithm SHA256).Hash.ToLower()
+          "$sha  $name" | Set-Content -Encoding ascii (Join-Path $dist 'SHA256SUMS')
+          # Printed as the pin line install/easytier-pins.txt wants, so cutting a
+          # release is a copy rather than a retyping. The version column is the
+          # release tag without its leading v.
+          Write-Host ''
+          Write-Host 'pin line for install/easytier-pins.txt:'
+          Write-Host "  <version>  x86_64  $sha  $name"
+
+      - uses: actions/upload-artifact@v4
+        id: artifact
+        with:
+          name: sukarfleet-setup-windows-x86_64
+          path: |
+            dist/sukarfleet-setup-windows-x86_64.exe
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+      # A no-op until the secret exists, and that is the whole point of it being
+      # here: the step is written, reviewed and skipped rather than invented in a
+      # hurry on release day. SignPath is the route because Azure Trusted Signing
+      # is not open to individuals outside the US and Canada, and a code-signing
+      # certificate is the thing this project does not have. Until then the
+      # EXE is unsigned, SmartScreen warns, and the SHA256 printed above is the
+      # trust anchor: docs/PLATFORMS.md says so in those words.
+      #
+      # Signing happens after the upload because the action submits an artifact
+      # that GitHub already holds. The hash above is therefore the unsigned one;
+      # signing changes the bytes, so the release that ships a signed EXE pins
+      # the hash of what it uploaded, not of what this run built.
+      - name: sign the installer
+        if: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: sukarfleet
+          signing-policy-slug: test-signing
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/signed

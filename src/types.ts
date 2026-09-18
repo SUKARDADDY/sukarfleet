@@ -228,6 +228,14 @@ export interface AdminConfig {
   // on-disk config predating P6 is untouched -- config.ts's mergeDefaults fills the default.
   uiEnabled: boolean;
   uiAssets?: boolean;
+  // Absolute path to the file holding this node's console token. Absent -- the only shape a
+  // per-user install has ever had -- means no token gate: loopback plus the Host pin is the whole
+  // story, as before. Present means /api/ui/* and POST /mcp additionally require
+  // `Authorization: Bearer <the file's contents, trimmed>`; the static /ui assets stay open, since
+  // the page they serve is what asks for the token. The file, not an inline value, so the token can
+  // be rotated without editing the config and so its ACL is the thing that says who may drive this
+  // node. Written only by an installer that put this node where several accounts can reach it.
+  consoleTokenFile?: string;
 }
 
 // Every way an admin call can be turned down without executing. Kept as a closed union (unlike
