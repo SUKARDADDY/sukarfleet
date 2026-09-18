@@ -810,6 +810,20 @@ function Grant-RepoInPlace {
   if (-not $granted) {
     Write-Warn "the node can read $RepoPath but not sync it until the service account has write access there."
   }
+  # A repo under a profile sits below directories the service account cannot even pass through:
+  # a profile root admits its owner, SYSTEM and Administrators, and SYSTEM only reached the repo
+  # because it bypasses traverse checks. The service account does not, so every directory from
+  # the profile root down to the repo gets a traverse-only entry for this folder alone, which
+  # opens the path and nothing in it. Seen on a real machine as "not adopted" for exactly the two
+  # repos kept in place, right after the service stopped being SYSTEM.
+  $dir = Split-Path -Parent ($RepoPath.TrimEnd('\'))
+  $root = [IO.Path]::GetPathRoot($RepoPath)
+  while ($dir -and ($dir.Length -gt $root.Length)) {
+    $rel = $dir.Substring($root.Length).Trim('\')
+    if (($rel -split '\\').Count -lt 2) { break }
+    [void] (Grant-SidAccess -Path $dir -Sid $ServiceSid -Rights 'Traverse' -Soft -What "letting the service account pass through $dir")
+    $dir = Split-Path -Parent $dir
+  }
   $gitPath = $RepoPath.TrimEnd('\') -replace '\\', '/'
   [void] (Add-SafeDirectory -ConfigPath $ServiceGitConfig -GitPath $gitPath)
   [void] (Add-SafeDirectory -ConfigPath $SystemGitConfig -GitPath $gitPath)
@@ -1038,6 +1052,28 @@ if ($doAdopt) {
   Write-Note "config exists at $ConfigFile; left untouched."
 } else {
   New-MachineConfig
+}
+
+# Every run, not only an adoption: a repo the config keeps outside the shared root needs the
+# service account let in, and a re-install after the account changed (the LocalService fallback,
+# or an upgrade of this script) has to reach those repos again. Idempotent: an access rule that
+# is already there is merged, and safe.directory lines are added once.
+try {
+  $cfgNow = Get-Content -LiteralPath $ConfigFile -Raw | ConvertFrom-Json
+  $sharedPrefix = $SharedRoot.TrimEnd('\') + '\'
+  foreach ($repo in @(Get-Prop -Object $cfgNow -Name 'repos' -Default @())) {
+    $rp = [string] (Get-Prop -Object $repo -Name 'path' -Default '')
+    if (-not $rp) { continue }
+    if ($rp.StartsWith($sharedPrefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
+    if (-not (Test-Path -LiteralPath $rp)) { Write-Warn "repo path $rp in the config does not exist; nothing to grant there."; continue }
+    if ($script:KeptRepoPaths -notcontains $rp) {
+      Write-Step "repo outside the shared root at $rp : letting the service account in"
+      Grant-RepoInPlace -RepoPath $rp
+      $script:KeptRepoPaths += $rp
+    }
+  }
+} catch {
+  Write-Warn "could not read the repos out of $ConfigFile to grant the service account access: $($_.Exception.Message)"
 }
 
 # Nothing copied in above carries an ACL of its own: every copy is robocopy with /COPY:DAT,
