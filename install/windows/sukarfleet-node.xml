@@ -12,8 +12,8 @@
   Placeholders:
     __BUN_EXE__          full path to bun.exe
     __APP_DIR__          the sukarfleet tree the node runs from
-    __SERVICE_ACCOUNT__  NT SERVICE\sukarfleet-node, or NT AUTHORITY\LocalService on the
-                         fallback path the installer takes when the virtual account is refused
+    __SERVICE_ACCOUNT__  named in the comment below only; the account itself is set with
+                         sc config, see there
     __NODE_DIR__         C:\ProgramData\sukarfleet\node
     __LOG_DIR__          where WinSW writes stdout, stderr and its own log
     __DEPEND_BLOCK__     <depend>easytier-fleet</depend>, or nothing at all when the mesh
@@ -32,12 +32,11 @@
   <arguments>run src\node.ts</arguments>
   <workingdirectory>__APP_DIR__</workingdirectory>
 
-  <!-- A virtual account, not SYSTEM. It gets exactly the rights the installer grants it on
-       the node directory and the shared root, and nothing else on the machine. -->
-  <serviceaccount>
-    <username>__SERVICE_ACCOUNT__</username>
-    <allowservicelogon>true</allowservicelogon>
-  </serviceaccount>
+  <!-- The account is not set here. WinSW 2.12 ignored a <serviceaccount> block and registered
+       the service as LocalSystem; Install-MachineNode.ps1 sets __SERVICE_ACCOUNT__ with
+       "sc config obj=" after the install and reads it back with "sc qc". A virtual account,
+       not SYSTEM: it gets exactly the rights the installer grants it on the node directory and
+       the shared root, and nothing else on the machine. -->
 
   <!-- The daemon's own paths. SUKARFLEET_CONFIG is a file, SUKARFLEET_CONFIG_DIR and
        SUKARFLEET_STATE are directories. GIT_CONFIG_GLOBAL points git at a config written for

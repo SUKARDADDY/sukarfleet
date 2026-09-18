@@ -1138,6 +1138,22 @@ function Install-NodeService {
     Write-Host ($r.Output | Out-String)
     return $false
   }
+  # The account is set through the service controller, not the xml. WinSW 2.12 reads a v2
+  # <serviceaccount> and quietly registered the service as LocalSystem on a real machine while
+  # this script said otherwise. sc config takes a virtual account with no password, and sc qc
+  # is then read back, because the account this service runs as is the whole point of it.
+  $cfg = Invoke-Native -Exe 'sc.exe' -Arguments @('config', $ServiceId, 'obj=', $Account)
+  if ($cfg.ExitCode -ne 0) {
+    Write-Host ($cfg.Output | Out-String)
+    return $false
+  }
+  $qc = Invoke-Native -Exe 'sc.exe' -Arguments @('qc', $ServiceId)
+  $qcText = ($qc.Output | Out-String)
+  if ($qcText -notmatch ('SERVICE_START_NAME\s*:\s*' + [regex]::Escape($Account))) {
+    Write-Host $qcText
+    Write-Warn "sc qc does not show $Account as the account of '$ServiceId'"
+    return $false
+  }
   $s = Invoke-Native -Exe $WinSwExe -Arguments @('start')
   if ($s.ExitCode -ne 0) { Write-Host ($s.Output | Out-String) }
   for ($i = 0; $i -lt 20; $i++) {
