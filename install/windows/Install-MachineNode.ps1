@@ -92,17 +92,9 @@ $script:Transcribing = $false
 # after they were granted access: the LocalService fallback in step 13 has to reach them again.
 $script:KeptRepoPaths = @()
 
-# SHA256 through .NET rather than Get-FileHash: that cmdlet is a script function in the
-# Microsoft.PowerShell.Utility module, and a Windows PowerShell started from PowerShell 7 can
-# inherit a PSModulePath that hides it ("The term 'Get-FileHash' is not recognized", seen on a
-# hosted runner). A stream and a hasher need no module.
-function Get-Sha256Hex {
-  param([Parameter(Mandatory)] [string] $Path)
-  $sha = [Security.Cryptography.SHA256]::Create()
-  $stream = [IO.File]::OpenRead($Path)
-  try { $bytes = $sha.ComputeHash($stream) } finally { $stream.Dispose(); $sha.Dispose() }
-  return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
-}
+# Get-Sha256Hex is NOT defined here. It lives in install\windows\Pins.ps1, which this script
+# dot-sources in step 2, well before the first hash is taken in step 7. One copy, because two
+# copies of a hashing function is two places for a fix to land in only one of.
 
 function Get-Elapsed { return [int] ((Get-Date) - $script:Started).TotalSeconds }
 function Write-Step { param([string] $m) Write-Host ("[machine] {0,-6} {1}" -f "t+$(Get-Elapsed)s", $m) }
@@ -140,6 +132,17 @@ function Test-Elevated {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
   return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# The safe.directory glob ends in *, and -like would read that * as a wildcard: "C:/AI_Agent/*"
+# tested with -like matches "C:/AI_Agentsomethingelse/x" as happily as the real thing, so a
+# neighbouring entry in someone's gitconfig could answer "already marked safe" for a path that is
+# not. These checks always meant a literal substring, case-insensitively because Windows paths are.
+function Test-ContainsText {
+  param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Haystack,
+        [Parameter(Mandatory)] [string] $Needle)
+  if (-not $Haystack) { return $false }
+  return ($Haystack.IndexOf($Needle, [StringComparison]::OrdinalIgnoreCase) -ge 0)
 }
 
 # Set-Content -Encoding UTF8 writes a byte order mark on 5.1, and a BOM in front of a JSON
@@ -330,15 +333,18 @@ if ($doAdopt -and -not $existingTask) {
   $doAdopt = $false
 }
 
+# A path that was passed is checked here whatever -SkipMesh says. The file is only READ at the
+# mesh stage, minutes later, and a typo that is only noticed there is a typo noticed after the
+# service account, the shared root and the system git config have all been changed.
+if ($MeshSecretFile -and -not (Test-Path -LiteralPath $MeshSecretFile)) {
+  Write-Die "no such file: $MeshSecretFile. That is the file that should hold the network secret, one line. Fix the path, or pass -SkipMesh if the mesh transport is already installed here. Nothing was installed."
+}
 if (-not $SkipMesh) {
   if (-not $MeshIp) {
     Write-Die 'no -MeshIp. The mesh stage would sit at a prompt nobody is watching. Pass this machine''s mesh address, or -SkipMesh if the mesh transport is already installed here.'
   }
   if (-not $MeshSecretFile) {
     Write-Die 'no -MeshSecretFile. The mesh stage would sit at a secret prompt nobody is watching. Pass a file holding the network secret, or -SkipMesh if the mesh transport is already installed here.'
-  }
-  if (-not (Test-Path -LiteralPath $MeshSecretFile)) {
-    Write-Die "no such file: $MeshSecretFile"
   }
 }
 
@@ -462,7 +468,7 @@ if (-not $gitOnPath) {
 $systemGitText = ''
 if (Test-Path -LiteralPath $SystemGitConfig) { $systemGitText = Get-Content -LiteralPath $SystemGitConfig -Raw }
 if ($null -eq $systemGitText) { $systemGitText = '' }
-if ($systemGitText -like "*$SafeDirectoryGlob*") {
+if (Test-ContainsText -Haystack $systemGitText -Needle $SafeDirectoryGlob) {
   Write-Note "$SystemGitConfig already marks $SafeDirectoryGlob safe"
 } else {
   $addition = "[safe]`r`n`tdirectory = $SafeDirectoryGlob`r`n"
@@ -477,7 +483,7 @@ if ($systemGitText -like "*$SafeDirectoryGlob*") {
 # machine-wide file.
 function Test-SafeDirectoryVisible {
   $scoped = Invoke-Native -Exe 'git' -Arguments @('config', '--system', '--show-origin', '--get-all', 'safe.directory')
-  if (($scoped.Output | Out-String) -like "*$SafeDirectoryGlob*") { return $true }
+  if (Test-ContainsText -Haystack ($scoped.Output | Out-String) -Needle $SafeDirectoryGlob) { return $true }
   # Git for Windows reads C:\ProgramData\Git\config ahead of the system file and does not
   # always report it under --system. --list answers the wider question: does git read this
   # value at all, and out of which file. The origin has to be the file this script wrote, or a
@@ -486,7 +492,8 @@ function Test-SafeDirectoryVisible {
   $all = Invoke-Native -Exe 'git' -Arguments @('config', '--list', '--show-origin')
   foreach ($line in $all.Output) {
     $s = [string] $line
-    if (($s -like "*safe.directory=$SafeDirectoryGlob*") -and ($s -like "*$wanted*")) { return $true }
+    if ((Test-ContainsText -Haystack $s -Needle "safe.directory=$SafeDirectoryGlob") -and
+        (Test-ContainsText -Haystack $s -Needle $wanted)) { return $true }
   }
   return $false
 }
@@ -602,6 +609,17 @@ if (-not $haveWinsw) {
 # Step 8: the service definition
 # ---------------------------------------------------------------------------
 
+# Every value substituted into the service xml is a path or an account name this script did not
+# choose: -AppDir comes off a command line, ProgramFiles and ProgramData follow the machine's
+# locale and its administrator's taste, and & < > " are all legal in a Windows path. Unescaped,
+# one of them turns a working service definition into a file WinSW cannot parse, and the failure
+# arrives as a service that will not start rather than as anything naming the character.
+function ConvertTo-XmlText {
+  param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Value)
+  if (-not $Value) { return '' }
+  return [System.Security.SecurityElement]::Escape($Value)
+}
+
 function Write-NodeServiceXml {
   param([Parameter(Mandatory)] [string] $Account)
   $xml = Get-Content -LiteralPath $XmlTemplate -Raw
@@ -610,13 +628,14 @@ function Write-NodeServiceXml {
   # easytier-fleet, so the element goes away rather than wedging the node.
   $depend = ''
   if (Get-Service -Name $MeshServiceName -ErrorAction SilentlyContinue) {
-    $depend = "<depend>$MeshServiceName</depend>"
+    $depend = "<depend>$(ConvertTo-XmlText -Value $MeshServiceName)</depend>"
   }
-  $xml = $xml.Replace('__BUN_EXE__', $BunExe)
-  $xml = $xml.Replace('__APP_DIR__', $AppDir)
-  $xml = $xml.Replace('__SERVICE_ACCOUNT__', $Account)
-  $xml = $xml.Replace('__NODE_DIR__', $NodeDir)
-  $xml = $xml.Replace('__LOG_DIR__', $LogDir)
+  $xml = $xml.Replace('__BUN_EXE__', (ConvertTo-XmlText -Value $BunExe))
+  $xml = $xml.Replace('__APP_DIR__', (ConvertTo-XmlText -Value $AppDir))
+  $xml = $xml.Replace('__SERVICE_ACCOUNT__', (ConvertTo-XmlText -Value $Account))
+  $xml = $xml.Replace('__NODE_DIR__', (ConvertTo-XmlText -Value $NodeDir))
+  $xml = $xml.Replace('__LOG_DIR__', (ConvertTo-XmlText -Value $LogDir))
+  # Not escaped: this one is the element built two lines up, not a value.
   $xml = $xml.Replace('__DEPEND_BLOCK__', $depend)
   Write-Utf8File -Path $WinSwXml -Content $xml
   if ($depend) { Write-Note "  the service will wait for '$MeshServiceName' at boot" }
@@ -805,6 +824,50 @@ function Get-RepoAdoptionPlan {
   return @{ Move = $true; Grant = $false; Why = 'a service has no profile to reach into' }
 }
 
+# Resets the ACLs under a tree that has just been renamed into the shared root, so that what is
+# in it inherits the shared root's access rather than keeping the profile owner's.
+#
+# NOT `icacls <root> /reset /T`. icacls walks reparse points: a symlink or a junction inside a
+# repository points somewhere else on this machine, and /T follows it and resets whatever it
+# finds on the other side. These trees are known to contain links -- robocopy refused them by
+# name during adoption ("untrusted mount point") -- so the tree is walked here instead, a
+# reparse point is counted and stepped over rather than entered, and every real item is reset on
+# its own. The root is reset first, without /T, because that is what makes anything created
+# under it later inherit from the shared root.
+#
+# One icacls per item is slower than one icacls per tree. That is the price of not resetting a
+# directory that was never part of this install, and the count below is printed so a long pause
+# reads as work rather than as a hang.
+function Reset-MovedTreeAcl {
+  param([Parameter(Mandatory)] [string] $Root)
+  Invoke-Icacls -Arguments @($Root, '/reset', '/Q') -What "resetting the ACL on $Root"
+  $reset = 0
+  $skipped = 0
+  $stack = New-Object System.Collections.Stack
+  $stack.Push($Root)
+  while ($stack.Count -gt 0) {
+    $dir = [string] $stack.Pop()
+    $children = @()
+    try { $children = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop) }
+    catch {
+      Write-Warn "could not list $dir while resetting ACLs: $($_.Exception.Message). What is in it keeps the access it had."
+      continue
+    }
+    foreach ($child in $children) {
+      if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq [IO.FileAttributes]::ReparsePoint) {
+        $skipped++
+        continue
+      }
+      $r = Invoke-Native -Exe 'icacls.exe' -Arguments @($child.FullName, '/reset', '/Q')
+      if ($r.ExitCode -eq 0) { $reset++ }
+      else { Write-Warn "icacls exited $($r.ExitCode) resetting $($child.FullName); it keeps the access it had." }
+      if ($child.PSIsContainer) { [void] $stack.Push($child.FullName) }
+      if ((($reset + $skipped) % 2000) -eq 0) { Write-Note "  reset $reset item(s) so far under $Root" }
+    }
+  }
+  Write-Note "  reset the ACL on $reset item(s) under $Root, and skipped $skipped reparse point(s), which lead out of this tree"
+}
+
 # A repo that stays where it is has to work for two accounts: the daemon, which runs as the
 # service account and reads the service gitconfig, and the person at the keyboard, who reads the
 # system one. So the service account gets Modify, inherited by what is already in the tree, and
@@ -860,8 +923,15 @@ function Invoke-Adoption {
   try { $cfg = $raw | ConvertFrom-Json }
   catch { Write-Die "could not read $srcConfig as JSON, so nothing was adopted and nothing was moved." }
 
-  # --- refuse on a dirty tree, BEFORE anything is stopped or moved -----------
+  # --- the whole plan, BEFORE anything is stopped or moved -------------------
+  # Every refusal that can be known from the config and the disk is taken here, in one pass, while
+  # the old node is still registered and every repository is still where its owner left it. The
+  # loop that moves things further down executes a plan that has already passed: a refusal raised
+  # halfway through that loop would land after the scheduled task was unregistered and after some
+  # repositories had already been renamed, which is the worst moment on this whole path to stop.
   $repos = @(Get-Prop -Object $cfg -Name 'repos' -Default @())
+  $repoPlans = @()
+  $claimedDests = @{}
   foreach ($repo in $repos) {
     $path = [string] (Get-Prop -Object $repo -Name 'path' -Default '')
     $name = [string] (Get-Prop -Object $repo -Name 'name' -Default '(unnamed)')
@@ -879,16 +949,36 @@ function Invoke-Adoption {
       Write-Host ($status.Output | Out-String)
       Write-Die "git could not read the state of '$name' at $path. Nothing was stopped and nothing was moved."
     }
+    $plan = Get-RepoAdoptionPlan -RepoPath $path -ProfileDir $profileDir
     $dirty = @($status.Output | ForEach-Object { ([string] $_).Trim() } | Where-Object { $_ })
     if ($dirty.Count -gt 0) {
       $show = ($dirty | Select-Object -First 10) -join "`n    "
       # The refusal covers both outcomes. A repo that stays where it is is not moved, but it is
       # handed to a daemon that will start syncing it, which is no kinder to uncommitted work.
-      $plan = Get-RepoAdoptionPlan -RepoPath $path -ProfileDir $profileDir
       $what = 'this install is about to hand that directory to a daemon that syncs it'
       if ($plan.Move) { $what = 'this install would move that directory' }
       Write-Die "repo '$name' at $path has $($dirty.Count) uncommitted change(s), and $what. Commit or discard them first, then re-run. Nothing was stopped and nothing was moved.`n    $show"
     }
+    $dest = ''
+    if ($plan.Move) {
+      $leaf = Split-Path -Leaf $path.TrimEnd('\')
+      $dest = Join-Path $SharedRoot $leaf
+      if ((Test-Path -LiteralPath $dest) -and @(Get-ChildItem -LiteralPath $dest -Force).Count -gt 0) {
+        Write-Die "'$name' would move to $dest, and there is already something there. Move or remove it, then re-run. Nothing was stopped and nothing was moved."
+      }
+      $key = $dest.ToLowerInvariant()
+      if ($claimedDests.ContainsKey($key)) {
+        Write-Die "'$name' and '$($claimedDests[$key])' would both move to $dest, because they have the same folder name in different places. Rename one of them, or point its config entry somewhere else, then re-run. Nothing was stopped and nothing was moved."
+      }
+      $claimedDests[$key] = $name
+      # A rename needs one volume; the move loop below uses [IO.Directory]::Move and nothing else.
+      $srcRoot = [IO.Path]::GetPathRoot($path)
+      $dstRoot = [IO.Path]::GetPathRoot($dest)
+      if ($srcRoot -ne $dstRoot) {
+        Write-Die "'$name' is on $srcRoot and the shared root is on $dstRoot. Adoption moves a repository by renaming it, which needs one volume. Pick a shared root on $srcRoot, or move the repository yourself and point the config at it, then re-run. Nothing was stopped and nothing was moved."
+      }
+    }
+    $repoPlans += @{ Repo = $repo; Name = $name; Path = $path; Plan = $plan; Dest = $dest }
   }
 
   # --- the rollback copy, before the task stops existing ---------------------
@@ -953,14 +1043,16 @@ function Invoke-Adoption {
   }
 
   # --- repos ----------------------------------------------------------------
-  # Two outcomes, one printed line each, and Get-RepoAdoptionPlan holds the rule. What decides is
-  # where the repo sits: a working tree under the profile moves into the shared root, and a repo
-  # inside a dot-directory of that profile stays where the tool that owns it expects to find it.
-  foreach ($repo in $repos) {
-    $path = [string] (Get-Prop -Object $repo -Name 'path' -Default '')
-    $name = [string] (Get-Prop -Object $repo -Name 'name' -Default '(unnamed)')
-    if (-not $path) { continue }
-    $plan = Get-RepoAdoptionPlan -RepoPath $path -ProfileDir $profileDir
+  # Executes the plan built above and decides nothing: every refusal this could have raised was
+  # raised before the task was unregistered. Two outcomes, one printed line each, and
+  # Get-RepoAdoptionPlan holds the rule. What decides is where the repo sits: a working tree under
+  # the profile moves into the shared root, and a repo inside a dot-directory of that profile
+  # stays where the tool that owns it expects to find it.
+  foreach ($entry in $repoPlans) {
+    $repo = $entry.Repo
+    $path = [string] $entry.Path
+    $name = [string] $entry.Name
+    $plan = $entry.Plan
     if (-not $plan.Move) {
       Write-Step "keeping '$name' where it is at $path : $($plan.Why)"
       if ($plan.Grant) {
@@ -969,25 +1061,17 @@ function Invoke-Adoption {
       }
       continue
     }
-    $leaf = Split-Path -Leaf $path.TrimEnd('\')
-    $dest = Join-Path $SharedRoot $leaf
-    if ((Test-Path -LiteralPath $dest) -and @(Get-ChildItem -LiteralPath $dest -Force).Count -gt 0) {
-      Write-Die "'$name' would move to $dest, and there is already something there. Move or remove it, then re-run."
-    }
+    $dest = [string] $entry.Dest
     Write-Step "moving '$name' from $path to $dest : $($plan.Why)"
     # A rename, never a copy: one volume, one atomic call, links kept as links. robocopy /MOVE
     # deleted files out of the source as it copied them and then refused the tree's symlinks
     # ("the path cannot be traversed because it contains an untrusted mount point", error 448),
     # which left a real repository split across both paths. A rename either happens or does not.
-    $srcRoot = [IO.Path]::GetPathRoot($path)
-    $dstRoot = [IO.Path]::GetPathRoot($dest)
-    if ($srcRoot -ne $dstRoot) {
-      Write-Die "'$name' is on $srcRoot and the shared root is on $dstRoot. Adoption moves a repository by renaming it, which needs one volume. Pick a shared root on $srcRoot, or move the repository yourself and point the config at it, then re-run."
-    }
+    # The one-volume check is in the plan above, taken before anything was stopped.
     if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue }
     try { [IO.Directory]::Move($path, $dest) }
     catch { Write-Die "could not move '$name' from $path to $dest : $($_.Exception.Message). Nothing was moved." }
-    Invoke-Icacls -Arguments @($dest, '/reset', '/T', '/C', '/Q') -What "resetting the ACL on $dest"
+    Reset-MovedTreeAcl -Root $dest
     # A junction at the old path, so the account that owned this tree keeps its habits: its
     # shell, its editor and its agent sessions all still find it where it used to be.
     if (-not (Test-Path -LiteralPath $path)) {
@@ -1097,10 +1181,15 @@ try {
 # what makes that script's Test-StagedSecretPath recognise the file as the installer's and
 # shred it once the TOML has it.
 $meshRan = $false
-if ($MeshSecretFile) {
+if ($MeshSecretFile -and -not $SkipMesh) {
   Write-Utf8File -Path $StagedSecret -Content ((Get-Content -LiteralPath $MeshSecretFile -Raw).Trim() + "`n")
   Invoke-Icacls -Arguments @($StagedSecret, '/inheritance:r') -What "removing inherited access from the staged mesh secret"
   Invoke-Icacls -Arguments @($StagedSecret, '/grant:r', "*${SidSystem}:(F)", "*${SidAdmins}:(F)") -What "restricting the staged mesh secret"
+} elseif ($MeshSecretFile) {
+  # -SkipMesh: the transport the secret belongs to is not being installed here, so the secret is
+  # never opened, never copied and never handed on. The finally block below still shreds a file
+  # the installer staged, because a secret left lying on disk is worse than one that went unused.
+  Write-Note '  -SkipMesh: the network secret file is not read'
 }
 
 $savedState = $env:SUKARFLEET_STATE
@@ -1119,13 +1208,22 @@ try {
   }
   if ($MeshIp) { $meshArgs['MeshIp'] = $MeshIp }
   if ($PeerList.Count -gt 0) { $meshArgs['PeerUri'] = $PeerList }
-  if (Test-Path -LiteralPath $StagedSecret) { $meshArgs['MeshSecretFile'] = $StagedSecret }
+  if ((-not $SkipMesh) -and (Test-Path -LiteralPath $StagedSecret)) { $meshArgs['MeshSecretFile'] = $StagedSecret }
   if ($SkipMesh) { $meshArgs['SkipMesh'] = $true }
 
   if ($SkipMesh) { Write-Step 'mesh transport skipped (-SkipMesh); running the elevated stage for the machine-wide settings it also owns' }
   else { Write-Step 'installing the mesh transport through Install-Sukarfleet.ps1 -Stage Elevated' }
+  # & does not throw for a child .ps1 that called `exit 1`: the catch below would never see it,
+  # and $meshRan would say "the stage ran" for a stage that refused. $LASTEXITCODE is the only
+  # thing that child leaves behind, so it is zeroed first -- a stale code from any native command
+  # earlier in this script must not be read as this stage's answer.
+  $global:LASTEXITCODE = 0
   & $InstallSukarfleet @meshArgs
-  $meshRan = $true
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warn "Install-Sukarfleet.ps1 -Stage Elevated exited $LASTEXITCODE. Its output is above."
+  } else {
+    $meshRan = $true
+  }
 } catch {
   Write-Warn "the mesh stage did not finish: $($_.Exception.Message)"
 } finally {

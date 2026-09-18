@@ -138,9 +138,13 @@ Adoption exports the scheduled task to `C:\ProgramData\sukarfleet\node\adopted-t
 the credential store, the state directory, the fleet SSH key and the sukarfleet lines out of
 `authorized_keys`. The machine keeps its place in the fleet and nothing re-pairs.
 
-Most repositories the old node was syncing are moved into the shared root with `robocopy /MOVE`,
-their ACLs are reset, and a directory junction is left where each one used to be, so that
-account's shell, editor and scripts still find it at the old path. One kind stays put: a
+Most repositories the old node was syncing are renamed into the shared root -- a single
+`Directory.Move`, which is atomic and keeps links as links. (`robocopy /MOVE` was tried first and
+is not what runs: it deleted files out of the source as it copied them and then refused the tree's
+symlinks, leaving one repository split across both paths.) Their ACLs are reset so they inherit
+the shared root's access, with any symlink or junction inside skipped rather than followed out of
+the tree, and a directory junction is left where each repository used to be, so that account's
+shell, editor and scripts still find it at the old path. One kind stays put: a
 repository inside a dot-directory of the profile, such as an agent's memory store or a dotfile
 source tree. That directory belongs to the tool that made it, and the tool looks for it there
 and nowhere else, so instead of moving it the installer grants the service account Modify on it
@@ -157,6 +161,22 @@ on every file while Windows reports the refusal as "not found".
 The DPAPI-sealed copy of the machine key is deliberately not copied. It is sealed to the account
 that sealed it, and the service runs as a different account, so copying it would produce a file
 that looks like a working credential and is not.
+
+Three things change for a repository that is kept in place, and they are worth knowing before you
+adopt rather than after:
+
+- **Its `postMerge` hook now runs as the service account.** That hook is the argv in your own
+  config, not a git hook (git hooks are off for the service: its `GIT_CONFIG_GLOBAL` points
+  `core.hooksPath` at an empty directory). The service account has no profile, no `HOME` and no
+  interactive session, so a hook written for a person -- `chezmoi apply` is the obvious one --
+  fails. The failure is logged and nothing else happens to it: the repository still fetches and
+  still merges.
+- **Every directory between the profile root and the repository gets a traverse-only entry** for
+  the service account, because a profile admits its owner, SYSTEM and Administrators and nobody
+  else. It opens the path and nothing in it, and the uninstaller leaves it.
+- **The node's auto-commit needs a clock this machine has vetted**, as it did before: the commits
+  it writes are stamped with the time this machine believes, and the elevated stage runs
+  `w32tm /resync` for exactly that reason.
 
 ### Watching it
 

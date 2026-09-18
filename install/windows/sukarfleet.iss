@@ -70,11 +70,40 @@ Source: "{#SrcRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Root: HKLM; Subkey: "Software\sukarfleet"; ValueType: string; ValueName: "SharedRoot"; ValueData: "{code:GetSharedRoot}"; Flags: uninsdeletekey; Check: IsAdminInstallMode
 
 [Run]
-; Both scripts run through cmd.exe so that everything they print lands in a log file next to
-; what they installed. A silent install has no window to read, and a wizard window closes with
-; the wizard; the log is what remains when something went wrong.
-Filename: "{cmd}"; Parameters: "{code:MachineNodeCmd}"; StatusMsg: "Installing the machine-wide node. This takes a few minutes."; Flags: waituntilterminated runhidden; Check: IsAdminInstallMode
-Filename: "{cmd}"; Parameters: "{code:UserNodeCmd}"; StatusMsg: "Installing the node for this account. This takes a few minutes."; Flags: waituntilterminated runhidden; Check: not IsAdminInstallMode
+; Nothing is launched by Filename here, and that is the whole point of the entry. Setup ignores
+; the exit code of a [Run] program, so a machine-wide install the script REFUSED -- no mesh
+; address, git missing, a service that would not start -- used to leave Setup reporting success
+; and a person believing they had a node. The launch moved into RunScopeInstaller, called as the
+; entry's BeforeInstall, which is the one moment that is both after every file is in {app} and
+; inside a phase where an exception raised from [Code] still ends Setup with a non-zero exit code:
+;
+;   - A [Run] entry's BeforeInstall and AfterInstall hooks are called from the same protected
+;     block as the [Run] entries themselves, and the only handler on that block shows the
+;     exception, sets exit code 3 and terminates Setup. Help topic "Setup Exit Codes": 3 is "A
+;     fatal error occurred while preparing to move to the next installation phase".
+;   - CurStepChanged(ssPostInstall) does NOT do this, which is why the launch is not there. Help
+;     topic "Pascal Scripting: Abort" lists the event functions an exception ends Setup from --
+;     InitializeSetup, InitializeWizard, CurStepChanged(ssInstall), InitializeUninstall,
+;     CurUninstallStepChanged(usAppMutexCheck) and CurUninstallStepChanged(usUninstall). ssPostInstall
+;     is not among them: an exception there is caught, logged and stepped over, and Setup goes on
+;     to exit 0. ssInstall, which is on the list, runs before {app} exists, so the scripts cannot
+;     be started from there either.
+;   - The box Setup shows for the exception is its own critical-error box, which is one
+;     /SUPPRESSMSGBOXES answers. It is not a MsgBox() raised from [Code]: that kind is documented
+;     as non-suppressible and is what the wizard pages above refuse to raise in a silent install.
+;
+; The command each entry would have run is a cmd that does nothing, so the Setup log says where
+; the work actually happened.
+Filename: "{cmd}"; Parameters: "/C rem sukarfleet: the install ran in this entry's BeforeInstall"; StatusMsg: "Installing the machine-wide node. This takes a few minutes."; Flags: waituntilterminated runhidden; Check: IsAdminInstallMode; BeforeInstall: InstallMachineNode
+Filename: "{cmd}"; Parameters: "/C rem sukarfleet: the install ran in this entry's BeforeInstall"; StatusMsg: "Installing the node for this account. This takes a few minutes."; Flags: waituntilterminated runhidden; Check: not IsAdminInstallMode; BeforeInstall: InstallUserNode
+
+[UninstallDelete]
+; The machine-wide install puts the service wrapper, Bun and the tray in C:\Program Files\sukarfleet
+; and Setup puts {app} inside that same directory. Uninstall-MachineNode.ps1 removes what it
+; installed there BY NAME and leaves the directory standing, because the uninstaller running it
+; lives under {app} inside it. This entry is replayed after {app} is gone and takes the directory
+; away once there is genuinely nothing left in it.
+Type: dirifempty; Name: "{commonpf64}\sukarfleet"; Check: IsAdminInstallMode
 
 [UninstallRun]
 Filename: "powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\install\windows\Uninstall-MachineNode.ps1"" -AppDir ""{app}"" -SharedRoot ""{reg:HKLM\Software\sukarfleet,SharedRoot|C:\AI_Agent}"""; RunOnceId: "RemoveMachineNode"; Flags: waituntilterminated runhidden; Check: IsAdminInstallMode
@@ -420,22 +449,60 @@ begin
   if SecretIsOurs then Result := Result + ' -ShredSecretSource';
 end;
 
-// cmd.exe /C "powershell.exe <args> > <log> 2>&1". The outer quotes are cmd's; -NonInteractive
-// makes a prompt fail instead of wait, which is the only honest answer with no keyboard.
-function UserNodeCmd(Param: String): String;
-var
-  LogPath: String;
+function UserNodeLog(): String;
 begin
-  LogPath := ExpandConstant('{localappdata}\sukarfleet\install-user.log');
-  ForceDirectories(ExtractFileDir(LogPath));
-  Result := '/C "powershell.exe ' + UserNodeParams() + ' > "' + LogPath + '" 2>&1"';
+  Result := ExpandConstant('{localappdata}\sukarfleet\install-user.log');
 end;
 
-function MachineNodeCmd(Param: String): String;
-var
-  LogPath: String;
+function MachineNodeLog(): String;
 begin
-  LogPath := ExpandConstant('{commonappdata}\sukarfleet\install-machine.log');
+  Result := ExpandConstant('{commonappdata}\sukarfleet\install-machine.log');
+end;
+
+// cmd.exe /C "powershell.exe <args> > <log> 2>&1". The outer quotes are cmd's; -NonInteractive
+// makes a prompt fail instead of wait, which is the only honest answer with no keyboard. cmd
+// hands back whatever powershell.exe exited with, which is what makes the exit code below real.
+function UserNodeCmd(): String;
+begin
+  Result := '/C "powershell.exe ' + UserNodeParams() + ' > "' + UserNodeLog() + '" 2>&1"';
+end;
+
+function MachineNodeCmd(): String;
+begin
+  Result := '/C "powershell.exe ' + MachineNodeParams() + ' > "' + MachineNodeLog() + '" 2>&1"';
+end;
+
+// ---------------------------------------------------------------------------
+// The launch, and the refusal
+//
+// Called as the BeforeInstall of the matching [Run] entry; see the comment on that section for
+// why it is there and nowhere else. Exec waits for cmd, cmd waits for powershell, and powershell
+// exits 1 on every Write-Die in the install scripts, so a refusal arrives here as a number.
+// ---------------------------------------------------------------------------
+procedure RunScopeInstaller(Scope, Params, LogPath: String);
+var
+  ResultCode: Integer;
+begin
   ForceDirectories(ExtractFileDir(LogPath));
-  Result := '/C "powershell.exe ' + MachineNodeParams() + ' > "' + LogPath + '" 2>&1"';
+  if not Exec(ExpandConstant('{cmd}'), Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    RaiseException('The ' + Scope + ' install script could not be started at all. Nothing was installed.');
+  end;
+  if ResultCode <> 0 then
+  begin
+    // Named, not summarised. The script has already written the sentence explaining itself into
+    // that file, and on a silent install that file is the only place anyone can read it.
+    RaiseException('The ' + Scope + ' install did not finish: its script exited ' +
+      IntToStr(ResultCode) + '. Read ' + LogPath + ' -- its last lines say what was refused and why.');
+  end;
+end;
+
+procedure InstallMachineNode();
+begin
+  RunScopeInstaller('machine-wide', MachineNodeCmd(), MachineNodeLog());
+end;
+
+procedure InstallUserNode();
+begin
+  RunScopeInstaller('per-account', UserNodeCmd(), UserNodeLog());
 end;

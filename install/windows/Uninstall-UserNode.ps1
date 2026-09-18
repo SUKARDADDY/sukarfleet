@@ -33,9 +33,28 @@ if ($task) {
   Write-Line "no scheduled task '$TaskName' to remove"
 }
 
+# Which port to watch. 7710 is the default and the answer for a profile with no config, but a
+# node installed on another port would otherwise be waited for on a port nothing was ever bound
+# to, and this loop would return immediately while the node still held its own.
+$configDir = Join-Path $env:USERPROFILE '.config\sukarfleet'
+$nodePort = 7710
+$configFile = Join-Path $configDir 'config.json'
+if (Test-Path -LiteralPath $configFile) {
+  try {
+    $cfg = Get-Content -LiteralPath $configFile -Raw | ConvertFrom-Json
+    $prop = $cfg.PSObject.Properties['nodePort']
+    if ($prop -and $prop.Value) {
+      $port = [int] $prop.Value
+      if ($port -gt 0 -and $port -lt 65536) { $nodePort = $port }
+    }
+  } catch {
+    Write-Line "could not read nodePort out of $configFile ($($_.Exception.Message)); waiting on $nodePort"
+  }
+}
+
 # The node may outlive its task for a moment; give it a few seconds to let go of the port.
 for ($i = 0; $i -lt 10; $i++) {
-  $held = Get-NetTCPConnection -LocalPort 7710 -State Listen -ErrorAction SilentlyContinue
+  $held = Get-NetTCPConnection -LocalPort $nodePort -State Listen -ErrorAction SilentlyContinue
   if (-not $held) { break }
   Start-Sleep -Seconds 1
 }
@@ -51,7 +70,6 @@ if (Get-ItemProperty -Path $runKey -Name $RunValueName -ErrorAction SilentlyCont
 $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\sukarfleet console.lnk'
 if (Test-Path -LiteralPath $shortcut) { Remove-Item -LiteralPath $shortcut -Force -ErrorAction SilentlyContinue }
 
-$configDir = Join-Path $env:USERPROFILE '.config\sukarfleet'
 $stateDir = Join-Path $env:USERPROFILE '.local\state\sukarfleet'
 Write-Line "left in place: $configDir (identity and peers), $stateDir, the fleet SSH key under .ssh, and every synced repository."
 Write-Line 'the other machines in the fleet still list this one as a peer until you remove it there.'
