@@ -185,6 +185,16 @@ a transcript at `C:\ProgramData\sukarfleet\node\logs\install.log`, which is what
 silent install. `/LOG=<path>` captures Setup's own log, which records the exit code of the
 script it ran.
 
+### When it refuses
+
+A machine-wide install refused before anything is written, whether for a missing mesh address, a
+missing git, a per-user node nobody asked to adopt or an adoption whose repositories have
+uncommitted work in them, ends Setup with exit code 7 and the reason in the `/LOG` file, and
+nothing at all was installed. A machine-wide install that failed after its files were in place,
+such as a service that registers and then will not start, exits 0 with the reason in
+`C:\ProgramData\sukarfleet\install-machine.log` and in a message box, and the software is on the
+machine, so the uninstaller in Apps and features is the way back off it.
+
 ### Removing it
 
 Uninstall from Apps and features, or run the uninstaller in the install directory.
