@@ -98,6 +98,10 @@ Filename: "{cmd}"; Parameters: "/C rem sukarfleet: the install ran in this entry
 Filename: "{cmd}"; Parameters: "/C rem sukarfleet: the install ran in this entry's BeforeInstall"; StatusMsg: "Installing the node for this account. This takes a few minutes."; Flags: waituntilterminated runhidden; Check: not IsAdminInstallMode; BeforeInstall: InstallUserNode
 
 [UninstallDelete]
+; bun install writes node_modules into {app} after Setup has copied its files, so Setup never
+; owned it and would leave it, and with it the whole {app} directory and the uninstaller inside.
+; Seen on a hosted runner: "unins000.exe" and "node_modules" were all that survived. Both scopes.
+Type: filesandordirs; Name: "{app}\node_modules"
 ; The machine-wide install puts the service wrapper, Bun and the tray in C:\Program Files\sukarfleet
 ; and Setup puts {app} inside that same directory. Uninstall-MachineNode.ps1 removes what it
 ; installed there BY NAME and leaves the directory standing, because the uninstaller running it
