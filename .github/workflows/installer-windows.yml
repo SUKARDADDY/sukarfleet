@@ -592,7 +592,9 @@ jobs:
           # it cannot it schedules the delete for the next boot; a directory
           # holding nothing but that stub is a finished uninstall. Anything else
           # left is not. Give the last delete a minute before deciding.
-          $appDir = 'C:\Program Files\sukarfleet\app'
+          # ProgramW6432 is where 64-bit Program Files actually is on this machine, which is
+          # not always C:\Program Files: {commonpf64} in the .iss follows the same variable.
+          $appDir = (Join-Path $env:ProgramW6432 'sukarfleet\app')
           for ($i = 0; $i -lt 30; $i++) {
             if (-not (Test-Path -LiteralPath $appDir)) { break }
             $left = @(Get-ChildItem -LiteralPath $appDir -Force | Where-Object { $_.Name -notlike 'unins000.*' })
@@ -656,7 +658,9 @@ jobs:
           $log = Join-Path $env:RUNNER_TEMP 'setup-refused.log'
           $scriptLog = Join-Path $env:ProgramData 'sukarfleet\install-machine.log'
           $nodeDir = Join-Path $env:ProgramData 'sukarfleet\node'
-          $appDir = 'C:\Program Files\sukarfleet\app'
+          # ProgramW6432 is where 64-bit Program Files actually is on this machine, which is
+          # not always C:\Program Files: {commonpf64} in the .iss follows the same variable.
+          $appDir = (Join-Path $env:ProgramW6432 'sukarfleet\app')
 
           # The steps above installed and uninstalled a machine-wide node, and a
           # machine-wide uninstall KEEPS the node directory on purpose. Both of
@@ -763,6 +767,314 @@ jobs:
             exit 1
           }
           Write-Host 'a refused machine-wide install exits 7, says why in the setup log, and installs nothing'
+
+      # Adoption, which is the one path in this installer that acts on a machine that already
+      # has a node rather than on an empty one, and the one nothing else in this workflow runs:
+      # Get-AdoptionPlan is called twice on a real adoption, once by the preflight before a file
+      # is copied and once again immediately before the old node is stopped, and until this step
+      # neither call had ever run outside a developer's machine.
+      #
+      # What is asserted is the whole of the promise: the preflight passes with a per-user node
+      # present rather than refusing it, the service comes up, the scheduled task that used to
+      # start that node is gone, and the machine-wide node carries the identity of the node it
+      # adopted rather than a fresh one every peer would have to pair with again.
+      #
+      # The step installs both scopes and removes both at the end, because the steps after it
+      # are entitled to the machine the steps before it had.
+      - name: smoke - a machine-wide install adopts a per-user node
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
+          $userLog = Join-Path $env:RUNNER_TEMP 'setup-adopt-user.log'
+          $machineLog = Join-Path $env:RUNNER_TEMP 'setup-adopt-machine.log'
+          $userScriptLogs = @((Join-Path $env:LOCALAPPDATA 'sukarfleet\install-user.log'))
+          $machineScriptLogs = @((Join-Path $env:ProgramData 'sukarfleet\install-machine.log'), (Join-Path $env:ProgramData 'sukarfleet\node\logs\install.log'))
+          $userConfigDir = Join-Path $env:USERPROFILE '.config\sukarfleet'
+          $nodeDir = Join-Path $env:ProgramData 'sukarfleet\node'
+
+          # The same poll, kill and log dump the two install steps above use, in one function
+          # because this step runs two installs. A silent install that never returns has to be
+          # reported with its logs, not discovered when the job times out.
+          function Invoke-SilentSetup {
+            param(
+              [Parameter(Mandatory)] [string] $Exe,
+              [Parameter(Mandatory)] [string[]] $Argv,
+              [Parameter(Mandatory)] [string] $SetupLog,
+              [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $ScriptLogs,
+              [int] $Minutes = 15
+            )
+            $p = Start-Process -FilePath $Exe -PassThru -ArgumentList $Argv
+            $deadline = (Get-Date).AddMinutes($Minutes)
+            $lastReport = Get-Date
+            while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 10
+              if (((Get-Date) - $lastReport).TotalSeconds -ge 60) {
+                $lastReport = Get-Date
+                Write-Host "still installing at $((Get-Date).ToString('HH:mm:ss'))"
+                foreach ($sl in $ScriptLogs) {
+                  if (Test-Path -LiteralPath $sl) {
+                    Write-Host "  last lines of ${sl}:"
+                    Get-Content -LiteralPath $sl -Tail 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+                  }
+                }
+                Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'powershell|cmd|bun|ssh-keygen' } |
+                  ForEach-Object { Write-Host "  pid $($_.ProcessId): $($_.CommandLine)" }
+              }
+            }
+            $hung = $false
+            if (-not $p.HasExited) {
+              Write-Host "the installer did not return within $Minutes minutes; killing it"
+              Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'powershell|cmd|bun|ssh-keygen' } |
+                ForEach-Object { Write-Host "  pid $($_.ProcessId): $($_.CommandLine)" }
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              $hung = $true
+            }
+            $p.WaitForExit()
+            Write-Host "installer exit code: $($p.ExitCode)"
+            $text = ''
+            if (Test-Path -LiteralPath $SetupLog) {
+              $text = Get-Content -Raw -LiteralPath $SetupLog
+              Write-Host "--- $SetupLog ---"
+              Get-Content -LiteralPath $SetupLog | ForEach-Object { Write-Host "  $_" }
+              Write-Host '--- end of setup log ---'
+            } else {
+              Write-Host "no setup log at $SetupLog"
+            }
+            foreach ($sl in $ScriptLogs) {
+              if (Test-Path -LiteralPath $sl) {
+                Write-Host "--- $sl ---"
+                Get-Content -LiteralPath $sl | ForEach-Object { Write-Host "  $_" }
+                Write-Host "--- end of $sl ---"
+              } else {
+                Write-Host "no script log at $sl"
+              }
+            }
+            return [pscustomobject]@{ ExitCode = $p.ExitCode; Hung = $hung; SetupLog = $text }
+          }
+
+          # machine-key.json is the fleet identity and it holds a private key as well as a public
+          # one, so what is printed and compared is a hash of the public half and never the file.
+          function Get-MachineKeyHash {
+            param([Parameter(Mandatory)] [string] $Path)
+            if (-not (Test-Path -LiteralPath $Path)) { return '<missing>' }
+            try {
+              $key = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+              $pub = ConvertTo-Json $key.publicKeyJwk -Depth 8 -Compress
+              $bytes = [Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($pub))
+              return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+            } catch {
+              return "<unreadable: $($_.Exception.Message)>"
+            }
+          }
+
+          # --- the node that will be adopted ---------------------------------------
+          # Same argument list as the per-user step at the top of this job, so what is adopted
+          # here is the install that job already proved.
+          $u = Invoke-SilentSetup -Exe $exe -SetupLog $userLog -ScriptLogs $userScriptLogs -Argv @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER',
+            '/MACHINE=ci-runner', '/SKIPMESH', '/SKIPTRAY', '/NOOPEN',
+            "/LOG=$userLog"
+          )
+          if ($u.Hung -or $u.ExitCode -ne 0) {
+            Write-Host 'the per-user install this step adopts did not finish; there is nothing to adopt'
+            exit 1
+          }
+
+          # The node writes machine-key.json before it opens its port, so a 200 from /health is
+          # also the proof that the identity this step is about to record exists on disk.
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            try {
+              $r = Invoke-WebRequest -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 3 `
+                   -Uri 'http://127.0.0.1:7710/health'
+              if ($r.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ok) {
+            Write-Host 'no 200 from http://127.0.0.1:7710/health within 60 seconds'
+            Get-ScheduledTask -TaskName sukarfleet -ErrorAction SilentlyContinue |
+              Format-List TaskName, State | Out-String | Write-Host
+            Write-Host 'the per-user node never came up, so an adoption here would prove nothing'
+            exit 1
+          }
+          Write-Host 'per-user health: 200'
+
+          # --- what makes it that node ---------------------------------------------
+          # Two things travel, and Install-MachineNode.ps1 copies both into the node directory:
+          # machine-key.json, which is what peers pinned, and the fleet SSH key the installer
+          # generated. The machine name is read too, because the adopted config is rewritten on
+          # the way across and a rewrite that changed it would be a different machine.
+          $userKeyHash = Get-MachineKeyHash -Path (Join-Path $userConfigDir 'machine-key.json')
+          $userSshPubFile = Join-Path $env:USERPROFILE '.ssh\id_sukarfleet_ed25519.pub'
+          $userSshPub = '<missing>'
+          if (Test-Path -LiteralPath $userSshPubFile) { $userSshPub = (Get-Content -Raw -LiteralPath $userSshPubFile).Trim() }
+          $userMachine = '<missing>'
+          $userConfigFile = Join-Path $userConfigDir 'config.json'
+          if (Test-Path -LiteralPath $userConfigFile) {
+            $userMachine = [string] ((Get-Content -Raw -LiteralPath $userConfigFile | ConvertFrom-Json).machine)
+          }
+          Write-Host "per-user config:      $userConfigFile (machine=$userMachine)"
+          Write-Host "per-user machine key: $userKeyHash"
+          Write-Host "per-user ssh key:     $userSshPub"
+          foreach ($v in @($userKeyHash, $userSshPub, $userMachine)) {
+            if ($v -like '<*') {
+              Write-Host 'the per-user node has no identity to compare against, so this step cannot tell an adoption from a fresh install'
+              exit 1
+            }
+          }
+
+          # --- the adopting install ------------------------------------------------
+          $m = Invoke-SilentSetup -Exe $exe -SetupLog $machineLog -ScriptLogs $machineScriptLogs -Argv @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/ALLUSERS',
+            '/MACHINE=ci-runner', '/SKIPMESH', '/SKIPTRAY', '/NOOPEN', '/ADOPT=1',
+            "/LOG=$machineLog"
+          )
+
+          # Every assertion from here on is collected rather than exited on: the cleanup at the
+          # bottom has to run whatever they decide, or a failure here leaves a service and two
+          # installs standing for every step after it. The exit is the last thing in the step.
+          $failures = @()
+          # The preflight is what "exit 0" proves. It ran Get-AdoptionPlan with the per-user task
+          # registered, and a refusal there would have been exit 7 with nothing installed. The
+          # script prints "preflight ok" to the preflight log, which lives in {tmp} and goes when
+          # Setup goes, so the setup log is asked for the absence of the refusal instead.
+          if ($m.Hung) { $failures += 'the adopting machine-wide install never returned' }
+          if ($m.ExitCode -ne 0) {
+            $failures += "the adopting install exited $($m.ExitCode); 0 is a preflight that accepted an adoption, 7 is one that refused it"
+          }
+          if ($m.SetupLog -match 'This machine-wide install would be refused:') {
+            $failures += "the preflight refused the adoption it was asked for; the reason is in $machineLog"
+          }
+
+          # Same budget as the "service runs" step above: 60 one-second polls.
+          $svc = $null
+          for ($i = 0; $i -lt 60; $i++) {
+            $svc = Get-Service -Name sukarfleet-node -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Running') { break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $svc) {
+            $failures += 'the adopting install registered no sukarfleet-node service'
+          } elseif ($svc.Status -ne 'Running') {
+            $failures += "service sukarfleet-node is $($svc.Status) after 60 seconds"
+          } else {
+            Write-Host 'service sukarfleet-node: Running'
+          }
+
+          # One identity per PC is the whole reason adoption exists. A surviving task would mean
+          # this machine now starts two nodes that fight over the same repos.
+          $task = Get-ScheduledTask -TaskName sukarfleet -ErrorAction SilentlyContinue
+          if ($task) {
+            $failures += "the per-user scheduled task sukarfleet is still registered ($($task.State)): the machine would run two nodes"
+          } else {
+            Write-Host 'scheduled task sukarfleet: gone, which is what adoption unregisters'
+          }
+
+          $machineKeyHash = Get-MachineKeyHash -Path (Join-Path $nodeDir 'machine-key.json')
+          $machineSshPubFile = Join-Path $nodeDir 'id_sukarfleet_ed25519.pub'
+          $machineSshPub = '<missing>'
+          if (Test-Path -LiteralPath $machineSshPubFile) { $machineSshPub = (Get-Content -Raw -LiteralPath $machineSshPubFile).Trim() }
+          $machineConfigFile = Join-Path $nodeDir 'config.json'
+          $machineMachine = '<missing>'
+          if (Test-Path -LiteralPath $machineConfigFile) {
+            $machineMachine = [string] ((Get-Content -Raw -LiteralPath $machineConfigFile | ConvertFrom-Json).machine)
+          }
+          Write-Host "machine-wide config:      $machineConfigFile (machine=$machineMachine)"
+          Write-Host "machine-wide machine key: $machineKeyHash"
+          Write-Host "machine-wide ssh key:     $machineSshPub"
+          if ($machineKeyHash -ne $userKeyHash) {
+            $failures += "machine-key.json did not travel: the adopted node holds $machineKeyHash, the per-user node held $userKeyHash, and every peer would have to pair with this machine again"
+          }
+          if ($machineSshPub -ne $userSshPub) {
+            $failures += 'the fleet SSH key did not travel: the adopted node holds a different one than the node it adopted'
+          }
+          if ($machineMachine -ne $userMachine) {
+            $failures += "the adopted config says machine=$machineMachine and the per-user config said machine=$userMachine"
+          }
+
+          # --- cleanup -------------------------------------------------------------
+          # Both scopes are installed at this point: adoption takes the per-user node's identity
+          # and unregisters its task, and leaves the per-user Setup entry alone. HKLM first, so
+          # the service lets go of its files before the per-user copy goes.
+          $roots = @(
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+          )
+          $entries = @()
+          foreach ($root in $roots) {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            foreach ($key in Get-ChildItem -LiteralPath $root) {
+              $props = Get-ItemProperty -LiteralPath $key.PSPath
+              if ($props.DisplayName -and $props.DisplayName -match 'sukarfleet') {
+                Write-Host "uninstall entry: $($key.PSPath)"
+                $entries += $props
+              }
+            }
+          }
+          if ($entries.Count -eq 0) {
+            $failures += 'neither install registered an uninstaller, so there was no supported way to clean up'
+          }
+          foreach ($entry in $entries) {
+            # Inno records the scope it was installed in as a switch on the uninstall string, and
+            # dropping it sends the uninstaller looking in the wrong registry hive. Keep whatever
+            # is there and add ours.
+            $command = $entry.UninstallString
+            if ($command -match '^"([^"]+)"\s*(.*)$') {
+              $uninstaller = $Matches[1]
+              $rest = $Matches[2]
+            } else {
+              $uninstaller = $command
+              $rest = ''
+            }
+            $argv = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
+            if ($rest) { $argv += ($rest -split '\s+' | Where-Object { $_ }) }
+            Write-Host "running: $uninstaller $($argv -join ' ')"
+            $un = Start-Process -FilePath $uninstaller -PassThru -ArgumentList $argv
+            $un.WaitForExit()
+            # Printed, not asserted. The per-user uninstaller runs Uninstall-UserNode.ps1 against
+            # a machine whose scheduled task adoption already took away, which is a thing it is
+            # allowed to find; the state left behind is asserted below instead.
+            Write-Host "uninstaller exit code: $($un.ExitCode)"
+            # Inno's uninstaller copies itself into TEMP and re-launches, so the process started
+            # above returns long before the work is done, and the first process exits before its
+            # TEMP copy has even started. One empty poll proves nothing: the quiet has to last.
+            # Five consecutive empty polls, two seconds apart, is the bar.
+            $settled = $false
+            $quiet = 0
+            for ($i = 0; $i -lt 150; $i++) {
+              $running = @(Get-Process -ErrorAction SilentlyContinue |
+                Where-Object { $_.ProcessName -like 'unins*' -or $_.ProcessName -like '_iu*' })
+              if ($running.Count -eq 0) { $quiet++ } else { $quiet = 0 }
+              if ($quiet -ge 5) { $settled = $true; break }
+              Start-Sleep -Seconds 2
+            }
+            if (-not $settled) {
+              Write-Host 'an uninstaller process was still running after 5 minutes:'
+              Get-Process | Where-Object { $_.ProcessName -like 'unins*' -or $_.ProcessName -like '_iu*' } |
+                ForEach-Object { Write-Host "  pid $($_.Id): $($_.ProcessName)" }
+              $failures += "the uninstaller for $($entry.DisplayName) never settled"
+            }
+          }
+          $gone = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            if (-not (Get-Service -Name sukarfleet-node -ErrorAction SilentlyContinue)) { $gone = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $gone) { $failures += 'service sukarfleet-node survived the cleanup uninstall' }
+          if (Get-ScheduledTask -TaskName sukarfleet -ErrorAction SilentlyContinue) {
+            $failures += 'scheduled task sukarfleet survived the cleanup uninstall'
+          }
+          # The machine-wide uninstall keeps the node directory on purpose, which is the
+          # documented contract, so it is reported rather than asserted away.
+          Write-Host "kept after cleanup: $nodeDir -> $(Test-Path -LiteralPath $nodeDir)"
+
+          if ($failures.Count -gt 0) {
+            foreach ($f in $failures) { Write-Host $f }
+            exit 1
+          }
+          Write-Host 'a machine-wide install adopted the per-user node: preflight passed, service running, task gone, same identity'
 
       # A no-op until the secret exists, and that is the whole point of it being
       # here: the step is written, reviewed and skipped rather than invented in a
