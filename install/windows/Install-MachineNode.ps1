@@ -488,7 +488,12 @@ function Get-AdoptionPlan {
     # check would refuse to answer and the refusal would look like a broken repo. An
     # administrator reading a tree it is about to move is exactly the case that check is not
     # about, and nothing is written to the repo here.
-    $status = Invoke-Native -Exe 'git' -Arguments @('-c', 'safe.directory=*', '-C', $path, 'status', '--porcelain')
+    #
+    # --no-optional-locks because `git status` refreshes the stat cache and rewrites .git/index
+    # on its way out, and this call happens on the -Preflight pass too: a pass that is only
+    # being asked "would this be refused?" must not write inside a repository it has not been
+    # given yet. It also keeps the answer out of the way of whatever that account has open.
+    $status = Invoke-Native -Exe 'git' -Arguments @('-c', 'safe.directory=*', '--no-optional-locks', '-C', $path, 'status', '--porcelain')
     if ($status.ExitCode -ne 0) {
       Write-Host ($status.Output | Out-String)
       Write-Die "git could not read the state of '$name' at $path. Nothing was stopped and nothing was moved."
@@ -555,6 +560,15 @@ function Get-AdoptionPlan {
 
 function Test-InstallRefusals {
   param([Parameter(Mandatory)] [string] $StageDir)
+
+  # -SecretWillBeStaged answers "is there a secret at all" for a file that does not exist yet,
+  # which is only true of a preflight. A real run that took it would install a mesh stage with
+  # no secret to hand it and find out at the prompt nobody is watching. Refused here rather
+  # than documented, because a switch that is only honoured by convention is honoured until it
+  # is not.
+  if ($SecretWillBeStaged -and -not $Preflight) {
+    Write-Die '-SecretWillBeStaged is a preflight-only switch: a real run has to be handed the secret file itself. Nothing was installed.'
+  }
 
   if (-not (Test-Elevated)) {
     Write-Die 'this installs a Windows service, writes under C:\ProgramData and C:\Program Files, and edits the system git config. It needs administrator rights. Nothing was installed.'

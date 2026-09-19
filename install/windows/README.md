@@ -189,9 +189,18 @@ script it ran.
 
 A machine-wide install refused before anything is written, whether for a missing mesh address, a
 missing git, a per-user node nobody asked to adopt or an adoption whose repositories have
-uncommitted work in them, ends Setup with exit code 7 and the reason in the `/LOG` file, and
-nothing at all was installed. A machine-wide install that failed after its files were in place,
-such as a service that registers and then will not start, exits 0 with the reason in
+uncommitted work in them, ends Setup with exit code 7 and nothing at all was installed. The
+`/LOG` file and the message box both carry the refusal from its `ERROR:` line to the end of what
+the script printed, so a refusal that lists what it found -- the file paths in a repository with
+uncommitted work, for one -- arrives with its reason at the top rather than cut off above it.
+
+Exit code 7 belongs to the machine-wide scope alone. A per-user install has no preflight: it
+refuses from inside the install itself, which Setup does not read an exit code from, so Setup
+exits 0 and the reason is in `%LOCALAPPDATA%\sukarfleet\install-user.log`. The files Setup had
+already copied are still on disk, and the uninstaller in Apps and features is what removes them.
+
+A machine-wide install that failed after its files were in place, such as a service that
+registers and then will not start, exits 0 with the reason in
 `C:\ProgramData\sukarfleet\install-machine.log` and in a message box, and the software is on the
 machine, so the uninstaller in Apps and features is the way back off it.
 

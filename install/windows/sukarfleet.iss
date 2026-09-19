@@ -64,13 +64,12 @@ Source: "{#SrcRoot}\tsconfig.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SrcRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SrcRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
-; The two files PrepareToInstall needs before anything at all is installed. dontcopy keeps them
-; in the EXE rather than copying them into {app} from here, and ExtractTemporaryFile puts them
-; in {tmp} on demand -- the only way to ask Install-MachineNode.ps1 whether this machine would
-; be refused while there is still nothing on disk to take back off it. The copies the node runs
-; from arrive with the install\* entry above; these two are read once and thrown away with {tmp}.
+; The one file PrepareToInstall needs before anything at all is installed. dontcopy keeps it in
+; the EXE rather than copying it into {app} from here, and ExtractTemporaryFile puts it in {tmp}
+; on demand -- the only way to ask Install-MachineNode.ps1 whether this machine would be refused
+; while there is still nothing on disk to take back off it. The copy the node runs from arrives
+; with the install\* entry above; this one is read once and thrown away with {tmp}.
 Source: "{#SrcRoot}\install\windows\Install-MachineNode.ps1"; Flags: dontcopy
-Source: "{#SrcRoot}\install\windows\Pins.ps1"; Flags: dontcopy
 
 [Registry]
 ; The uninstaller reads this to name the shared root in what it says it left behind. It changes
@@ -562,23 +561,55 @@ end;
 // Install-Sukarfleet.ps1 refuses for itself from the [Run] hook.
 // ---------------------------------------------------------------------------
 
-// The last non-empty lines of a file, oldest first, as one string. The refusal sentence is the
-// last thing Install-MachineNode.ps1 prints, and the two or three lines before it are the ones
-// that say where it got to.
-function LastLinesOf(const Path: String; Count: Integer): String;
+// The refusal, and everything printed after it, as one string. Write-Die's line is
+// "[machine] t+Ns  ERROR: <sentence>", and a refusal that shows its evidence prints that
+// evidence underneath: the dirty-repository refusal follows its sentence with up to ten
+// indented porcelain lines. Reading the last few lines of the log therefore came back holding
+// the file paths and none of the reason. The block is cut at the LAST "ERROR:" line instead and
+// runs to the end of the file, capped so a long one cannot fill the box. A log with no such
+// line at all fell over some other way, and its last few lines are the only thing left that
+// says anything. {tmp}\preflight.log goes when Setup does, so what is not taken out of here is
+// not anywhere.
+function RefusalFrom(const Path: String; Fallback, Cap: Integer): String;
 var
   Lines: TArrayOfString;
-  I, Taken: Integer;
+  I, Count, First, Taken: Integer;
   S: String;
 begin
   Result := '';
   if not LoadStringsFromFile(Path, Lines) then Exit;
-  Taken := 0;
-  // Walked to the end rather than broken out of: a few dozen lines cost nothing, and Break and
-  // Continue are two more things to be sure of in a language this file only speaks here.
-  for I := GetArrayLength(Lines) - 1 downto 0 do
+  Count := GetArrayLength(Lines);
+  // Every line is looked at rather than the walk being broken out of: a few dozen lines cost
+  // nothing, and Break and Continue are two more things to be sure of in a language this file
+  // only speaks here. The last match wins because nothing guards the assignment.
+  First := -1;
+  for I := 0 to Count - 1 do
   begin
-    if Taken < Count then
+    if Pos('ERROR:', Lines[I]) > 0 then First := I;
+  end;
+  Taken := 0;
+  if First < 0 then
+  begin
+    for I := Count - 1 downto 0 do
+    begin
+      if Taken < Fallback then
+      begin
+        S := Trim(Lines[I]);
+        if S <> '' then
+        begin
+          if Result = '' then
+            Result := S
+          else
+            Result := S + #13#10 + Result;
+          Taken := Taken + 1;
+        end;
+      end;
+    end;
+    Exit;
+  end;
+  for I := First to Count - 1 do
+  begin
+    if Taken < Cap then
     begin
       S := Trim(Lines[I]);
       if S <> '' then
@@ -586,7 +617,7 @@ begin
         if Result = '' then
           Result := S
         else
-          Result := S + #13#10 + Result;
+          Result := Result + #13#10 + S;
         Taken := Taken + 1;
       end;
     end;
@@ -627,18 +658,17 @@ begin
   Result := '';
   if not IsAdminInstallMode then Exit;
 
-  // Pins.ps1 travels with it because Install-MachineNode.ps1 dot-sources it by name out of the
-  // directory it is run from. The preflight does not get as far as the first pinned download,
-  // but a script that is missing a file it sources is a refusal about the wrong thing.
+  // The script alone, and nothing it would otherwise need beside it. A -Preflight pass answers
+  // and exits before the line that dot-sources Pins.ps1 out of {app}, and before anything else
+  // reads the tree it is asked about, so the copy in {tmp} is the only file this stage opens.
   try
     ExtractTemporaryFile('Install-MachineNode.ps1');
-    ExtractTemporaryFile('Pins.ps1');
   except
     // ExtractTemporaryFile raises rather than returning, and an exception out of this function
     // is not one of the ones that end Setup either. Caught, so the answer is still a returned
     // string and still exit code 7.
     Result := 'This machine-wide install would be refused:' + #13#10 +
-      'the preflight scripts could not be unpacked: ' + GetExceptionMessage + #13#10 +
+      'the preflight script could not be unpacked: ' + GetExceptionMessage + #13#10 +
       'Nothing was installed.';
     Log(Result);
     Exit;
@@ -659,7 +689,7 @@ begin
   end;
   if ResultCode = 0 then Exit;
 
-  Reason := LastLinesOf(LogPath, 5);
+  Reason := RefusalFrom(LogPath, 5, 15);
   if Reason = '' then
     Reason := 'the preflight exited ' + IntToStr(ResultCode) + ' and wrote nothing to ' + LogPath + '.';
   Result := 'This machine-wide install would be refused:' + #13#10 + Reason + #13#10 +
