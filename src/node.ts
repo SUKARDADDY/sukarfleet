@@ -614,6 +614,9 @@ async function main(): Promise<void> {
     onIndexRepaired: (repoName, quarantinedTo) => {
       log('warn', 'sync: corrupt git index rebuilt from HEAD', { repo: repoName, quarantinedTo });
     },
+    onObjectsRepaired: (repoName, quarantinedTo, recoveredFrom) => {
+      log('warn', 'sync: empty git objects refetched', { repo: repoName, quarantinedTo, recoveredFrom });
+    },
   });
 
   const health = new Health(cfg);

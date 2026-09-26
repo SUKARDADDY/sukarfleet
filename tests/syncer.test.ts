@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Syncer, isCorruptIndexError, type SyncerDeps, type SyncerOptions } from '../src/syncer';
+import { Syncer, isCorruptIndexError, isEmptyObjectError, type SyncerDeps, type SyncerOptions } from '../src/syncer';
 import { defaultConfig } from '../src/config';
 import { run } from '../src/util';
 import type { RunOptions, RunResult } from '../src/util';
@@ -68,6 +68,7 @@ interface Recorder {
   conflicts: string[];
   notApplicable: string[];
   repairs: { repo: string; quarantinedTo: string }[];
+  objectRepairs: { repo: string; quarantinedTo: string; recoveredFrom: string }[];
 }
 
 function recorder(vetted = true): Recorder {
@@ -76,12 +77,14 @@ function recorder(vetted = true): Recorder {
   const conflicts: string[] = [];
   const notApplicable: string[] = [];
   const repairs: { repo: string; quarantinedTo: string }[] = [];
+  const objectRepairs: { repo: string; quarantinedTo: string; recoveredFrom: string }[] = [];
   return {
     stats,
     pushes,
     conflicts,
     notApplicable,
     repairs,
+    objectRepairs,
     deps: {
       isClockVetted: () => vetted,
       onRepoStat: (_r, s) => stats.push(s),
@@ -89,6 +92,7 @@ function recorder(vetted = true): Recorder {
       onGithubPushNotApplicable: (r) => notApplicable.push(r),
       onConflictArtifact: (_r, p) => conflicts.push(p),
       onIndexRepaired: (r, quarantinedTo) => repairs.push({ repo: r, quarantinedTo }),
+      onObjectsRepaired: (r, quarantinedTo, recoveredFrom) => objectRepairs.push({ repo: r, quarantinedTo, recoveredFrom }),
       machineKey: TEST_MACHINE_KEY,
     },
   };
@@ -975,4 +979,133 @@ test('a sync failure that is not index corruption is never repaired or retried',
   expect(recA.stats[0]!.syncError).toContain('refusing sync');
   const entries = await readdir(join(dirA, '.git'));
   expect(entries.filter((e) => e.startsWith('index.corrupt-')).length).toBe(0);
+});
+
+
+// --- empty loose object self-repair ----------------------------------------
+// What a lost page cache did to two synced repos on a live node: the files under the sync branch's
+// tip commit (and a few others) came back zero bytes long. `git status` then fails with
+// `object file ... is empty` / `bad object HEAD` before autoCommit can do anything, and the repo
+// stopped syncing for three days until a human refetched the objects by hand.
+async function emptyObject(repoDir: string, oid: string): Promise<void> {
+  const p = join(repoDir, '.git', 'objects', oid.slice(0, 2), oid.slice(2));
+  await chmod(p, 0o644);
+  await writeFile(p, '');
+}
+
+test('isEmptyObjectError matches git\'s zero-byte object wording and nothing broader', () => {
+  expect(
+    isEmptyObjectError(
+      'git status --porcelain -z failed (code 128): error: object file .git/objects/f7/bbed1ace04371241abadebeb7a919e0ed7d1ee is empty\nfatal: bad object HEAD',
+    ),
+  ).toBe(true);
+  // A missing object is not necessarily crash damage: a ref can name something never fetched.
+  expect(isEmptyObjectError('fatal: bad object HEAD')).toBe(false);
+  expect(isEmptyObjectError('fatal: missing object 3e24a370be8d3fb70af76c058bd91a404757b88a for refs/heads/sync/x')).toBe(false);
+  expect(isEmptyObjectError('fatal: unknown index entry format 0xe2760000')).toBe(false);
+});
+
+test('empty loose objects are quarantined, refetched from a peer, and the cycle completes', async () => {
+  const { dirA, dirB, syncA, syncB, recA, repoA, repoB } = await setupPair({ 'a.txt': 'one' });
+
+  // A commits, B pulls it: the peer now holds every object A is about to lose.
+  await writeFile(join(dirA, 'a.txt'), 'two');
+  await syncA.syncOnce(repoA);
+  await syncB.syncOnce(repoB);
+  const tip = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  const tree = (await git(dirA, ['rev-parse', 'HEAD^{tree}'])).stdout.trim();
+  expect((await git(dirB, ['cat-file', '-t', tip])).stdout.trim()).toBe('commit');
+
+  // Pending work, then the crash.
+  await writeFile(join(dirA, 'a.txt'), 'three');
+  await emptyObject(dirA, tip);
+  await emptyObject(dirA, tree);
+  expect((await run(['git', 'status', '--porcelain'], { cwd: dirA })).code).not.toBe(0);
+
+  await syncA.syncOnce(repoA);
+
+  expect(recA.objectRepairs.length).toBe(1);
+  expect(recA.objectRepairs[0]!.recoveredFrom).toBe('fleet-beta');
+  // Both dead files are kept under their object ids, still zero bytes.
+  const kept = (await readdir(recA.objectRepairs[0]!.quarantinedTo)).sort();
+  expect(kept).toEqual([tip, tree].sort());
+  expect((await stat(join(recA.objectRepairs[0]!.quarantinedTo, tip))).size).toBe(0);
+
+  // The retried cycle committed the pending edit on top of the recovered tip (and may have merged
+  // the peer's branch after it, so ancestry rather than HEAD^).
+  expect((await run(['git', 'merge-base', '--is-ancestor', tip, 'HEAD'], { cwd: dirA })).code).toBe(0);
+  expect((await run(['git', 'fsck', '--connectivity-only', '--no-dangling'], { cwd: dirA })).code).toBe(0);
+  expect((await git(dirA, ['show', 'HEAD:a.txt'])).stdout).toBe('three');
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect(recA.repairs.length).toBe(0);
+});
+
+test('an empty object no remote holds is reported, not papered over, and never retried', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+
+  // A commit that never left this machine: no peer can hand it back.
+  await writeFile(join(dirA, 'a.txt'), 'local only');
+  await git(dirA, ['commit', '-q', '-am', 'never synced']);
+  const tip = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  await emptyObject(dirA, tip);
+
+  const before = recA.stats.length;
+  await syncA.syncOnce(repoA);
+
+  expect(recA.objectRepairs.length).toBe(0);
+  expect(recA.stats.length - before).toBe(1); // one attempt, not two
+  expect(recA.stats.at(-1)!.syncError).toContain('is empty');
+  // The dead file was still moved aside, so the next cycle reports the missing object plainly
+  // and does not match isEmptyObjectError again.
+  const quarantines = (await readdir(join(dirA, '.git'))).filter((e) => e.startsWith('objects.empty-'));
+  expect(quarantines.length).toBe(1);
+  expect(await readdir(join(dirA, '.git', quarantines[0]!))).toEqual([tip]);
+  await syncA.syncOnce(repoA);
+  expect(recA.stats.at(-1)!.syncError).not.toContain('is empty');
+  expect((await readdir(join(dirA, '.git'))).filter((e) => e.startsWith('objects.empty-')).length).toBe(1);
+});
+
+test('an empty object while every remote is down is put back, and repaired once one answers', async () => {
+  const { dirA, dirB, syncA, syncB, recA, repoA, repoB } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, 'a.txt'), 'two');
+  await syncA.syncOnce(repoA);
+  await syncB.syncOnce(repoB);
+  const tip = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  await emptyObject(dirA, tip);
+
+  // The reboot that caused the damage: the mesh is not up yet.
+  await git(dirA, ['remote', 'set-url', 'fleet-beta', `file://${join(dirB, 'not-there')}`]);
+  await syncA.syncOnce(repoA);
+  expect(recA.objectRepairs.length).toBe(0);
+  // Put back under its own name, so the next cycle fails the same way instead of going quiet.
+  expect((await stat(join(dirA, '.git', 'objects', tip.slice(0, 2), tip.slice(2)))).size).toBe(0);
+  expect(recA.stats.at(-1)!.syncError).toContain('is empty');
+
+  await git(dirA, ['remote', 'set-url', 'fleet-beta', `file://${dirB}`]);
+  await syncA.syncOnce(repoA);
+  expect(recA.objectRepairs.length).toBe(1);
+  expect(recA.objectRepairs[0]!.recoveredFrom).toBe('fleet-beta');
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+});
+
+test('a lost blob that was only staged is dropped from the index and re-staged from the worktree', async () => {
+  const { dirA, dirB, syncA, syncB, recA, repoA, repoB } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, 'a.txt'), 'two');
+  await syncA.syncOnce(repoA);
+  await syncB.syncOnce(repoB);
+  const tip = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+
+  // Staged when the machine died: the blob is on no remote, only in the worktree.
+  await writeFile(join(dirA, 'b.txt'), 'staged only');
+  await git(dirA, ['add', 'b.txt']);
+  const blob = (await git(dirA, ['rev-parse', ':b.txt'])).stdout.trim();
+  await emptyObject(dirA, blob);
+  await emptyObject(dirA, tip);
+
+  await syncA.syncOnce(repoA);
+
+  expect(recA.objectRepairs.length).toBe(1);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect((await git(dirA, ['show', 'HEAD:b.txt'])).stdout).toBe('staged only');
+  expect((await run(['git', 'fsck', '--connectivity-only', '--no-dangling'], { cwd: dirA })).code).toBe(0);
 });
