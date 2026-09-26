@@ -2,8 +2,8 @@
 // Section 03 sync cycle: multi-repo peer-to-peer git state machine.
 // Single writer per machine on sync/<machine>. main is never touched here.
 
-import { join, dirname } from 'node:path';
-import { rename, stat } from 'node:fs/promises';
+import { join, dirname, isAbsolute } from 'node:path';
+import { mkdir, readdir, rename, stat } from 'node:fs/promises';
 import type { FleetConfig, RepoConfig, PresenceRepoStat, MachineKey } from './types';
 import { run, runBytes, log, atomicWrite, nowMs, sleep as utilSleep, TransitionGate } from './util';
 import { buildAuthHeader } from './keys';
@@ -27,6 +27,10 @@ export interface SyncerDeps {
   // repair from the log line repairIndex writes anyway. It exists so a caller can surface the
   // quarantine path somewhere an operator will actually look.
   onIndexRepaired?: (repo: string, quarantinedTo: string) => void;
+  // Fired after zero-byte loose objects were quarantined and refetched (see repairEmptyObjects).
+  // Optional and additive, for the same reason as onIndexRepaired. `recoveredFrom` names the
+  // remote whose refetch made the object store whole again.
+  onObjectsRepaired?: (repo: string, quarantinedTo: string, recoveredFrom: string) => void;
   // This machine's signing identity. Required to attach the x-fleet-auth header that
   // gitserve.ts mandates on every peer fetch (see fetchAll below). Contract addition —
   // callers construct this the same way Gossip does, via keys.loadOrCreateMachineKey().
@@ -53,6 +57,9 @@ export interface SyncerOptions {
   pushBackoffMs?: number[];
   gitTimeoutMs?: number;
   fetchTimeoutMs?: number;
+  // Bound on one `fetch --refetch` during object repair. It downloads the whole repo, as a fresh
+  // clone would, so the ordinary fetch bound is too tight for it.
+  refetchTimeoutMs?: number;
   postMergeTimeoutMs?: number;
   now?: () => number;
   // Test seam for the git subprocess (mirrors sshadmin.ts's deps.runner convention). Defaults to
@@ -83,6 +90,7 @@ export class Syncer {
   private readonly pushBackoffMs: number[];
   private readonly gitTimeoutMs: number;
   private readonly fetchTimeoutMs: number;
+  private readonly refetchTimeoutMs: number;
   private readonly postMergeTimeoutMs: number;
   private readonly now: () => number;
   private readonly gitRunner: typeof run;
@@ -103,6 +111,7 @@ export class Syncer {
     this.pushBackoffMs = opts.pushBackoffMs ?? [5000, 15000, 45000];
     this.gitTimeoutMs = opts.gitTimeoutMs ?? 60000;
     this.fetchTimeoutMs = opts.fetchTimeoutMs ?? 60000;
+    this.refetchTimeoutMs = opts.refetchTimeoutMs ?? 300000;
     this.postMergeTimeoutMs = opts.postMergeTimeoutMs ?? 120000;
     this.now = opts.now ?? nowMs;
     this.gitRunner = opts.gitRunner ?? run;
@@ -170,19 +179,23 @@ export class Syncer {
   // so a machine that loses it to an unclean shutdown is not damaged, it is merely stuck, and it
   // stays stuck forever without this: `git status` is the first thing autoCommit runs, so the repo
   // never syncs, never pushes, and reports the same fault every alarm interval until a human runs
-  // two commands. Nothing else here self-heals, deliberately -- see repairIndex for the line.
+  // two commands. A cycle that fails on EMPTY LOOSE OBJECTS is retried once too, after
+  // repairEmptyObjects refetches them. Nothing else here self-heals, deliberately -- see
+  // repairIndex and repairEmptyObjects for the line.
   async syncOnce(repo: RepoConfig): Promise<SyncOnceResult> {
     const first = await this.runCycle(repo);
-    if (!first.corruptIndex) return { originFetchOk: first.originFetchOk };
-    if (!(await this.repairIndex(repo))) return { originFetchOk: first.originFetchOk };
+    if (first.damage === null) return { originFetchOk: first.originFetchOk };
+    const repaired =
+      first.damage === 'index' ? await this.repairIndex(repo) : await this.repairEmptyObjects(repo);
+    if (!repaired) return { originFetchOk: first.originFetchOk };
     const second = await this.runCycle(repo);
     return { originFetchOk: second.originFetchOk };
   }
 
-  // One attempt at a full cycle. Reports whether it died on a corrupt index so syncOnce can
-  // decide to repair and re-enter; every other outcome is already fully reported through
-  // onRepoStat before this returns.
-  private async runCycle(repo: RepoConfig): Promise<{ originFetchOk: boolean | null; corruptIndex: boolean }> {
+  // One attempt at a full cycle. Reports whether it died on repairable local git damage so
+  // syncOnce can decide to repair and re-enter; every other outcome is already fully reported
+  // through onRepoStat before this returns.
+  private async runCycle(repo: RepoConfig): Promise<{ originFetchOk: boolean | null; damage: RepairableDamage | null }> {
     let originFetchOk: boolean | null = false;
     try {
       const branchR = await this.gitOk(repo.path, ['symbolic-ref', '--short', 'HEAD']);
@@ -206,7 +219,7 @@ export class Syncer {
 
       const lastCommit = await this.head(repo.path);
       this.deps.onRepoStat(repo.name, { lastSyncOkMs: this.now(), lastCommit, syncError: null });
-      return { originFetchOk, corruptIndex: false };
+      return { originFetchOk, damage: null };
     } catch (err) {
       // Never leave the repo wedged mid-merge.
       await this.git(repo.path, ['merge', '--abort']).catch(() => {});
@@ -214,7 +227,12 @@ export class Syncer {
       const msg = err instanceof Error ? err.message : String(err);
       log('error', 'sync cycle failed', { repo: repo.name, error: msg });
       this.deps.onRepoStat(repo.name, { lastSyncOkMs: null, lastCommit, syncError: msg });
-      return { originFetchOk, corruptIndex: isCorruptIndexError(msg) };
+      const damage: RepairableDamage | null = isCorruptIndexError(msg)
+        ? 'index'
+        : isEmptyObjectError(msg)
+          ? 'empty-objects'
+          : null;
+      return { originFetchOk, damage };
     }
   }
 
@@ -237,7 +255,7 @@ export class Syncer {
     if (indexPathR.code !== 0) return false;
     const rel = indexPathR.stdout.trim();
     if (rel.length === 0) return false;
-    const indexPath = rel.startsWith('/') ? rel : join(repo.path, rel);
+    const indexPath = isAbsolute(rel) ? rel : join(repo.path, rel);
     const quarantine = `${indexPath}.corrupt-${this.fsIso()}`;
 
     try {
@@ -282,6 +300,172 @@ export class Syncer {
     log('warn', 'index repair: rebuilt a corrupt git index from HEAD', { repo: repo.name, quarantine });
     this.deps.onIndexRepaired?.(repo.name, quarantine);
     return true;
+  }
+
+  // Quarantine every zero-byte loose object and refetch the store from the remotes, one at a time,
+  // until it is whole again. Returns whether it is -- a false answer means
+  // the cycle should NOT be retried, and the original error stands as the reported fault.
+  //
+  // Why this repair clears the same bar as repairIndex: a loose object is named by the hash of its
+  // content, and git writes one to a temp file and renames it into place, so a zero-byte file
+  // under an object's final name is never a write in progress and never a valid object. It is
+  // what a lost page cache leaves behind. Moving it aside discards nothing, and a refetch can only
+  // bring back the exact bytes that hash, because git verifies every object it receives. What it
+  // cannot do is invent an object no remote has: a commit made here and lost before any push stays
+  // lost, the repair reports failure, and a human decides.
+  //
+  // --refetch, not a plain fetch: a plain one negotiates from the local refs, and when a ref names
+  // one of the emptied objects the negotiation itself dies ("did not send all necessary objects").
+  // A refetch sends no haves and takes the whole pack, as a fresh clone would. Fleet peers are
+  // tried before origin: the mesh is cheaper than GitHub, and a peer may hold commits this machine
+  // synced to it but never pushed.
+  //
+  // When no remote answered at all (the usual state for a minute after the reboot that caused
+  // this), the empty files are put back, so the next cycle fails the same way and tries again.
+  // Leaving them moved would turn the error into "bad object", which no longer matches, and one
+  // offline cycle would disable the repair for good. When a remote did answer and the store is
+  // still not whole, the object really is gone: the files stay quarantined, the next error names
+  // a missing object, and the repair does not run again.
+  private async repairEmptyObjects(repo: RepoConfig): Promise<boolean> {
+    const objectsPathR = await this.git(repo.path, ['rev-parse', '--git-path', 'objects']);
+    if (objectsPathR.code !== 0) return false;
+    const rel = objectsPathR.stdout.trim();
+    if (rel.length === 0) return false;
+    const objectsDir = isAbsolute(rel) ? rel : join(repo.path, rel);
+    const loosePath = (oid: string) => join(objectsDir, oid.slice(0, 2), oid.slice(2));
+
+    const empties = await findEmptyLooseObjects(objectsDir);
+    if (empties.length === 0) return false;
+
+    // Kept, not deleted, for the same reason as the corrupt index: the files carry no bytes, but
+    // their names and mtimes say which objects a crash took and when.
+    const quarantine = join(dirname(objectsDir), `objects.empty-${this.fsIso()}`);
+    const moved: string[] = [];
+    try {
+      await mkdir(quarantine, { recursive: true });
+      for (const oid of empties) {
+        await rename(loosePath(oid), join(quarantine, oid));
+        moved.push(oid);
+      }
+    } catch (err) {
+      log('error', 'object repair: could not quarantine empty objects', {
+        repo: repo.name,
+        error: String(err),
+      });
+      await this.unquarantine(repo, quarantine, moved, loosePath);
+      return false;
+    }
+
+    const succeed = (source: string): true => {
+      log('warn', 'object repair: restored empty loose objects', {
+        repo: repo.name,
+        source,
+        objects: empties.length,
+        quarantine,
+      });
+      this.deps.onObjectsRepaired?.(repo.name, quarantine, source);
+      return true;
+    };
+
+    const remotesR = await this.git(repo.path, ['remote']);
+    const present = new Set(
+      remotesR.code === 0 ? remotesR.stdout.split('\n').map((s) => s.trim()).filter(Boolean) : [],
+    );
+    const order = [...this.remoteNames().filter((r) => r !== 'origin'), 'origin'];
+    let anyAnswered = false;
+    for (const remote of order) {
+      if (!present.has(remote)) continue;
+      const args = await this.fetchAuthArgs(repo, remote);
+      args.push('fetch', '--refetch', remote);
+      // A dead peer must not cost the full refetch bound; a live one on the mesh finishes well
+      // inside a minute.
+      const timeoutMs = remote.startsWith('fleet-') ? Math.min(this.refetchTimeoutMs, 60000) : this.refetchTimeoutMs;
+      const r = await this.git(repo.path, args, timeoutMs);
+      this.deps.onStep?.();
+      if (r.code !== 0) {
+        // A refetch also fails against a live remote, when a local ref names an object that remote
+        // never had ("did not send all necessary objects"). That remote answered, and its answer
+        // is that it cannot help. Only a separate probe tells that apart from a dead link.
+        const probeArgs = await this.fetchAuthArgs(repo, remote);
+        probeArgs.push('ls-remote', '--heads', remote);
+        const probeTimeout = remote.startsWith('fleet-') ? Math.min(this.fetchTimeoutMs, 10000) : this.fetchTimeoutMs;
+        if ((await this.git(repo.path, probeArgs, probeTimeout)).code === 0) anyAnswered = true;
+        log('info', 'object repair: refetch failed; trying the next remote', {
+          repo: repo.name,
+          remote,
+          stderr: r.stderr.trim().slice(0, 300),
+        });
+        continue;
+      }
+      anyAnswered = true;
+      if (await this.objectStoreWhole(repo)) return succeed(remote);
+    }
+
+    if (!anyAnswered) {
+      log('warn', 'object repair: no remote reachable; will retry next cycle', {
+        repo: repo.name,
+        objects: empties,
+      });
+      await this.unquarantine(repo, quarantine, moved, loosePath);
+      return false;
+    }
+    log('error', 'object repair: no remote could restore the empty objects', {
+      repo: repo.name,
+      objects: empties,
+      quarantine,
+    });
+    return false;
+  }
+
+  // Is every ref's history present, and can the cycle run? connectivity-only checks that every
+  // object reachable from a ref, the index or a reflog exists, without inflating blobs; with the
+  // zero-byte files moved out, existing is the same as intact for the objects that were lost.
+  //
+  // One recovery on the way: a blob that was staged but not yet committed is on no remote, so a
+  // refetch cannot bring it back and the index alone still points at it. The index is derived state (see repairIndex), so it is
+  // rebuilt from HEAD and the check runs again; autoCommit re-stages the worktree next cycle.
+  private async objectStoreWhole(repo: RepoConfig): Promise<boolean> {
+    const check = async () => {
+      const fsck = await this.git(repo.path, ['fsck', '--connectivity-only', '--no-dangling'], this.refetchTimeoutMs);
+      if (fsck.code !== 0) return false;
+      return (await this.git(repo.path, ['status', '--porcelain', '-z'])).code === 0;
+    };
+    if (await check()) return true;
+    const head = await this.git(repo.path, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']);
+    if (head.code !== 0) return false;
+    if ((await this.git(repo.path, ['read-tree', 'HEAD'])).code !== 0) return false;
+    return await check();
+  }
+
+  // Put quarantined zero-byte files back under their object names, so the next cycle hits the
+  // same "is empty" error and repairs again.
+  private async unquarantine(
+    repo: RepoConfig,
+    quarantine: string,
+    moved: readonly string[],
+    loosePath: (oid: string) => string,
+  ): Promise<void> {
+    for (const oid of moved) {
+      // Something wrote the real object meanwhile (a refetch's loose unpack, a concurrent add):
+      // never clobber it with the empty file.
+      if (await pathExists(loosePath(oid))) continue;
+      try {
+        await rename(join(quarantine, oid), loosePath(oid));
+      } catch (err) {
+        log('error', 'object repair: could not put an empty object back', {
+          repo: repo.name,
+          oid,
+          error: String(err),
+        });
+      }
+    }
+  }
+
+  // The signed x-fleet-auth header a fleet-<peer> fetch needs (see fetchAll); nothing for origin.
+  private async fetchAuthArgs(repo: RepoConfig, remote: string): Promise<string[]> {
+    if (!remote.startsWith('fleet-')) return [];
+    const header = await buildAuthHeader('GIT', `/git/${repo.name}`, this.cfg.machine, this.deps.machineKey);
+    return ['-c', `http.extraHeader=x-fleet-auth: ${header}`];
   }
 
   // (1) auto-commit: write-quiet debounce + per-file (size,mtime) stability re-check.
@@ -347,11 +531,7 @@ export class Syncer {
       // `-c http.extraHeader`. origin (GitHub) uses its own credential handling and needs no
       // header; git ignores http.extraHeader for non-HTTP transports so this is harmless to
       // pass unconditionally to fleet-* fetches only.
-      const args: string[] = [];
-      if (remote.startsWith('fleet-')) {
-        const header = await buildAuthHeader('GIT', `/git/${repo.name}`, this.cfg.machine, this.deps.machineKey);
-        args.push('-c', `http.extraHeader=x-fleet-auth: ${header}`);
-      }
+      const args = await this.fetchAuthArgs(repo, remote);
       args.push('fetch', '--prune', remote);
       // Fleet remotes live on the LAN/mesh: they connect in milliseconds or
       // they are down. A dead peer must cost ~10s, not a full origin-grade
@@ -727,6 +907,47 @@ export function isCorruptIndexError(message: string): boolean {
   const m = message.toLowerCase();
   if (m.includes('index.lock')) return false;
   return CORRUPT_INDEX_PATTERNS.some((p) => m.includes(p));
+}
+
+type RepairableDamage = 'index' | 'empty-objects';
+
+// git's words for a zero-byte loose object: `error: object file .git/objects/f7/bbed... is empty`.
+// Deliberately NOT `bad object` or `missing object` on their own: those also describe a ref that
+// names something never fetched, which a refetch-everything repair has no business treating as
+// crash damage.
+export function isEmptyObjectError(message: string): boolean {
+  return /object file \S+ is empty/i.test(message);
+}
+
+// Every zero-byte loose object under `objectsDir`, as a full hex object id. Packs, info/ and
+// temp files are skipped by shape: only a two-hex-digit directory holding hex-named files is a
+// loose object.
+async function findEmptyLooseObjects(objectsDir: string): Promise<string[]> {
+  const found: string[] = [];
+  let dirs: string[];
+  try {
+    dirs = await readdir(objectsDir);
+  } catch {
+    return found;
+  }
+  for (const d of dirs) {
+    if (!/^[0-9a-f]{2}$/.test(d)) continue;
+    let names: string[];
+    try {
+      names = await readdir(join(objectsDir, d));
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      if (!/^[0-9a-f]{38}([0-9a-f]{24})?$/.test(n)) continue;
+      try {
+        if ((await stat(join(objectsDir, d, n))).size === 0) found.push(d + n);
+      } catch {
+        // Vanished mid-scan (a concurrent gc packed it): not damage.
+      }
+    }
+  }
+  return found;
 }
 
 async function pathExists(p: string): Promise<boolean> {
