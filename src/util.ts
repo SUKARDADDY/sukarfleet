@@ -40,6 +40,9 @@ export interface RunBytesResult {
   stdout: Uint8Array;
   stderr: string;
   truncated?: boolean;
+  // A local deadline or signal supplies no exit status from a remote transport.
+  timedOut?: boolean;
+  signalCode?: string;
 }
 
 const DEFAULT_RUN_TIMEOUT_MS = 60000;
@@ -185,6 +188,8 @@ export async function runBytes(argv: string[], opts: RunOptions = {}): Promise<R
     stdout: stdoutRes.bytes,
     stderr: new TextDecoder().decode(stderrRes.bytes),
   };
+  if (timedOut) result.timedOut = true;
+  if (proc.signalCode) result.signalCode = proc.signalCode;
   // Left absent (not `false`) with no cap, so the uncapped result object keeps its historical shape.
   if (opts.maxCaptureBytes !== undefined) result.truncated = stdoutRes.truncated || stderrRes.truncated;
   return result;

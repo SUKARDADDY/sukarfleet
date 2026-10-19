@@ -4,9 +4,10 @@
 
 import { open, rename, chmod } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
+import { isIP } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { FleetConfig } from './types';
+import type { AccessTargetConfig, FleetConfig } from './types';
 import { ensureDir, log, readJsonFile } from './util';
 
 const CONFIG_FILE_MODE = 0o600;
@@ -232,6 +233,28 @@ function validatePeer(p: unknown, i: number): void {
   }
 }
 
+export function validateAccessTarget(value: unknown): asserts value is AccessTargetConfig {
+  if (!isPlainObject(value)) fail('access target must be an object');
+  if (typeof value.name !== 'string' || !/^[A-Za-z0-9._-]{1,64}$/.test(value.name)) fail('invalid access target name');
+  if (typeof value.host !== 'string' || isIP(value.host) !== 4 || value.host.startsWith('127.') || value.host === '0.0.0.0') {
+    fail('access target host must be a non-loopback IPv4 address');
+  }
+  if (!Number.isInteger(value.port) || (value.port as number) < 1 || (value.port as number) > 65535) fail('invalid access target port');
+  if (typeof value.user !== 'string' || !/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(value.user)) fail('invalid access target user');
+  for (const field of ['identityFile', 'knownHostsFile'] as const) {
+    if (typeof value[field] !== 'string' || !/^(\/|~\/)/.test(value[field]) || /[\r\n\0]/.test(value[field])) {
+      fail(`access target ${field} must be an absolute or home-relative path`);
+    }
+  }
+  if (value.platform !== 'macos' && value.platform !== 'linux') fail('invalid access target platform');
+  if (value.screenshotCommand !== undefined && (!Array.isArray(value.screenshotCommand) ||
+      !value.screenshotCommand.length || value.screenshotCommand.length > 64 ||
+      value.screenshotCommand.some((s) => typeof s !== 'string' || s.includes('\0')) ||
+      !value.screenshotCommand[0] || !value.screenshotCommand.includes('{output}'))) {
+    fail('screenshotCommand must be argv with an {output} argument');
+  }
+}
+
 function validateRepo(r: unknown, i: number): void {
   if (!isPlainObject(r)) fail(`repos[${i}] must be an object`);
   const repo = r as Record<string, unknown>;
@@ -257,6 +280,15 @@ function validate(cfg: FleetConfig): void {
   }
   if (!Array.isArray(cfg.peers)) fail('peers must be an array');
   cfg.peers.forEach((p, i) => validatePeer(p, i));
+  if (cfg.accessTargets !== undefined) {
+    if (!Array.isArray(cfg.accessTargets)) fail('accessTargets must be an array');
+    const names = new Set([cfg.machine, ...cfg.peers.map((p) => p.name)]);
+    for (const target of cfg.accessTargets) {
+      validateAccessTarget(target);
+      if (names.has(target.name)) fail('access target name conflicts with another machine');
+      names.add(target.name);
+    }
+  }
   if (!Array.isArray(cfg.repos)) fail('repos must be an array');
   cfg.repos.forEach((r, i) => validateRepo(r, i));
   if (!Array.isArray(cfg.unionPaths) || cfg.unionPaths.some((p) => typeof p !== 'string')) {

@@ -135,14 +135,14 @@ function rpcRequest(method: string, params?: unknown, id: string | number = 1): 
 }
 
 describe('tools/list', () => {
-  test('returns exactly the four fleet tools', async () => {
+  test('returns the fleet tools, including access-only operations', async () => {
     const { deps } = await makeHarness();
     const handler = createMcpFetchHandler(deps);
     const res = await handler(rpcRequest('tools/list'));
     expect(res.status).toBe(200);
     const body = (await res.json()) as { result: { tools: { name: string }[] } };
     const names = body.result.tools.map((t) => t.name).sort();
-    expect(names).toEqual(['fleet.admin_run', 'fleet.admin_status', 'fleet.peers', 'fleet.tail']);
+    expect(names).toEqual(['fleet.access_list', 'fleet.access_register', 'fleet.admin_run', 'fleet.admin_status', 'fleet.peers', 'fleet.run', 'fleet.screenshot', 'fleet.tail']);
   });
 
   test('fleet.admin_run requires machine, argv and reason, and takes nothing else', async () => {
