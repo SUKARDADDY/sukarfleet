@@ -22,6 +22,18 @@ export interface PeerConfig {
   sshPublicKey?: string | null;
 }
 
+// Access-only targets use a pinned SSH account without running a node or syncing repositories.
+// These paths belong to the originating machine. Private keys never leave it.
+export interface AccessTargetConfig {
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  identityFile: string;
+  knownHostsFile: string;
+  platform: 'macos' | 'linux';
+}
+
 export interface RepoConfig {
   name: string;
   path: string;
@@ -35,6 +47,7 @@ export interface FleetConfig {
   nodePort: number;
   networkName: string;
   peers: PeerConfig[];
+  accessTargets?: AccessTargetConfig[];
   repos: RepoConfig[];
   unionPaths: string[];
   easytier: {

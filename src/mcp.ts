@@ -32,6 +32,7 @@ import type {
   PeerView,
 } from './types';
 import { log } from './util';
+import type { AccessOnly } from './access';
 
 export const MCP_LOOPBACK_HOST = '127.0.0.1';
 export const MCP_LOOPBACK_PORT = 7719;
@@ -71,6 +72,7 @@ export interface McpDeps {
   // compile rather than serve an agent surface that silently does nothing.
   adminRun: (req: AdminRunRequest) => Promise<AdminRunResult>;
   adminStatus: () => Promise<AdminStatusEntry[]>;
+  access?: Pick<AccessOnly, 'call'>;
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +155,38 @@ interface McpToolDef {
 
 const TOOLS: McpToolDef[] = [
   {
+    name: 'fleet.access_list',
+    description: 'List access-only SSH machines registered on this origin. These machines do not run a node or sync repositories. Reachability is not implied.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'fleet.access_register',
+    description: 'Register an access-only SSH machine using an existing private key and pinned known_hosts on this origin. Does not install software or enable sync. Requires the admin lane and agent-origin access. Replacing settings requires replace:true.',
+    inputSchema: { type: 'object', properties: {
+      machine: { type: 'string' }, host: { type: 'string', description: 'Target IPv4 mesh address.' },
+      port: { type: 'integer', default: 22 }, user: { type: 'string' },
+      identityFile: { type: 'string', description: 'Existing private key path on this origin. The key is never returned.' },
+      knownHostsFile: { type: 'string', description: 'Existing known_hosts file containing a pin for this address and port.' },
+      platform: { type: 'string', enum: ['macos', 'linux'] },
+      reason: { type: 'string' }, replace: { type: 'boolean', default: false },
+    }, required: ['machine', 'host', 'user', 'identityFile', 'knownHostsFile', 'platform', 'reason'], additionalProperties: false },
+  },
+  {
+    name: 'fleet.run',
+    description: 'Run argv on a registered access-only machine as its SSH user. Requires /usr/bin/perl on the target for process-group deadlines. Strict host-key pinning, bounded output and signed auditing apply. asRoot uses sudo -n and requires existing target-local sudo authorization; no password is requested or transmitted. SSH failure leaves completion unknown; never automatically retry.',
+    inputSchema: { type: 'object', properties: {
+      machine: { type: 'string' }, argv: { type: 'array', items: { type: 'string' } },
+      reason: { type: 'string' }, timeoutSec: { type: 'integer' }, asRoot: { type: 'boolean', default: false },
+    }, required: ['machine', 'argv', 'reason'], additionalProperties: false },
+  },
+  {
+    name: 'fleet.screenshot',
+    description: 'Capture a macOS access-only machine and return inline PNG pixels, at most 1600 pixels on the longest edge. Requires a logged-in desktop and macOS Screen Recording permission for the capture process. Check that pixels show the intended applications; a wallpaper-only image does not prove full desktop access.',
+    inputSchema: { type: 'object', properties: {
+      machine: { type: 'string' }, reason: { type: 'string' }, timeoutSec: { type: 'integer' },
+    }, required: ['machine', 'reason'], additionalProperties: false },
+  },
+  {
     name: 'fleet.peers',
     description: 'List the live fleet peer table (gossip presence merged with configured peers).',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -208,7 +242,7 @@ interface ToolTextContent {
 }
 
 interface ToolCallResult {
-  content: ToolTextContent[];
+  content: Array<ToolTextContent | { type: 'image'; data: string; mimeType: string }>;
   isError?: boolean;
 }
 
@@ -296,6 +330,10 @@ async function runAdminCommand(args: Record<string, unknown>, deps: McpDeps): Pr
 }
 
 async function callTool(name: string, args: Record<string, unknown>, deps: McpDeps): Promise<ToolCallResult> {
+  if (['fleet.access_list', 'fleet.access_register', 'fleet.run', 'fleet.screenshot'].includes(name)) {
+    if (!deps.access) return errorResult('access-only transport is not configured on this server');
+    return deps.access.call(name, args);
+  }
   if (name === 'fleet.peers') {
     return textResult({ peers: buildPeerTable(deps) });
   }

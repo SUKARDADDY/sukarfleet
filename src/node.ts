@@ -49,6 +49,7 @@ import {
   type CrossCheckFlagKind,
 } from './audit';
 import { startMcpServer, type McpDeps, type McpServerHandle } from './mcp';
+import { AccessOnly } from './access';
 import { readCappedBody, DEFAULT_MAX_BODY_BYTES, BODY_READ_TIMEOUT_MS } from './http';
 
 // --- SSH admin lane wiring ------------------------------------------------
@@ -1277,6 +1278,7 @@ async function main(): Promise<void> {
       tailAudit,
       adminRun: (req) => sshAdmin.runAdmin(req),
       adminStatus: () => sshAdmin.status(),
+      access: new AccessOnly({ cfg, auditAppend: adminAuditAppend }),
     },
     { port: cfg.mcpPort },
   );
