@@ -120,6 +120,47 @@ test('sudo is noninteractive; SSH loss reports unknown completion and never retr
   expect(h.calls.at(-1)!.argv.at(-1)).toContain("'sudo' '-n' '--'");
 });
 
+test('OpenSSH uses only the configured identity, including percent paths, without default fallback', async () => {
+  const h = await harness();
+  const path = join(h.dir, 'with%percent and spaces');
+  await writeFile(path, 'fake-private-fixture', { mode: 0o600 });
+  const argv = accessSshArgv({ ...h.target, identityFile: path }, 2, ['true'], 1);
+  const config = await runBytes(['ssh', '-G', ...argv.slice(1)], { timeoutMs: 5000 });
+  expect(config.code).toBe(0);
+  expect(config.stderr).not.toContain('not accessible');
+  const identities = Buffer.from(config.stdout).toString().split('\n').filter((s) => s.startsWith('identityfile '));
+  expect(identities).toEqual(['identityfile none', `identityfile ${path.replace(/%/g, '%%')}`]);
+  // Removing the key cannot cause default identities to enter the explicit configuration.
+  await rm(path);
+  const missing = await runBytes(['ssh', '-G', ...argv.slice(1)], { timeoutMs: 5000 });
+  expect(Buffer.from(missing.stdout).toString().split('\n').filter((s) => s.startsWith('identityfile '))).toEqual(identities);
+});
+
+test('a real local transport timeout returns unknown completion, while a remote exit 124 stays an exit code', async () => {
+  const h = await harness();
+  const access = new AccessOnly({ cfg: h.cfg, auditAppend: h.auditAppend, runner: async (argv) => {
+    if (argv[0] === 'ssh-keygen') return { code: 0, stdout: new Uint8Array(), stderr: '' };
+    return runBytes(['/bin/sh', '-c', 'exec sleep 5'], { timeoutMs: 20, killGraceMs: 20 });
+  } });
+  const result = await access.call('fleet.run', request);
+  expect(result.isError).toBe(true); expect(decode(result).exitCode).toBeNull();
+  expect(decode(result).message).toContain('completion is unknown');
+  expect(h.audit.at(-1)?.detail.exitCode).toBeNull();
+  h.code(124);
+  const remote = await h.access.call('fleet.run', request);
+  expect(remote.isError).toBeUndefined(); expect(decode(remote).exitCode).toBe(124);
+});
+
+test('quote-expanded commands exceeding the subprocess bound are refused before any process or request record', async () => {
+  const h = await harness();
+  const argv = ['printf', '%s', "'".repeat(60000)];
+  expect(Buffer.byteLength(JSON.stringify(argv))).toBeLessThan(65536);
+  const result = await h.access.call('fleet.run', { ...request, argv });
+  expect(result.isError).toBe(true); expect(decode(result).error).toContain('after shell quoting');
+  expect(h.calls).toHaveLength(0);
+  expect(h.audit.some((a) => a.kind === 'access-run-requested')).toBe(false);
+});
+
 test('rate limit is shared by access mutations and commands', async () => {
   const h = await harness(); h.cfg.admin.ratePerMin = 1;
   expect((await h.access.call('fleet.run', request)).isError).toBeUndefined();

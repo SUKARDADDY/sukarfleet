@@ -134,7 +134,9 @@ ambient SSH config, agent identities, forwarding, or multiplexed sessions. Every
 a signed request record before dispatch and a completion record without output contents.
 Output is capped. The remote deadline terminates the command's process group, including
 background children. Exit 124 may mean the deadline expired or the command itself returned
-124. A transport failure leaves remote completion unknown and is never automatically retried.
+124. A local transport timeout, signal or SSH failure leaves remote completion unknown and
+is never automatically retried. Both JSON argv and the shell-quoted SSH command are limited
+to 64 KiB. Quote expansion can make a command exceed that bound even when its original argv fits.
 
 `fleet.screenshot` uses macOS screencapture and returns a PNG capped at 1600 pixels on its
 longest edge. macOS must grant Screen Recording to the responsible capture process, and

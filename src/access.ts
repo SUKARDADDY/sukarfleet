@@ -35,15 +35,21 @@ alarm $seconds; waitpid($pid,0); my $status=$?; alarm 0; stop();
 exit (($status & 127) ? 128+($status & 127) : $status >> 8);`;
 
 export function accessSshArgv(target: AccessTargetConfig, timeoutSec: number, argv: string[], connectSec: number): string[] {
+  const remoteCommand = ['exec', '/usr/bin/perl', '-e', REMOTE_RUNNER, '--', String(timeoutSec), ...argv].map(shellQuote).join(' ');
+  if (Buffer.byteLength(remoteCommand, 'utf8') > 65536) throw new Error('encoded SSH command exceeds 64 KiB after shell quoting');
+  const optionPath = (path: string): string => `"${sshPath(path).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
   return [
     'ssh', '-F', 'none', '-T', '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
     '-o', 'IdentityAgent=none', '-o', 'StrictHostKeyChecking=yes', '-o', 'UpdateHostKeys=no',
-    '-o', 'GlobalKnownHostsFile=none', '-o', `UserKnownHostsFile="${sshPath(target.knownHostsFile).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`,
+    '-o', 'GlobalKnownHostsFile=none', '-o', `UserKnownHostsFile=${optionPath(target.knownHostsFile)}`,
     '-o', 'ClearAllForwardings=yes', '-o', 'PermitLocalCommand=no', '-o', 'ProxyCommand=none',
     '-o', 'ProxyJump=none', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
     '-o', `ConnectTimeout=${connectSec}`, '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2',
-    '-i', sshPath(target.identityFile), '-p', String(target.port), '-l', target.user, '--', target.host,
-    ['exec', '/usr/bin/perl', '-e', REMOTE_RUNNER, '--', String(timeoutSec), ...argv].map(shellQuote).join(' '),
+    // -i stats its value before token expansion. IdentityFile as an option expands %% correctly.
+    // The explicit none entry prevents OpenSSH loading default identities if this key disappears.
+    '-o', 'IdentityFile=none', '-o', `IdentityFile=${optionPath(target.identityFile)}`,
+    '-o', 'PreferredAuthentications=publickey',
+    '-p', String(target.port), '-l', target.user, '--', target.host, remoteCommand,
   ];
 }
 
@@ -153,19 +159,20 @@ export class AccessOnly {
       if (!Number.isInteger(timeoutSec) || (timeoutSec as number) < 1 || (timeoutSec as number) > this.deps.cfg.admin.maxRunTimeoutSec) {
         throw new Error('timeoutSec must be a positive integer within admin.maxRunTimeoutSec');
       }
-      await this.checkFiles(target);
       const command = !screenshot && args.asRoot === true ? ['sudo', '-n', '--', ...argv] : argv;
+      const transportArgv = accessSshArgv(target, timeoutSec as number, command, this.deps.cfg.admin.connectTimeoutSec);
+      await this.checkFiles(target);
       await this.deps.auditAppend('access-run-requested', {
         runId, clientLabel: 'mcp', machine: target.name, reason: args.reason,
         operation: name, argv: screenshot ? (target.screenshotCommand ?? ['/usr/sbin/screencapture']) : command, timeoutSec,
       });
       requested = true;
       const started = Date.now();
-      const result = await this.runner(accessSshArgv(target, timeoutSec as number, command, this.deps.cfg.admin.connectTimeoutSec), {
+      const result = await this.runner(transportArgv, {
         timeoutMs: ((timeoutSec as number) + this.deps.cfg.admin.connectTimeoutSec + 5) * 1000,
         maxCaptureBytes: screenshot ? 8 * 1024 * 1024 : this.deps.cfg.admin.maxOutputBytes,
       });
-      const exitCode = result.code === 255 ? null : result.code;
+      const exitCode = result.code === 255 || result.timedOut || result.signalCode ? null : result.code;
       const meta = { runId, machine: target.name, exitCode, durationMs: Date.now() - started,
         truncated: result.truncated ?? false, stderr: result.stderr,
         ...(exitCode === null ? { message: 'SSH failed; remote completion is unknown. Do not automatically retry.' } : {}),
