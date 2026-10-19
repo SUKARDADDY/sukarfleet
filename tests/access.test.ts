@@ -65,6 +65,16 @@ test('registration cannot silently replace trust and is idempotent for the same 
   expect((await h.access.call('fleet.access_register', { ...args, user: 'another', replace: true })).isError).toBeUndefined();
 });
 
+test('a native broker command is persisted explicitly without changing sync configuration', async () => {
+  const h = await harness();
+  const screenshotCommand = ['/opt/native-capture', '--output', '{output}'];
+  const result = await h.access.call('fleet.access_register', { machine: h.target.name, ...h.target,
+    screenshotCommand, replace: true, reason: 'use a native desktop permission broker' });
+  expect(result.isError).toBeUndefined();
+  expect((await loadConfig(h.configPath)).accessTargets?.[0]?.screenshotCommand).toEqual(screenshotCommand);
+  expect(h.cfg.peers).toEqual([]); expect(h.cfg.repos).toEqual([]);
+});
+
 test('disabled lane, agent refusal, missing reason, malformed argv and unknown targets never connect', async () => {
   const h = await harness();
   h.cfg.admin.enabled = false; expect((await h.access.call('fleet.run', request)).isError).toBe(true);
@@ -128,7 +138,8 @@ test('audit failure before dispatch prevents execution; completion failure retai
 });
 
 test('screenshots return image content through the actual MCP handler; failed or truncated captures do not', async () => {
-  const h = await harness(); h.bytes(Buffer.from('89504e470d0a1a0a00000000', 'hex'));
+  const h = await harness();
+  h.bytes(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZbkAAAAASUVORK5CYII=', 'base64'));
   const handler = createMcpFetchHandler({ cfg: h.cfg, listPeers: () => [], tailAudit: async () => [],
     adminRun: async () => { throw new Error('unexpected admin call'); }, adminStatus: async () => [], access: h.access });
   const response = await handler(new Request('http://127.0.0.1:7719/mcp', { method: 'POST', headers: { 'content-type': 'application/json' },
@@ -144,7 +155,8 @@ test('screenshots return image content through the actual MCP handler; failed or
 
 test('config rejects duplicate/full-node names and unsafe endpoint input before writing', async () => {
   const h = await harness(); const before = await readFile(h.configPath, 'utf8');
-  for (const change of [{ host: '-oProxyCommand=bad' }, { user: 'x;bad' }, { name: 'alpha' }, { port: 65536 }]) {
+  for (const change of [{ host: '-oProxyCommand=bad' }, { user: 'x;bad' }, { name: 'alpha' }, { port: 65536 },
+    { screenshotCommand: ['echo'] }, { screenshotCommand: ['echo', '{output}', '\0'] }]) {
     await expect(patchConfig((raw) => { raw.accessTargets = [{ ...h.target, ...change }]; }, h.configPath)).rejects.toThrow();
     expect(await readFile(h.configPath, 'utf8')).toBe(before);
   }

@@ -32,6 +32,9 @@ export interface AccessTargetConfig {
   identityFile: string;
   knownHostsFile: string;
   platform: 'macos' | 'linux';
+  // Optional native GUI broker command. One argument must be {output}, replaced by a private
+  // temporary PNG path. Each token is shell-quoted independently by the origin.
+  screenshotCommand?: string[];
 }
 
 export interface RepoConfig {

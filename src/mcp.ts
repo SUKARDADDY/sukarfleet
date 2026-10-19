@@ -168,6 +168,7 @@ const TOOLS: McpToolDef[] = [
       identityFile: { type: 'string', description: 'Existing private key path on this origin. The key is never returned.' },
       knownHostsFile: { type: 'string', description: 'Existing known_hosts file containing a pin for this address and port.' },
       platform: { type: 'string', enum: ['macos', 'linux'] },
+      screenshotCommand: { type: 'array', items: { type: 'string' }, description: 'Optional GUI broker argv that writes PNG to an {output} argument. Otherwise uses macOS screencapture.' },
       reason: { type: 'string' }, replace: { type: 'boolean', default: false },
     }, required: ['machine', 'host', 'user', 'identityFile', 'knownHostsFile', 'platform', 'reason'], additionalProperties: false },
   },
@@ -188,7 +189,7 @@ const TOOLS: McpToolDef[] = [
   },
   {
     name: 'fleet.peers',
-    description: 'List the live fleet peer table (gossip presence merged with configured peers).',
+    description: 'List full-node peers with live gossip presence, plus access-only machines when registered. Access-only targets use fleet.run and fleet.screenshot on the stated origin.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
@@ -335,7 +336,11 @@ async function callTool(name: string, args: Record<string, unknown>, deps: McpDe
     return deps.access.call(name, args);
   }
   if (name === 'fleet.peers') {
-    return textResult({ peers: buildPeerTable(deps) });
+    const accessOnly = (deps.cfg.accessTargets ?? []).map((t) => ({
+      name: t.name, meshIp: t.host, platform: t.platform, origin: deps.cfg.machine,
+      mode: 'access-only', nodeInstalled: false, sync: false,
+    }));
+    return textResult({ peers: buildPeerTable(deps), ...(accessOnly.length ? { accessOnly } : {}) });
   }
 
   if (name === 'fleet.admin_run') {

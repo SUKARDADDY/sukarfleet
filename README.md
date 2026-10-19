@@ -141,7 +141,9 @@ longest edge. macOS must grant Screen Recording to the responsible capture proce
 desktop interaction separately needs Accessibility or Automation permission. A successful
 capture can still show only wallpaper from a background login session. Verify the returned
 pixels before treating desktop access as working. A GUI permission broker can be installed
-through `fleet.run` when remote captures need the logged-in user's desktop.
+through `fleet.run` when remote captures need the logged-in user's desktop. Register its
+capture argv as `screenshotCommand`, with one argument exactly `{output}` for the temporary
+PNG destination. Tokens are quoted independently. Changing it requires `replace:true`.
 
 If an MCP client still has an old tool catalog after a daemon upgrade, the supported transport
 client invokes the same server tools and keeps all policy and audit checks in place:

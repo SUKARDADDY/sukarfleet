@@ -47,12 +47,23 @@ export function accessSshArgv(target: AccessTargetConfig, timeoutSec: number, ar
   ];
 }
 
-const MAC_SCREENSHOT = `set -eu
+function macScreenshot(target: AccessTargetConfig): string {
+  const command = target.screenshotCommand ?? ['/usr/sbin/screencapture', '-x', '-t', 'png', '{output}'];
+  const capture = command.map((arg) => arg === '{output}' ? '"$d/screen.png"' : shellQuote(arg)).join(' ');
+  return `set -eu
 d=$(/usr/bin/mktemp -d)
 trap '/bin/rm -rf -- "$d"' EXIT
-/usr/sbin/screencapture -x -t png "$d/screen.png"
+${capture} >/dev/null
 /usr/bin/sips --resampleHeightWidthMax 1600 "$d/screen.png" >/dev/null
 /bin/cat "$d/screen.png"`;
+}
+
+function isCapturedPng(bytes: Uint8Array): boolean {
+  const b = Buffer.from(bytes);
+  return b.length >= 57 && b.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex')) &&
+    b.toString('ascii', 12, 16) === 'IHDR' && b.readUInt32BE(16) > 0 && b.readUInt32BE(16) <= 1600 &&
+    b.readUInt32BE(20) > 0 && b.readUInt32BE(20) <= 1600 && b.toString('ascii', b.length - 8, b.length - 4) === 'IEND';
+}
 
 export class AccessOnly {
   private runner: typeof runBytes;
@@ -107,7 +118,8 @@ export class AccessOnly {
       this.gate(args.reason);
       if (name === 'fleet.access_register') {
         const target = { name: args.machine, host: args.host, port: args.port ?? 22, user: args.user,
-          identityFile: args.identityFile, knownHostsFile: args.knownHostsFile, platform: args.platform };
+          identityFile: args.identityFile, knownHostsFile: args.knownHostsFile, platform: args.platform,
+          screenshotCommand: args.screenshotCommand };
         validateAccessTarget(target);
         if (target.name === this.deps.cfg.machine || this.deps.cfg.peers.some((p) => p.name === target.name)) {
           throw new Error('access-only name conflicts with a full node');
@@ -132,7 +144,7 @@ export class AccessOnly {
       const screenshot = name === 'fleet.screenshot';
       if (!screenshot && name !== 'fleet.run') throw new Error('unknown access-only operation');
       if (screenshot && target.platform !== 'macos') throw new Error('fleet.screenshot currently supports macOS targets');
-      const argv = screenshot ? ['/bin/sh', '-c', MAC_SCREENSHOT] : args.argv;
+      const argv = screenshot ? ['/bin/sh', '-c', macScreenshot(target)] : args.argv;
       if (!Array.isArray(argv) || !argv.length || argv.length > 128 ||
           argv.some((a) => typeof a !== 'string' || a.includes('\0')) ||
           !argv[0] || Buffer.byteLength(JSON.stringify(argv)) > 65536) throw new Error('argv must contain 1-128 strings, at most 64 KiB, without NUL');
@@ -145,7 +157,7 @@ export class AccessOnly {
       const command = !screenshot && args.asRoot === true ? ['sudo', '-n', '--', ...argv] : argv;
       await this.deps.auditAppend('access-run-requested', {
         runId, clientLabel: 'mcp', machine: target.name, reason: args.reason,
-        operation: name, argv: screenshot ? ['screenshot'] : command, timeoutSec,
+        operation: name, argv: screenshot ? (target.screenshotCommand ?? ['/usr/sbin/screencapture']) : command, timeoutSec,
       });
       requested = true;
       const started = Date.now();
@@ -164,7 +176,7 @@ export class AccessOnly {
           durationMs: meta.durationMs, truncated: meta.truncated, outputBytes: result.stdout.length });
       } catch { auditRecorded = false; }
       if (screenshot) {
-        if (exitCode !== 0 || meta.truncated || !Buffer.from(result.stdout.subarray(0, 8)).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) {
+        if (exitCode !== 0 || meta.truncated || !isCapturedPng(result.stdout)) {
           return text({ ...meta, auditRecorded, message: meta.message ?? 'Screen capture failed. Verify an unlocked desktop and macOS Screen Recording permission for the capture process.' }, true);
         }
         return { content: [{ type: 'text', text: JSON.stringify({ ...meta, auditRecorded }) },

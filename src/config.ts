@@ -247,6 +247,12 @@ export function validateAccessTarget(value: unknown): asserts value is AccessTar
     }
   }
   if (value.platform !== 'macos' && value.platform !== 'linux') fail('invalid access target platform');
+  if (value.screenshotCommand !== undefined && (!Array.isArray(value.screenshotCommand) ||
+      !value.screenshotCommand.length || value.screenshotCommand.length > 64 ||
+      value.screenshotCommand.some((s) => typeof s !== 'string' || s.includes('\0')) ||
+      !value.screenshotCommand[0] || !value.screenshotCommand.includes('{output}'))) {
+    fail('screenshotCommand must be argv with an {output} argument');
+  }
 }
 
 function validateRepo(r: unknown, i: number): void {
