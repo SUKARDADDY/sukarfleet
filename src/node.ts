@@ -50,6 +50,7 @@ import {
 } from './audit';
 import { startMcpServer, type McpDeps, type McpServerHandle } from './mcp';
 import { AccessOnly } from './access';
+import { SyncSetup } from './syncsetup';
 import { readCappedBody, DEFAULT_MAX_BODY_BYTES, BODY_READ_TIMEOUT_MS } from './http';
 
 // --- SSH admin lane wiring ------------------------------------------------
@@ -1279,6 +1280,16 @@ async function main(): Promise<void> {
       adminRun: (req) => sshAdmin.runAdmin(req),
       adminStatus: () => sshAdmin.status(),
       access: new AccessOnly({ cfg, auditAppend: adminAuditAppend }),
+      syncSetup: new SyncSetup({
+        cfg, pairing, syncer, auditAppend,
+        activateRepo: (repo) => {
+          selfRepoStats.set(repo.name, { lastSyncOkMs: null, lastCommit: null, syncError: null });
+          adopted.add(repo.name);
+          cfg.repos.push(repo);
+        },
+        status: () => ({ machine: cfg.machine, clockVetted: clockSentinel.isClockVetted(),
+          repos: cfg.repos.map((repo) => ({ ...repo, ...selfRepoStats.get(repo.name) })) }),
+      }),
     },
     { port: cfg.mcpPort },
   );
@@ -1624,7 +1635,7 @@ async function main(): Promise<void> {
         });
       }
       try {
-        const derived = await derive.updateMain(repo.path, { push: repoPush });
+        const derived = await derive.updateMain(repo.path, { push: repoPush && !repo.peerOnly });
         // A fresh sha existed and this machine sat it out. At info, not debug: who pushed is an
         // operational fact, and this is the line that says the roamer is deferring rather than
         // racing the anchor -- at one line per repo per sync tick, cheap enough to keep in a
