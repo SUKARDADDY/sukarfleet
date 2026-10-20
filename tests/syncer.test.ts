@@ -1109,3 +1109,18 @@ test('a lost blob that was only staged is dropped from the index and re-staged f
   expect((await git(dirA, ['show', 'HEAD:b.txt'])).stdout).toBe('staged only');
   expect((await run(['git', 'fsck', '--connectivity-only', '--no-dangling'], { cwd: dirA })).code).toBe(0);
 });
+
+
+test('peer-only repository sync never pushes a configured upstream', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'lesson.md': 'base' });
+  const origin = join(base, 'official.git');
+  await git(base, ['init', '--bare', '-q', origin]);
+  await git(dirA, ['remote', 'add', 'origin', origin]);
+  repoA.peerOnly = true;
+  await writeFile(join(dirA, 'lesson.md'), 'saved progress');
+  await syncA.syncOnce(repoA);
+  expect(recA.stats.at(-1)?.syncError).toBeNull();
+  expect(recA.notApplicable).toEqual(['r']);
+  expect(recA.pushes).toEqual([]);
+  expect((await git(origin, ['for-each-ref', '--format=%(refname)'])).stdout.trim()).toBe('');
+});

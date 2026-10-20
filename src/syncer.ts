@@ -716,6 +716,10 @@ export class Syncer {
 
   // (5) push sync/<machine> to origin with retries+backoff; skip cleanly when origin is absent.
   private async pushOrigin(repo: RepoConfig): Promise<void> {
+    if (repo.peerOnly) {
+      this.deps.onGithubPushNotApplicable?.(repo.name);
+      return;
+    }
     const originUrl = await this.git(repo.path, ['remote', 'get-url', 'origin']);
     if (originUrl.code !== 0) {
       // No GitHub backup for this repo. Say so explicitly rather than leaving the boot-time null
