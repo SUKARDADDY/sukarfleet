@@ -82,6 +82,8 @@ Use `fleet.pair_code` on the existing node, `fleet.pair_redeem` on the new one,
 and `fleet.repo_add` on each checkout. Each tool needs a reason. Registration
 preserves dirty files, adopts `sync/<machine>`, and defaults to peer-only sync.
 A peer-only repository never pushes its sync branch or derived main to origin.
+Each peer-only repo has an independent serialized sync cycle, so retries in
+unrelated repositories cannot hold it in a shared queue.
 Existing SSH access registration can stay alongside a full peer when both names
 resolve to the same mesh address.
 
