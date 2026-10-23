@@ -7,6 +7,12 @@ import { dirname, join } from 'node:path';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
+// Leads a PresenceRepoStat.syncError that is a note, not an error: the sync cycle is waiting on
+// something a person is in the middle of (a held lock, an unfinished merge) and has been for a
+// while. syncer.ts writes it; health.ts shows the text and raises no fault for it. Lives here
+// because both import util and neither should import the other.
+export const SYNC_DEFERRED_PREFIX = 'deferred: ';
+
 export function log(level: LogLevel, msg: string, extra?: object): void {
   const line = canonicalJson({ ts: new Date().toISOString(), level, msg, ...(extra ?? {}) });
   // eslint-disable-next-line no-console

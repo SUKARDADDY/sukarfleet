@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { listGitLocks, mayHoldRepoLocks, reapGitLocks, resolveGitDirs } from '../src/gitlocks';
+import { listGitLocks, mayHoldRepoLocks, reapGitLocks, repoRoots, resolveGitDirs } from '../src/gitlocks';
 import { run } from '../src/util';
 
 let base: string;
@@ -68,6 +68,16 @@ describe('mayHoldRepoLocks', () => {
     expect(mayHoldRepoLocks(['git', 'fsmonitor--daemon', 'run'])).toBe(false);
     expect(mayHoldRepoLocks(['git', 'upload-pack', '--stateless-rpc', '.'])).toBe(false);
     expect(mayHoldRepoLocks(['git', 'cat-file', '--batch'])).toBe(false);
+  });
+
+  test('read-only commands a person leaves in a pager do not count; status and writers still do', () => {
+    for (const sub of ['log', 'show', 'diff', 'blame', 'grep', 'ls-files', 'rev-parse', 'for-each-ref']) {
+      expect(mayHoldRepoLocks(['git', sub])).toBe(false);
+    }
+    // status refreshes the index opportunistically and is what an IDE runs in a loop: kept.
+    for (const sub of ['status', 'commit', 'merge', 'rebase', 'update-ref', 'gc', 'maintenance', 'reflog', 'branch', 'config']) {
+      expect(mayHoldRepoLocks(['git', sub])).toBe(true);
+    }
   });
 
   test('anything that is not git does not count by name', () => {
@@ -185,6 +195,23 @@ describe('resolveGitDirs and listGitLocks', () => {
         join(main, '.git', 'refs', 'heads', 'side.lock'),
       ].sort(),
     );
+  });
+
+  test('the repo\'s identity covers the main worktree and every linked one', async () => {
+    const main = await repo('main');
+    const wt = join(base, 'wt');
+    await git(main, ['worktree', 'add', '-q', '-b', 'side', wt]);
+    const fromMain = await repoRoots((await resolveGitDirs(main))!);
+    const fromWt = await repoRoots((await resolveGitDirs(wt))!);
+    const id = async (p: string) => {
+      const st = await stat(p);
+      return `${st.dev}:${st.ino}`;
+    };
+    for (const roots of [fromMain, fromWt]) {
+      expect(roots.ids.has(await id(main))).toBe(true);
+      expect(roots.ids.has(await id(wt))).toBe(true);
+      expect(roots.ids.has(await id(join(main, '.git')))).toBe(true);
+    }
   });
 
   test('not a repository: nothing to do', async () => {

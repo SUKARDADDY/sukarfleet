@@ -139,11 +139,13 @@ describe('drainChildren', () => {
     expect(drained).toEqual({ terminated: 0, killed: 0, abandoned: 0 });
   });
 
-  test('once drained, nothing new is started', async () => {
+  test('once drained, nothing new is started -- except a step that restores consistency', async () => {
     await drainChildren({ settleMs: 0, termGraceMs: 0, killWaitMs: 0 });
     const r = await run(['git', '--version']);
     expect(r.code).toBe(RUN_REFUSED_SHUTTING_DOWN);
     expect(r.stderr).toContain('shutting down');
+    // What syncer.ts's `merge --abort` and gitlocks.ts's lsof/tasklist probes use.
+    expect((await run(['git', '--version'], { evenWhileDraining: true })).code).toBe(0);
     allowChildSpawns();
     expect((await run(['git', '--version'])).code).toBe(0);
   });

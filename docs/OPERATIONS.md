@@ -129,7 +129,9 @@ Three things now stop that from happening or clear it up.
 - `systemctl --user stop` no longer exits over a running git. The daemon waits up to 30 seconds for
   git steps in flight, then sends SIGTERM, which git answers by deleting its own lock. SIGKILL comes
   only after that, and the daemon removes whatever lock that kill orphaned. The whole thing takes at
-  most 40 seconds, under systemd's 90 second stop timeout.
+  most 40 seconds, under systemd's 90 second stop timeout. A merge the daemon was in the middle of
+  is still aborted after the 30 seconds run out, and if the process dies before it can be, the next
+  cycle aborts and redoes it. Conflict markers are never committed.
 - When the daemon has to SIGKILL a git step that hung, it removes the locks that step created.
 - At the start of every sync cycle, a lock last written more than `thresholds.staleGitLockMin` ago
   (default 10 minutes) is removed if no live process can still own it. The cycle then carries on in
@@ -138,18 +140,39 @@ Three things now stop that from happening or clear it up.
 "No live process can own it" means more than "nobody has it open". `git commit -a` closes
 `index.lock` before it starts your editor and keeps the lock until the editor exits, with no file
 descriptor open on it. So the daemon also leaves a lock alone while any git that takes locks is
-working in that repository. On Linux it reads this from `/proc`, on macOS from `lsof` and `ps`. On
-Windows it waits until no `git.exe` is running at all, and a lock Windows refuses to rename counts as
-in use. If the check cannot answer, the lock stays and the next cycle asks again.
+working in that repository. Read-only commands like `log`, `diff` and `show` don't count, so a pager
+left open doesn't block the repair. `status` does count.
+
+"Working in that repository" is decided by device and inode, not by path. A git counts if its
+current directory, a path in its arguments, or `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or
+`GIT_INDEX_FILE` resolves into the repository, its `.git`, or any linked worktree of it. That covers
+a symlinked path and a linked worktree sharing the repo's refs. A git in another mount namespace (a
+container, a bwrap or flatpak sandbox) can't be judged from outside, so while one is running the
+daemon leaves every old lock alone.
+
+On Linux the daemon reads all of this from `/proc`. On macOS it uses `lsof` and `ps`. On Windows it
+waits until no `git.exe` is running at all, and a lock Windows refuses to rename counts as in use.
+That is coarse: it can't tell a resident `git fsmonitor--daemon`, or a peer fetching through the
+daemon's own `git upload-pack`, from a real holder. A Windows machine running fsmonitor will not
+clear a stale lock on its own. If the check cannot answer, the lock stays and the next cycle asks
+again.
 
 An empty lock is deleted. A lock with bytes in it is a write that never finished, and git never reads
 it, but it is moved to `.git/sukarfleet-stale-locks/<timestamp>/` rather than deleted, as evidence.
 Every removal is logged as `git lock repair: retired an orphaned lock` and recorded as a signed
 `sync-lock-repaired` audit entry. None of this raises a fault or a notification.
 
-While a lock is held, a cycle that needs it is deferred rather than failed. That used to raise a
-critical sync error, and a desktop notification, any time you and the daemon touched the same repo at
-once. A lock that never clears still shows up, as a stale-sync fault once `syncStaleMin` passes.
+While a lock is held, a cycle that needs it is deferred rather than failed. A merge you left
+unfinished on the sync branch, or unmerged paths from a cherry-pick or stash pop, defer it the same
+way. The daemon never commits or aborts those for you. Deferring used to be a critical sync error
+and a desktop notification any time you and the daemon touched the same repo at once.
+
+A deferral keeps the time of the last successful cycle. Right after a restart, before any cycle has
+succeeded, that is the time the daemon started, so a lock held across a restart doesn't count as
+"never synced". Once a deferral has lasted `staleGitLockMin`, the repo's `syncError` in `/status`
+reads `deferred: <reason>`, for example the lock git is waiting on. That note never raises a fault.
+If the wait goes on past `syncStaleMin`, the ordinary stale-sync fault fires, and the note is there
+to explain it.
 
 ## A sync branch origin has and this machine lost is merged back
 
@@ -163,6 +186,25 @@ newest-wins only on a vetted clock, and the losing side is kept under `.sync-con
 force-pushes and never rebases. If the merge would not be safe this cycle, it leaves the repo as it
 was and tries again next cycle. Each merge is recorded as a signed `sync-own-branch-merged` audit
 entry.
+
+The flip side is that you can't rewrite `sync/<this machine>` on origin while the daemon runs: it
+would merge origin's old history straight back in before you got to force-push. Stop the daemon on
+that machine first, rewrite and force-push both copies, then start it again.
+
+## Files Windows can't check out stay out of the commit
+
+The fleet is mixed, so every path the daemon commits has to be one Windows can hold. A Linux machine
+once committed `_tmp/x/check:css.log`, and from then on every merge on the Windows peer failed with
+`invalid path`. Now the auto-commit leaves out any file whose name has `< > : " | ? * \` or a
+control character in it, ends in a dot or a space, or is a reserved device name like `CON`, `nul`,
+`COM1` or `lpt9.txt`. The file stays on disk and is simply not synced. The daemon skips it silently
+every cycle (a debug log line at most).
+
+A path like that which is already in the index, committed by an older version or staged by hand, is
+taken out of the index with `git rm --cached`. The file stays on disk, the removal goes out with the
+next auto-commit, and it is recorded as a signed `sync-unportable-untracked` audit entry. That
+includes a file renamed to such a name: the old name is deleted from the repo and the new one stays
+local.
 
 Nothing else in the sync cycle repairs itself, and that is deliberate.
 

@@ -27,7 +27,17 @@
 // holds index.lock the whole time with no descriptor open on it. Ref locks are closed the same way
 // between write and rename. A check that only looked for open descriptors would delete that lock out
 // from under a live commit. So a lock counts as held when any process has it open OR any git process
-// that can take locks is working inside the repository (its cwd is in it, or its argv names it).
+// that can take locks is working inside the repository.
+//
+// "Inside" is decided by file identity, never by comparing path strings. The same repository has
+// many names: a symlinked path (`git --git-dir=<link>/.git`), a bind mount inside a container or
+// sandbox, a linked worktree whose refs live in the main repo's git dir. A string match missed all
+// three in review, against real git, and deleted live locks. So the check collects the (device,
+// inode) of every directory that is this repository -- its worktree, git dir, common dir, the main
+// worktree and every linked worktree -- and asks of each git process whether its cwd, any path in
+// its argv, or GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR/GIT_INDEX_FILE in its environment resolves to
+// one of those directories or anything beneath one. A git in a different mount namespace is not
+// judged at all: its paths may name nothing here, so it answers 'unknown', which keeps the lock.
 //
 // Which locks, and why these: the ones a stale copy of wedges sync. index.lock, HEAD.lock and
 // ORIG_HEAD.lock in the per-worktree git dir (add, commit, merge, checkout); config.lock (remote
@@ -55,9 +65,16 @@ import { log, run } from './util';
 
 export type LockHolderVerdict = 'free' | 'held' | 'unknown';
 
-// `lockPath` is the lock's canonical path; `repoRoots` are the canonical worktree, git dir and common
-// dir. Injectable through SyncerOptions so a test can force the fail-closed branch.
-export type LockHolderCheck = (lockPath: string, repoRoots: readonly string[]) => Promise<LockHolderVerdict>;
+// Every directory that IS this repository, by name and by (device, inode). See the header for why
+// identity and not the name decides.
+export interface RepoRoots {
+  paths: string[];
+  ids: Set<string>;
+}
+
+// `lockPath` is the lock's canonical path. Injectable through SyncerOptions so a test can force the
+// fail-closed branch.
+export type LockHolderCheck = (lockPath: string, repo: RepoRoots) => Promise<LockHolderVerdict>;
 
 export interface GitDirs {
   worktree: string;
@@ -189,7 +206,7 @@ export async function reapGitLocks(repoPath: string, opts: ReapOptions): Promise
 
   const uid = opts.uid !== undefined ? opts.uid : typeof process.getuid === 'function' ? process.getuid() : null;
   const holderCheck = opts.holderCheck ?? defaultLockHolderCheck;
-  const roots = await canonicalRoots(dirs);
+  const roots = await repoRoots(dirs);
   const repairs: LockRepair[] = [];
 
   for (const lockPath of locks) {
@@ -323,29 +340,130 @@ async function retireLock(
   }
 }
 
-async function canonicalRoots(dirs: GitDirs): Promise<string[]> {
-  const out = new Set<string>();
-  for (const p of [dirs.worktree, dirs.gitDir, dirs.commonDir]) {
+// The worktree, git dir and common dir; the main worktree, when the common dir is a `.git` inside
+// one; and every linked worktree registered under <commondir>/worktrees/*/gitdir. A git working in
+// any of them shares this repo's refs, packed-refs and config, so it can hold those locks.
+export async function repoRoots(dirs: GitDirs): Promise<RepoRoots> {
+  const candidates = new Set<string>([dirs.worktree, dirs.gitDir, dirs.commonDir]);
+  if (basename(dirs.commonDir) === '.git') candidates.add(dirname(dirs.commonDir));
+  try {
+    for (const name of await readdir(join(dirs.commonDir, 'worktrees'))) {
+      try {
+        const dotGit = (await readFile(join(dirs.commonDir, 'worktrees', name, 'gitdir'), 'utf8')).trim();
+        if (dotGit) candidates.add(dirname(isAbsolute(dotGit) ? dotGit : join(dirs.commonDir, 'worktrees', name, dotGit)));
+      } catch {
+        // a half-removed worktree: its admin dir is still under the common dir, already covered
+      }
+    }
+  } catch {
+    // no linked worktrees
+  }
+  const roots: RepoRoots = { paths: [], ids: new Set() };
+  for (const p of candidates) {
     try {
-      out.add(await realpath(p));
+      roots.paths.push(await realpath(p));
+      const st = await stat(p);
+      roots.ids.add(`${st.dev}:${st.ino}`);
     } catch {
-      out.add(p);
+      // a registered worktree that was deleted without `git worktree remove`
     }
   }
-  return [...out];
+  return roots;
 }
 
-function isWithin(path: string, root: string): boolean {
-  return path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
+// Is `path`, or the nearest ancestor of it that exists, one of the repo's directories or beneath
+// one? Walks up by `..` from the resolved directory, so symlinks and bind mounts resolve the way the
+// kernel resolves them for the process that holds them, not the way the string reads.
+async function insideRepo(path: string, roots: RepoRoots): Promise<boolean> {
+  let cur = path;
+  for (let i = 0; i < 64; i++) {
+    try {
+      await stat(cur);
+      break;
+    } catch {
+      const up = dirname(cur);
+      if (up === cur) return false;
+      cur = up;
+    }
+  }
+  let prev = '';
+  for (let i = 0; i < 128; i++) {
+    let id: string;
+    try {
+      const st = await stat(cur);
+      id = `${st.dev}:${st.ino}`;
+    } catch {
+      return false;
+    }
+    if (roots.ids.has(id)) return true;
+    if (id === prev) return false; // `..` of the root is the root
+    prev = id;
+    cur = `${cur}/..`;
+  }
+  return false;
 }
 
-// git subcommands that never take a lock in the repository they run in, so a long-lived one does not
-// make every lock in that repo look owned. These are the ones that actually linger: the remote
-// helpers (an orphaned `git remote-http` on a dead mesh connection can outlive its fetch by
-// minutes -- the daemon's own fetch timeout leaves exactly those behind), credential helpers and
-// their cache daemon, the fsmonitor daemon, the server side of a fetch (gitserve.ts serves peers
-// with upload-pack), and an editor's long-running `cat-file --batch`.
-const LOCK_FREE_SUBCOMMANDS = new Set(['cat-file', 'fsmonitor--daemon', 'upload-pack', 'upload-archive', 'http-fetch', 'version']);
+// The argv and environment values that could name a path, resolved against the process's cwd
+// (`cwdBase`, e.g. /proc/<pid>/cwd) when relative. A token like `--git-dir=x` contributes `x`.
+function pathishValues(tokens: readonly string[], cwdBase: string | null): string[] {
+  const out: string[] = [];
+  for (const t of tokens) {
+    const v = t.includes('=') ? t.slice(t.indexOf('=') + 1) : t;
+    if (v.length === 0 || !(v.includes('/') || v === '.' || v === '..')) continue;
+    if (v.startsWith('/')) out.push(v);
+    else if (cwdBase !== null) out.push(`${cwdBase}/${v}`);
+  }
+  return out;
+}
+
+const GIT_PATH_ENV = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE'];
+
+// git subcommands that never hold a lock in the repository they run in for longer than a moment, so
+// a long-lived one does not make every lock in that repo look owned. These are the ones that
+// actually linger: the remote helpers (an orphaned `git remote-http` on a dead mesh connection can
+// outlive its fetch by minutes -- the daemon's own fetch timeout leaves exactly those behind),
+// credential helpers and their cache daemon, the fsmonitor daemon, the server side of a fetch
+// (gitserve.ts serves peers with upload-pack), an editor's long-running `cat-file --batch`, and the
+// read-only commands a person leaves sitting in a pager (log, show, diff, blame, grep, ...).
+//
+// `diff` is here although it refreshes the index opportunistically: it takes and releases
+// index.lock before it waits on the pager, so the only lock it can hold is seconds old, and a
+// seconds-old lock is never a candidate. `status` is NOT here, on purpose: it refreshes the index
+// the same way and is the command an IDE runs in a loop, and nothing is lost by waiting it out.
+const LOCK_FREE_SUBCOMMANDS = new Set([
+  'cat-file',
+  'fsmonitor--daemon',
+  'upload-pack',
+  'upload-archive',
+  'http-fetch',
+  'version',
+  'help',
+  'log',
+  'show',
+  'whatchanged',
+  'shortlog',
+  'diff',
+  'diff-files',
+  'diff-index',
+  'diff-tree',
+  'blame',
+  'annotate',
+  'grep',
+  'ls-files',
+  'ls-tree',
+  'ls-remote',
+  'rev-parse',
+  'rev-list',
+  'for-each-ref',
+  'show-ref',
+  'describe',
+  'name-rev',
+  'merge-base',
+  'check-ignore',
+  'check-attr',
+  'count-objects',
+  'var',
+]);
 // Global options that take their value as the next argument.
 const GIT_OPTS_WITH_VALUE = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix']);
 
@@ -391,16 +509,25 @@ export const defaultLockHolderCheck: LockHolderCheck = async (lockPath, roots) =
   }
 };
 
-// Linux: /proc, read directly. Per process: is it a lock-capable git working in this repo
-// (cmdline + cwd), and does it have the lock open (fd links)? Another user's cwd and fd links are
-// unreadable and skipped, which is sound only because reapGitLocks never considers a lock that
-// another uid created.
-async function linuxLockHolders(lockPath: string, roots: readonly string[]): Promise<LockHolderVerdict> {
+// Linux: /proc, read directly. Per process: does it have the lock open (fd identity), and is it a
+// lock-capable git working in this repo (mount namespace, cwd, argv, environment)? Another user's
+// cwd, fd links, environment and namespace are unreadable and skipped, which is sound only because
+// reapGitLocks never considers a lock that another uid created.
+async function linuxLockHolders(lockPath: string, roots: RepoRoots): Promise<LockHolderVerdict> {
   let pids: string[];
+  let lockId: string;
+  let ourNs: string | null = null;
   try {
     pids = (await readdir('/proc')).filter((d) => /^\d+$/.test(d));
+    const st = await stat(lockPath);
+    lockId = `${st.dev}:${st.ino}`;
   } catch {
     return 'unknown';
+  }
+  try {
+    ourNs = await readlink('/proc/self/ns/mnt');
+  } catch {
+    // no namespace links (very old kernel): every readable process is in ours
   }
   // /proc mounted but empty, or a hidepid mount hiding everything but ourselves: not an answer.
   if (pids.length <= 1) return 'unknown';
@@ -413,12 +540,24 @@ async function linuxLockHolders(lockPath: string, roots: readonly string[]): Pro
       continue; // exited while we looked
     }
     if (mayHoldRepoLocks(argv)) {
-      if (argv.some((a) => roots.some((r) => a.includes(r)))) return 'held';
+      if (ourNs !== null) {
+        try {
+          if ((await readlink(`${base}/ns/mnt`)) !== ourNs) return 'unknown';
+        } catch {
+          // another user's process, or gone
+        }
+      }
+      if (await insideRepo(`${base}/cwd`, roots)) return 'held';
+      let env: string[] = [];
       try {
-        const cwd = await readlink(`${base}/cwd`);
-        if (roots.some((r) => isWithin(cwd, r))) return 'held';
+        env = (await readFile(`${base}/environ`, 'utf8'))
+          .split('\0')
+          .filter((e) => GIT_PATH_ENV.some((k) => e.startsWith(`${k}=`)));
       } catch {
         // another user's process, or gone
+      }
+      for (const p of pathishValues([...argv.slice(1), ...env], `${base}/cwd`)) {
+        if (await insideRepo(p, roots)) return 'held';
       }
     }
     let fds: string[];
@@ -429,7 +568,8 @@ async function linuxLockHolders(lockPath: string, roots: readonly string[]): Pro
     }
     for (const fd of fds) {
       try {
-        if ((await readlink(`${base}/fd/${fd}`)) === lockPath) return 'held';
+        const st = await stat(`${base}/fd/${fd}`);
+        if (`${st.dev}:${st.ino}` === lockId) return 'held';
       } catch {
         // closed while we looked
       }
@@ -446,41 +586,56 @@ async function probe(argv: string[]): Promise<{ code: number; stdout: string; st
   }
 }
 
-// macOS: no /proc. lsof answers "is it open" (exit 0 with a p-line: yes; exit 1 with no output:
-// no; anything else: no answer), ps supplies argv, and lsof again supplies the cwd of each git
-// that could hold a lock.
-async function macosLockHolders(lockPath: string, roots: readonly string[]): Promise<LockHolderVerdict> {
+// macOS: no /proc and no mount namespaces. lsof answers "is it open" -- it matches the file by
+// identity, not by name (exit 0 with a p-line: yes; exit 1 with no output: no; anything else: no
+// answer). ps supplies argv plus environment (-E, readable for our own processes), and lsof again
+// supplies the cwd of each git that could hold a lock. Paths are then judged by identity exactly as
+// on Linux.
+async function macosLockHolders(lockPath: string, roots: RepoRoots): Promise<LockHolderVerdict> {
   const open = await probe(['lsof', '-w', '-n', '-P', '-F', 'p', '--', lockPath]);
   if (open === null) return 'unknown';
   if (open.code === 0 && /^p\d+/m.test(open.stdout)) return 'held';
   if (!(open.code === 1 && open.stdout.trim() === '')) return 'unknown';
 
-  const ps = await probe(['ps', '-axww', '-o', 'pid=,command=']);
+  const ps = await probe(['ps', '-axwwE', '-o', 'pid=,command=']);
   if (ps === null || ps.code !== 0) return 'unknown';
-  const pids: string[] = [];
+  // Whitespace-split argv: a path with spaces splits wrong, which can only make a token fail to
+  // resolve. The executable and subcommand, which decide mayHoldRepoLocks, never contain one here.
+  const gits = new Map<string, string[]>();
   for (const line of ps.stdout.split('\n')) {
     const m = /^\s*(\d+)\s+(.*)$/.exec(line);
     if (!m) continue;
-    // Whitespace-split argv: paths with spaces split wrong, but only the executable and the
-    // subcommand matter here, and the full line is what the root match below reads.
-    if (!mayHoldRepoLocks(m[2]!.split(/\s+/))) continue;
-    if (roots.some((r) => m[2]!.includes(r))) return 'held';
-    pids.push(m[1]!);
+    const tokens = m[2]!.split(/\s+/);
+    if (mayHoldRepoLocks(tokens)) gits.set(m[1]!, tokens);
   }
-  if (pids.length === 0) return 'free';
+  if (gits.size === 0) return 'free';
 
   // Exit 1 also means "some of those pids exited meanwhile", with the rest still listed.
-  const cwds = await probe(['lsof', '-w', '-n', '-P', '-a', '-p', pids.join(','), '-d', 'cwd', '-F', 'n']);
+  const cwds = await probe(['lsof', '-w', '-n', '-P', '-a', '-p', [...gits.keys()].join(','), '-d', 'cwd', '-F', 'pn']);
   if (cwds === null || (cwds.code !== 0 && cwds.code !== 1)) return 'unknown';
+  const cwdOf = new Map<string, string>();
+  let pid = '';
   for (const line of cwds.stdout.split('\n')) {
-    if (line.startsWith('n') && roots.some((r) => isWithin(line.slice(1), r))) return 'held';
+    if (line.startsWith('p')) pid = line.slice(1);
+    else if (line.startsWith('n') && pid) cwdOf.set(pid, line.slice(1));
+  }
+  for (const [p, tokens] of gits) {
+    const cwd = cwdOf.get(p) ?? null;
+    if (cwd !== null && (await insideRepo(cwd, roots))) return 'held';
+    for (const path of pathishValues(tokens.slice(1), cwd)) {
+      if (await insideRepo(path, roots)) return 'held';
+    }
   }
   return 'free';
 }
 
 // Windows: no cheap way to read another process's cwd. Any git.exe running at all counts as a
 // holder, which is coarse and errs the right way: git processes there are short-lived, and the next
-// cycle asks again. When none is running, retireLock's rename is the second check -- Windows refuses
+// cycle asks again. The coarseness has a known cost: tasklist names only the image, so this cannot
+// tell the daemon's own `git upload-pack` (a peer fetching) or a resident `git fsmonitor--daemon`
+// from a real holder, and a machine running fsmonitor never repairs a stale lock on its own. Reading
+// command lines needs WMI, a PowerShell start per check, and is not worth it until Windows is more
+// than experimental. When none is running, retireLock's rename is the second check -- Windows refuses
 // to rename a file another process has open without delete sharing, and that refusal is read as
 // "in use", never forced.
 async function windowsLockHolders(): Promise<LockHolderVerdict> {

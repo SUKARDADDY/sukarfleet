@@ -5,7 +5,7 @@
 import { join } from 'node:path';
 import type { FleetConfig, PeerView } from './types';
 import { stateDir } from './config';
-import { atomicWrite, readJsonFile, log } from './util';
+import { atomicWrite, readJsonFile, log, SYNC_DEFERRED_PREFIX } from './util';
 import { osNotify } from './notify';
 import type { Urgency } from './notify';
 
@@ -222,7 +222,10 @@ function computeActiveFaults(cfg: FleetConfig, self: HealthSelf, peers: PeerView
   const staleMs = cfg.thresholds.syncStaleMin * 60000;
 
   for (const [repoName, stat] of Object.entries(self.repos)) {
-    if (stat.syncError) {
+    // A SYNC_DEFERRED_PREFIX note is the sync cycle explaining why it is waiting (a lock somebody
+    // holds, a merge somebody left open), shown in /status and raising nothing here. If the wait
+    // goes on, the stale check below is the fault, exactly as it would be with no note at all.
+    if (stat.syncError && !stat.syncError.startsWith(SYNC_DEFERRED_PREFIX)) {
       faults.push({
         key: `self-sync-error:${repoName}`,
         faultClass: 'self-sync-error',

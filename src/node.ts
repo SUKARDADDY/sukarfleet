@@ -44,6 +44,7 @@ import {
   AUDIT_KIND_ADMIN_RUN_REFUSED,
   AUDIT_KIND_SYNC_LOCK_REPAIRED,
   AUDIT_KIND_SYNC_OWN_BRANCH_MERGED,
+  AUDIT_KIND_SYNC_UNPORTABLE_UNTRACKED,
   flushLocalToUnion,
   crossCheckAuditLog,
   loadForkBaseline,
@@ -678,6 +679,13 @@ async function main(): Promise<void> {
     },
     onOwnBranchMerged: async (repoName, detail) => {
       await auditSyncRepair(AUDIT_KIND_SYNC_OWN_BRANCH_MERGED, { repo: repoName, ...detail });
+    },
+    onUnportableUntracked: async (repoName, paths) => {
+      await auditSyncRepair(AUDIT_KIND_SYNC_UNPORTABLE_UNTRACKED, {
+        repo: repoName,
+        count: paths.length,
+        paths: paths.slice(0, 50),
+      });
     },
   });
 

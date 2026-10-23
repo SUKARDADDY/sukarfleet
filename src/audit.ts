@@ -71,6 +71,7 @@ export const AUDIT_KIND_CREDENTIAL_STALE = 'credential-stale';
 // operator can see that something broke and fixed itself, since these raise no fault on purpose.
 export const AUDIT_KIND_SYNC_LOCK_REPAIRED = 'sync-lock-repaired';
 export const AUDIT_KIND_SYNC_OWN_BRANCH_MERGED = 'sync-own-branch-merged';
+export const AUDIT_KIND_SYNC_UNPORTABLE_UNTRACKED = 'sync-unportable-untracked';
 
 // admin-* detail contract, binding on every producer:
 //   admin-run-requested: { runId, targetMachine, argv: string[], reason, requestedBy, timeoutSec }
@@ -82,6 +83,7 @@ export const AUDIT_KIND_SYNC_OWN_BRANCH_MERGED = 'sync-own-branch-merged';
 //   sync-lock-repaired:  { repo, lock, reason, sizeBytes, lastWriteMs, action, quarantinedTo? }
 //                        -- the lock's path and size, never its content
 //   sync-own-branch-merged: { repo, branch, originTip, localTipBefore, localTipAfter, conflicts }
+//   sync-unportable-untracked: { repo, count, paths } -- paths capped at 50; names, never content
 //
 // Two content rules, and this file is the last place they can be enforced by convention before
 // the entries are signed and git-synced to every machine:

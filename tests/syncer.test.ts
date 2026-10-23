@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod, stat, utimes, readlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod, stat, utimes, readlink, symlink, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -10,6 +10,7 @@ import {
   isEmptyObjectError,
   isGitLockBusyError,
   isNonFastForwardRejection,
+  isPortablePath,
   SYNC_ERROR_MAX_CHARS,
   type OwnBranchMerge,
   type SyncerDeps,
@@ -17,7 +18,7 @@ import {
 } from '../src/syncer';
 import type { LockRepair } from '../src/gitlocks';
 import { defaultConfig } from '../src/config';
-import { run } from '../src/util';
+import { allowChildSpawns, drainChildren, run, SYNC_DEFERRED_PREFIX } from '../src/util';
 import type { RunOptions, RunResult } from '../src/util';
 import type { FleetConfig, RepoConfig, PresenceRepoStat, PeerConfig, MachineKey } from '../src/types';
 
@@ -83,6 +84,7 @@ interface Recorder {
   objectRepairs: { repo: string; quarantinedTo: string; recoveredFrom: string }[];
   lockRepairs: { repo: string; repair: LockRepair }[];
   ownMerges: { repo: string; detail: OwnBranchMerge }[];
+  unportable: { repo: string; paths: string[] }[];
 }
 
 function recorder(vetted = true): Recorder {
@@ -94,6 +96,7 @@ function recorder(vetted = true): Recorder {
   const objectRepairs: { repo: string; quarantinedTo: string; recoveredFrom: string }[] = [];
   const lockRepairs: { repo: string; repair: LockRepair }[] = [];
   const ownMerges: { repo: string; detail: OwnBranchMerge }[] = [];
+  const unportable: { repo: string; paths: string[] }[] = [];
   return {
     stats,
     pushes,
@@ -103,6 +106,7 @@ function recorder(vetted = true): Recorder {
     objectRepairs,
     lockRepairs,
     ownMerges,
+    unportable,
     deps: {
       isClockVetted: () => vetted,
       onRepoStat: (_r, s) => stats.push(s),
@@ -116,6 +120,9 @@ function recorder(vetted = true): Recorder {
       },
       onOwnBranchMerged: (r, detail) => {
         ownMerges.push({ repo: r, detail });
+      },
+      onUnportableUntracked: (r, paths) => {
+        unportable.push({ repo: r, paths });
       },
       machineKey: TEST_MACHINE_KEY,
     },
@@ -1247,7 +1254,7 @@ test('a fresh lock is left alone, and the cycle defers quietly instead of report
   // Not a fault: no syncError, and the last real success is kept rather than nulled.
   expect(recA.stats.at(-1)!.syncError).toBeNull();
   expect(recA.stats.at(-1)!.lastSyncOkMs).toBe(okMs);
-  expect(lines.some((l) => l.msg === 'sync deferred: a git lock is held; retrying next cycle')).toBe(true);
+  expect(lines.some((l) => l.msg === 'sync deferred; retrying next cycle')).toBe(true);
   expect(lines.some((l) => l.level === 'error')).toBe(false);
 });
 
@@ -1513,4 +1520,330 @@ test('a cycle that fails on a long argv and long stderr reports a bounded syncEr
   expect(err.length).toBeLessThanOrEqual(SYNC_ERROR_MAX_CHARS);
   expect(err).toContain('git add -A -- <300 paths> failed (code 128)');
   expect(err).toContain('fatal: something specific broke');
+});
+
+// --- holder check: the same repository under another name ----------------------
+// Review reproduced all three against real git with the path-string check this replaced: each
+// deleted a live lock. A lock is backdated well past staleGitLockMin, and in none of these cases
+// does the holder keep a descriptor open on it, so only the identity check can see the owner.
+const bwrapWorks = (() => {
+  try {
+    return Bun.spawnSync(['bwrap', '--dev-bind', '/', '/', 'true']).exitCode === 0;
+  } catch {
+    return false;
+  }
+})();
+
+// Skipped where it cannot run: it needs Linux and a bwrap that can create a mount namespace
+// unprivileged (`unshare -Ur` is refused on hosts that restrict user namespaces; bwrap usually is not).
+test.skipIf(process.platform !== 'linux' || !bwrapWorks)(
+  'a git in another mount namespace, on a bind mount of the repo, keeps its lock [needs Linux + bwrap]',
+  async () => {
+    const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+    await writeFile(join(dirA, 'a.txt'), 'sandboxed edit');
+    const alt = join(base, 'mounted-elsewhere');
+    await mkdir(alt);
+    const lock = join(dirA, '.git', 'index.lock');
+    const sandboxed = Bun.spawn(
+      ['bwrap', '--dev-bind', '/', '/', '--bind', dirA, alt, '--chdir', alt, '--die-with-parent', 'git', 'commit', '-a'],
+      { env: { ...process.env, GIT_EDITOR: 'sleep 15; true' }, stdio: ['ignore', 'ignore', 'ignore'] },
+    );
+    try {
+      await waitFor(() => exists(lock));
+      await ageFile(lock, 20 * 60_000);
+      await syncA.syncOnce(repoA);
+      expect(await exists(lock)).toBe(true);
+      expect(recA.lockRepairs).toHaveLength(0);
+    } finally {
+      sandboxed.kill('SIGKILL');
+      await sandboxed.exited;
+    }
+  },
+);
+
+// A ref transaction held open by `update-ref --stdin`: prepared (the lock written and closed), not
+// yet committed. That is the shape of every ref lock git holds mid-transaction.
+function holdRefTransaction(argv: string[], cwd: string, sha: string, env?: Record<string, string>) {
+  const p = Bun.spawn(argv, { cwd, stdin: 'pipe', stdout: 'ignore', stderr: 'ignore', env: { ...process.env, ...env } });
+  p.stdin.write(`start\nupdate refs/heads/held ${sha}\nprepare\n`);
+  p.stdin.flush();
+  return {
+    proc: p,
+    async release() {
+      p.stdin.write('abort\n');
+      p.stdin.end();
+      await p.exited;
+    },
+  };
+}
+
+test.skipIf(process.platform !== 'linux')('a git naming the repo through a symlink, from outside it, keeps its ref lock', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  const link = join(base, 'link-to-alpha');
+  await symlink(dirA, link);
+  const sha = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  const lock = join(dirA, '.git', 'refs', 'heads', 'held.lock');
+  const viaArgv = holdRefTransaction(['git', `--git-dir=${link}/.git`, 'update-ref', '--stdin'], base, sha);
+  try {
+    await waitFor(() => exists(lock));
+    await ageFile(lock, 20 * 60_000);
+    await syncA.syncOnce(repoA);
+    expect(await exists(lock)).toBe(true);
+  } finally {
+    await viaArgv.release();
+  }
+
+  // The same through GIT_DIR in the environment rather than argv.
+  const viaEnv = holdRefTransaction(['git', 'update-ref', '--stdin'], base, sha, { GIT_DIR: `${link}/.git` });
+  try {
+    await waitFor(() => exists(lock));
+    await ageFile(lock, 20 * 60_000);
+    await syncA.syncOnce(repoA);
+    expect(await exists(lock)).toBe(true);
+  } finally {
+    await viaEnv.release();
+  }
+  expect(recA.lockRepairs).toHaveLength(0);
+});
+
+test.skipIf(process.platform !== 'linux')('a git in a linked worktree keeps the shared ref lock it holds', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  const wt = join(base, 'alpha-worktree');
+  await git(dirA, ['worktree', 'add', '-q', '-b', 'side', wt]);
+  const sha = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  const lock = join(dirA, '.git', 'refs', 'heads', 'held.lock');
+  const holder = holdRefTransaction(['git', 'update-ref', '--stdin'], wt, sha);
+  try {
+    await waitFor(() => exists(lock));
+    await ageFile(lock, 20 * 60_000);
+    await syncA.syncOnce(repoA);
+    expect(await exists(lock)).toBe(true);
+    expect(recA.lockRepairs).toHaveLength(0);
+  } finally {
+    await holder.release();
+  }
+});
+
+// --- merges a shutdown or a crash left half-done ----------------------------------
+async function concurrentEdit(dirA: string, dirB: string): Promise<void> {
+  const early = { GIT_AUTHOR_DATE: '2026-01-01T00:00:00+00:00', GIT_COMMITTER_DATE: '2026-01-01T00:00:00+00:00' };
+  const late = { GIT_AUTHOR_DATE: '2026-06-01T00:00:00+00:00', GIT_COMMITTER_DATE: '2026-06-01T00:00:00+00:00' };
+  await writeFile(join(dirA, 'foo.txt'), 'alpha-version\n');
+  await git(dirA, ['commit', '-q', '-am', 'edit A'], early);
+  await writeFile(join(dirB, 'foo.txt'), 'beta-version\n');
+  await git(dirB, ['commit', '-q', '-am', 'edit B'], late);
+}
+
+test('a shutdown that starts refusing children mid-merge still aborts the merge', async () => {
+  const { dirA, dirB, recA, repoA } = await setupPair({ 'foo.txt': 'base\n' });
+  await concurrentEdit(dirA, dirB);
+  const before = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  let s: Syncer | null = null;
+  // Right after `git merge` leaves its conflicts, the drain's bound expires: from here on every
+  // ordinary spawn is refused, exactly as in a shutdown that ran out of patience.
+  const gitRunner = (async (argv: string[], opts: RunOptions = {}): Promise<RunResult> => {
+    const r = await run(argv, opts);
+    if (argv[1] === 'merge' && argv[2] === '--no-ff') {
+      s!.stop();
+      await drainChildren({ settleMs: 0, termGraceMs: 0, killWaitMs: 0 });
+    }
+    return r;
+  }) as typeof run;
+  s = new Syncer(makeConfig('alpha', [peer('beta')], dirA), recA.deps, { ...FAST, gitRunner });
+  try {
+    await s.syncOnce(repoA);
+  } finally {
+    allowChildSpawns();
+  }
+
+  expect(await exists(join(dirA, '.git', 'MERGE_HEAD'))).toBe(false);
+  expect((await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(before);
+  expect((await git(dirA, ['status', '--porcelain'])).stdout.trim()).toBe('');
+  expect(await readFile(join(dirA, 'foo.txt'), 'utf8')).toBe('alpha-version\n');
+  expect(recA.stats.every((st) => st.syncError === null)).toBe(true);
+});
+
+test('a merge the daemon left unfinished is aborted and redone; its markers are never committed', async () => {
+  const { dirA, dirB, recA, repoA } = await setupPair({ 'foo.txt': 'base\n' });
+  await concurrentEdit(dirA, dirB);
+  // What a process that died between `git merge` and resolving it leaves behind.
+  await git(dirA, ['fetch', '-q', 'fleet-beta']);
+  const betaTip = (await git(dirA, ['rev-parse', 'refs/remotes/fleet-beta/sync/beta'])).stdout.trim();
+  await writeFile(join(dirA, '.git', 'sukarfleet-merge'), `${betaTip}\n`);
+  const m = await run(['git', 'merge', '--no-ff', '--no-edit', betaTip], { cwd: dirA });
+  expect(m.code).not.toBe(0);
+  expect(await readFile(join(dirA, 'foo.txt'), 'utf8')).toContain('<<<<<<<');
+
+  const s = new Syncer(makeConfig('alpha', [peer('beta')], dirA), recA.deps, FAST);
+  await s.syncOnce(repoA);
+
+  expect(await exists(join(dirA, '.git', 'MERGE_HEAD'))).toBe(false);
+  expect(await exists(join(dirA, '.git', 'sukarfleet-merge'))).toBe(false);
+  // Redone under newest-wins: beta's later edit wins, alpha's is kept as an artifact.
+  expect(await readFile(join(dirA, 'foo.txt'), 'utf8')).toBe('beta-version\n');
+  expect(recA.conflicts).toHaveLength(1);
+  expect((await run(['git', 'grep', '-q', '<<<<<<<', 'HEAD'], { cwd: dirA })).code).toBe(1);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+});
+
+test('a merge a person left unfinished is waited on, never committed or aborted', async () => {
+  const { dirA, dirB, recA, repoA } = await setupPair({ 'foo.txt': 'base\n' });
+  await concurrentEdit(dirA, dirB);
+  await git(dirA, ['fetch', '-q', 'fleet-beta']);
+  await run(['git', 'merge', '--no-ff', '--no-edit', 'refs/remotes/fleet-beta/sync/beta'], { cwd: dirA });
+  const before = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+
+  const s = new Syncer(makeConfig('alpha', [peer('beta')], dirA), recA.deps, FAST);
+  await s.syncOnce(repoA);
+
+  expect(await exists(join(dirA, '.git', 'MERGE_HEAD'))).toBe(true);
+  expect((await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(before);
+  expect(await readFile(join(dirA, 'foo.txt'), 'utf8')).toContain('<<<<<<<');
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+});
+
+// --- restart, stop and the deferral note --------------------------------------------
+test('a deferral right after a restart reports boot time, not "never synced"', async () => {
+  const { dirA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, '.git', 'index.lock'), '');
+  await writeFile(join(dirA, 'a.txt'), 'two');
+  const bootAt = Date.now();
+  const restarted = new Syncer(makeConfig('alpha', [peer('beta')], dirA), recA.deps, FAST);
+
+  await restarted.syncOnce(repoA);
+
+  const st = recA.stats.at(-1)!;
+  expect(st.syncError).toBeNull();
+  expect(st.lastSyncOkMs).not.toBeNull();
+  expect(st.lastSyncOkMs!).toBeGreaterThanOrEqual(bootAt);
+});
+
+test('a deferral that outlasts staleGitLockMin says why in syncError, as a note', async () => {
+  const { dirA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, '.git', 'index.lock'), '');
+  await writeFile(join(dirA, 'a.txt'), 'two');
+  const clock = makeClock(Date.now());
+  const s = new Syncer(makeConfig('alpha', [peer('beta')], dirA), recA.deps, {
+    ...FAST,
+    now: clock.now,
+    lockHolderCheck: async () => 'held',
+  });
+
+  await s.syncOnce(repoA);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  clock.advance(11 * 60_000);
+  await s.syncOnce(repoA);
+  const note = recA.stats.at(-1)!.syncError!;
+  expect(note.startsWith(SYNC_DEFERRED_PREFIX)).toBe(true);
+  expect(note).toContain('index.lock');
+
+  await rm(join(dirA, '.git', 'index.lock'));
+  await s.syncOnce(repoA);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+});
+
+test('a stop during the write-quiet debounce commits nothing', async () => {
+  const { dirA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, 'a.txt'), 'possibly half-written');
+  const before = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  let s: Syncer | null = null;
+  s = new Syncer(makeConfig('alpha', [peer('beta')], dirA), recA.deps, {
+    ...FAST,
+    debounceMs: 5,
+    sleep: async () => {
+      s!.stop();
+    },
+  });
+
+  await s.syncOnce(repoA);
+
+  expect((await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(before);
+});
+
+// --- paths a Windows checkout cannot hold -------------------------------------------
+// Live: a Linux node auto-committed `_tmp/x/check:css.log`, and the Windows peer's merge failed
+// with "invalid path" every cycle after.
+test('isPortablePath refuses what Windows refuses', () => {
+  for (const ok of ['a.txt', 'dir/sub/file.md', '.hidden', 'console.log', 'auxiliary.txt', 'com10', 'a b/c d.txt', 'x.lock']) {
+    expect(isPortablePath(ok)).toBe(true);
+  }
+  for (const bad of [
+    '_tmp/x/check:css.log',
+    'a<b',
+    'a>b',
+    'q"uote',
+    'pi|pe',
+    'what?.md',
+    'star*.md',
+    'back\\slash',
+    'ctrl\u0001char',
+    'ends-with-dot.',
+    'dir./file',
+    'ends-with-space ',
+    'CON',
+    'con.txt',
+    'Aux.tar.gz',
+    'nul',
+    'dir/COM1',
+    'lpt9.log',
+    'PRN  .txt',
+  ]) {
+    expect(isPortablePath(bad)).toBe(false);
+  }
+});
+
+test('an unportable untracked file is never committed; portable ones in the same cycle are', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await mkdir(join(dirA, '_tmp', 'x'), { recursive: true });
+  await writeFile(join(dirA, '_tmp', 'x', 'check:css.log'), 'log');
+  await writeFile(join(dirA, '_tmp', 'x', 'fine.log'), 'log');
+  await writeFile(join(dirA, 'CON.txt'), 'x');
+  await writeFile(join(dirA, 'a.txt'), 'two');
+
+  await syncA.syncOnce(repoA);
+
+  const tracked = (await git(dirA, ['ls-files'])).stdout.split('\n').filter(Boolean).sort();
+  expect(tracked).toEqual(['_tmp/x/fine.log', 'a.txt']);
+  expect((await git(dirA, ['show', 'HEAD:a.txt'])).stdout).toBe('two');
+  expect(await exists(join(dirA, '_tmp', 'x', 'check:css.log'))).toBe(true);
+  expect(recA.unportable).toHaveLength(0);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+
+  // Left alone every cycle after, quietly: no commit, no error.
+  const head = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  await syncA.syncOnce(repoA);
+  expect((await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(head);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+});
+
+test('an unportable path already tracked is untracked, recorded once, and the file stays on disk', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, 'check:css.log'), 'log');
+  await writeFile(join(dirA, 'what?.md'), 'q');
+  await git(dirA, ['add', '-A']);
+  await git(dirA, ['commit', '-q', '-m', 'an older machine committed these']);
+
+  await syncA.syncOnce(repoA);
+
+  expect((await git(dirA, ['ls-files'])).stdout.split('\n').filter(Boolean)).toEqual(['a.txt']);
+  expect((await git(dirA, ['ls-tree', '--name-only', 'HEAD'])).stdout.split('\n').filter(Boolean)).toEqual(['a.txt']);
+  expect(await readFile(join(dirA, 'check:css.log'), 'utf8')).toBe('log');
+  expect(recA.unportable).toEqual([{ repo: 'r', paths: ['check:css.log', 'what?.md'] }]);
+
+  await syncA.syncOnce(repoA);
+  expect(recA.unportable).toHaveLength(1);
+});
+
+test('a rename to an unportable name: the new name stays out, the old one goes', async () => {
+  const { dirA, syncA, repoA } = await setupPair({ 'good.txt': 'g', 'moved.txt': 'm' });
+  // One staged with git mv, one renamed behind git's back.
+  await git(dirA, ['mv', 'good.txt', 'bad:name.txt']);
+  await rename(join(dirA, 'moved.txt'), join(dirA, 'moved|too.txt'));
+
+  await syncA.syncOnce(repoA);
+
+  expect((await git(dirA, ['ls-tree', '--name-only', 'HEAD'])).stdout.trim()).toBe('');
+  expect(await readFile(join(dirA, 'bad:name.txt'), 'utf8')).toBe('g');
+  expect(await readFile(join(dirA, 'moved|too.txt'), 'utf8')).toBe('m');
+  expect((await git(dirA, ['status', '--porcelain'])).stdout.split('\n').filter((l) => !l.startsWith('??')).filter(Boolean)).toEqual([]);
 });
