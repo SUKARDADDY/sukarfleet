@@ -20,7 +20,7 @@ import type {
 import { expandHome, loadConfig, patchConfig, persistLegacyMigration, stateDir } from './config';
 import { Enrollments } from './enroll';
 import { DEFAULT_REPO_URL, EnrollmentIssuer } from './installer';
-import { atomicWrite, clockDriftMs, log, nowMs, run, sdNotify, readJsonFile } from './util';
+import { atomicWrite, clockDriftMs, drainChildren, log, nowMs, run, sdNotify, readJsonFile } from './util';
 
 import { buildAuthHeader, loadOrCreateMachineKey, writeSecretFile } from './keys';
 import { Gossip } from './gossip';
@@ -42,6 +42,8 @@ import {
   AUDIT_KIND_CREDENTIAL_REMOVED,
   AUDIT_KIND_ADMIN_RUN_COMPLETED,
   AUDIT_KIND_ADMIN_RUN_REFUSED,
+  AUDIT_KIND_SYNC_LOCK_REPAIRED,
+  AUDIT_KIND_SYNC_OWN_BRANCH_MERGED,
   flushLocalToUnion,
   crossCheckAuditLog,
   loadForkBaseline,
@@ -118,6 +120,11 @@ const AUDIT_UNION_RELATIVE_PATH = 'sukarfleet-audit.jsonl';
 
 interface LoopHandle {
   stop(): void;
+  // Resolves once no iteration is running: immediately when idle, else when the current one ends.
+  // A stopped loop starts no new iteration, so after stop() this settles for good. Shutdown waits
+  // on it with a bound (drainChildren), never bare: an iteration wedged on an await with no
+  // deadline would otherwise hang the exit forever.
+  idle(): Promise<void>;
 }
 
 interface MinimalServer {
@@ -130,14 +137,21 @@ interface MinimalServer {
 export function scheduleLoop(name: string, intervalMs: number, fn: () => Promise<void>): LoopHandle {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
+  let inFlight: Promise<void> | null = null;
 
   const tick = async (): Promise<void> => {
     if (stopped) return;
+    let finished: () => void = () => {};
+    inFlight = new Promise<void>((resolve) => {
+      finished = resolve;
+    });
     try {
       await fn();
     } catch (err) {
       log('error', `${name} loop iteration failed`, { error: String(err) });
     } finally {
+      inFlight = null;
+      finished();
       if (!stopped) {
         timer = setTimeout(tick, intervalMs);
         (timer as unknown as { unref?: () => void }).unref?.();
@@ -156,6 +170,9 @@ export function scheduleLoop(name: string, intervalMs: number, fn: () => Promise
     stop(): void {
       stopped = true;
       if (timer) clearTimeout(timer);
+    },
+    idle(): Promise<void> {
+      return inFlight ?? Promise.resolve();
     },
   };
 }
@@ -198,6 +215,13 @@ export function isLoopFresh(nowMsVal: number, lastOkMs: number, windowMs: number
 // of anchorDaemonOnline === false before it takes over pushing derive's derived main. Exported so
 // tests IMPORT it rather than re-hardcoding the number the gate actually checks.
 export const TAKEOVER_STREAK = 2;
+
+// Graceful-shutdown budget (see shutdown() in main). Exported so a test can pin the sum against
+// systemd's default TimeoutStopSec rather than trust this comment.
+export const SHUTDOWN_SETTLE_MS = 30_000;
+export const SHUTDOWN_TERM_GRACE_MS = 5_000;
+export const SHUTDOWN_KILL_WAIT_MS = 5_000;
+export const SYSTEMD_DEFAULT_TIMEOUT_STOP_MS = 90_000;
 
 // P3 single-pusher policy (Class A fix). Previously this gate read transport.anchorReachable() --
 // the EasyTier PEER TABLE, a different systemd unit than the anchor's node daemon. That mismatch
@@ -528,6 +552,9 @@ async function main(): Promise<void> {
   // or the watchdog starves before a slow first cycle can complete.
   let gossipLoopOkMs = nowMs();
   let syncLoopOkMs = nowMs();
+  // Set by shutdown() below. Up here because the sync loop reads it between repos: a tick that is
+  // mid-way through the repo list when SIGTERM lands finishes the repo it is on and starts no other.
+  let shuttingDown = false;
   let lastTransportSummary: unknown = null;
   let lastTransportRestartOk: boolean | null = null;
   // P3 single-pusher takeover debounce (nextAnchorDownStreak); consulted for the roamer role only,
@@ -592,6 +619,32 @@ async function main(): Promise<void> {
   const gossip = new Gossip(cfg, key, buildPresencePayload);
   await gossip.restore();
 
+  // The audit log. The admin lane records every call, refusal and pairing into it, and the sync
+  // lane every repair it makes on its own (which is why it is built here, ahead of the Syncer).
+  // Every entry this machine appends carries `prev`, so its run is hash-chained from its genesis
+  // forward: an entry edited or replaced after that genesis is detectable, trailing truncation of
+  // the newest entries is not (see audit.ts's crossCheckAuditLog). Construction touches no disk and opens no
+  // port -- AuditLog reads its sequence lazily on the first append -- so a node that appends
+  // nothing is byte-identical to one that never built it.
+  const auditLog = new AuditLog(cfg.machine, key);
+  const auditAppend = (kind: string, detail: Record<string, unknown>): Promise<AuditEntry> =>
+    auditLog.append(kind, detail);
+  // Most-recent-first, per McpDeps.tailAudit's and UiRoutesDeps.tailAudit's shared contract.
+  const tailAudit = async (limit: number): Promise<AuditEntry[]> => {
+    const all = await auditLog.readAll();
+    return all.slice(-limit).reverse();
+  };
+
+  // A failed append degrades to a log line: the repair it records has already happened, and losing
+  // the bookkeeping must not cost the cycle that made it.
+  const auditSyncRepair = async (kind: string, detail: Record<string, unknown>): Promise<void> => {
+    try {
+      await auditAppend(kind, detail);
+    } catch (err) {
+      log('error', 'audit: could not record a sync repair', { kind, error: String(err) });
+    }
+  };
+
   const syncer = new Syncer(cfg, {
     machineKey: key,
     isClockVetted: () => clockSentinel.isClockVetted(),
@@ -618,6 +671,14 @@ async function main(): Promise<void> {
     onObjectsRepaired: (repoName, quarantinedTo, recoveredFrom) => {
       log('warn', 'sync: empty git objects refetched', { repo: repoName, quarantinedTo, recoveredFrom });
     },
+    // Silent by design, like the two above, and audited on top: these fire with nobody watching,
+    // and an operator asking "why did that repo stall for ten minutes" finds the answer in fleet.tail.
+    onLockRepaired: async (repoName, repair) => {
+      await auditSyncRepair(AUDIT_KIND_SYNC_LOCK_REPAIRED, { repo: repoName, ...repair });
+    },
+    onOwnBranchMerged: async (repoName, detail) => {
+      await auditSyncRepair(AUDIT_KIND_SYNC_OWN_BRANCH_MERGED, { repo: repoName, ...detail });
+    },
   });
 
   const health = new Health(cfg);
@@ -638,21 +699,6 @@ async function main(): Promise<void> {
   // ever retried -- without this call the clock could otherwise stay unvetted forever.
   await republishEndpoint();
   await clockSentinel.vet();
-
-  // The audit log. The admin lane records every call, refusal and pairing into it, and every entry
-  // this machine appends carries `prev`, so its run is hash-chained from its genesis forward: an
-  // entry edited or replaced after that genesis is detectable, trailing truncation of the newest
-  // entries is not (see audit.ts's crossCheckAuditLog). Construction touches no disk and opens no
-  // port -- AuditLog reads its sequence lazily on the first append -- so a node that appends
-  // nothing is byte-identical to one that never built it.
-  const auditLog = new AuditLog(cfg.machine, key);
-  const auditAppend = (kind: string, detail: Record<string, unknown>): Promise<AuditEntry> =>
-    auditLog.append(kind, detail);
-  // Most-recent-first, per McpDeps.tailAudit's and UiRoutesDeps.tailAudit's shared contract.
-  const tailAudit = async (limit: number): Promise<AuditEntry[]> => {
-    const all = await auditLog.readAll();
-    return all.slice(-limit).reverse();
-  };
 
   // The MCP server handle. Declared here so shutdown() and fetchHandler below can reference it
   // unconditionally; it is started further down regardless of any other lane.
@@ -1577,6 +1623,7 @@ async function main(): Promise<void> {
     const push = shouldPushThisTick(cfg.role, anchorDaemonOnlineNow, anchorDownStreak);
 
     for (const repo of cfg.repos) {
+      if (shuttingDown) break;
       if (!adopted.has(repo.name)) continue; // never sync on main
 
       const sync = await syncer.syncOnce(repo);
@@ -1783,7 +1830,21 @@ async function main(): Promise<void> {
     adoptedRepos: [...adopted],
   });
 
-  let shuttingDown = false;
+  // Graceful shutdown. It used to stop the loops and exit on the spot, over whatever git child was
+  // running. Under systemd's KillMode=mixed that child then got SIGKILL, and SIGKILL is the one
+  // signal git cannot clean up after: a repo stayed wedged for twelve days on the index.lock one
+  // such exit left behind. Now nothing new is scheduled, the work in flight is given time to end
+  // on its own, and only then are children stopped -- SIGTERM first, which git answers by deleting
+  // its own locks -- with SIGKILL as the last resort and its orphaned locks cleared by the Syncer's
+  // afterKill hook. See drainChildren for the order and why it is safe.
+  //
+  // Budget: SHUTDOWN_SETTLE_MS + SHUTDOWN_TERM_GRACE_MS + SHUTDOWN_KILL_WAIT_MS is 40 s, well inside
+  // systemd's default TimeoutStopSec of 90 s, so the service manager's own SIGKILL is not what
+  // ends a git child unless one outlives SIGKILL itself. The watchdog loop stops first and pings no more. A stop systemd started has
+  // already left the watchdog behind; for a SIGTERM from anywhere else, the last ping is at most
+  // watchdogSec/3 old, and at the default watchdogSec of 120 that plus 40 s is still under it.
+  // Every wait is bounded by a timer, not by the work, so a sync await wedged on something with no
+  // deadline costs the budget and never hangs the exit.
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -1793,10 +1854,18 @@ async function main(): Promise<void> {
     transportLoop.stop();
     healthLoop.stop();
     watchdogLoop.stop();
+    syncer.stop();
     sshAdmin.stop();
     mcpHandle?.stop();
     meshServer.stop();
     statusServer?.stop();
+    const drained = await drainChildren({
+      settled: Promise.all([syncLoop.idle(), gossipLoop.idle(), transportLoop.idle(), healthLoop.idle()]),
+      settleMs: SHUTDOWN_SETTLE_MS,
+      termGraceMs: SHUTDOWN_TERM_GRACE_MS,
+      killWaitMs: SHUTDOWN_KILL_WAIT_MS,
+    });
+    log(drained.terminated > 0 ? 'warn' : 'info', 'shutdown: in-flight work drained', { ...drained });
     try {
       await gossip.snapshot();
     } catch (err) {

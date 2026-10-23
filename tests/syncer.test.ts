@@ -1,9 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod, stat, utimes, readlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Syncer, isCorruptIndexError, isEmptyObjectError, type SyncerDeps, type SyncerOptions } from '../src/syncer';
+import {
+  Syncer,
+  boundErrorText,
+  isCorruptIndexError,
+  isEmptyObjectError,
+  isGitLockBusyError,
+  isNonFastForwardRejection,
+  SYNC_ERROR_MAX_CHARS,
+  type OwnBranchMerge,
+  type SyncerDeps,
+  type SyncerOptions,
+} from '../src/syncer';
+import type { LockRepair } from '../src/gitlocks';
 import { defaultConfig } from '../src/config';
 import { run } from '../src/util';
 import type { RunOptions, RunResult } from '../src/util';
@@ -69,6 +81,8 @@ interface Recorder {
   notApplicable: string[];
   repairs: { repo: string; quarantinedTo: string }[];
   objectRepairs: { repo: string; quarantinedTo: string; recoveredFrom: string }[];
+  lockRepairs: { repo: string; repair: LockRepair }[];
+  ownMerges: { repo: string; detail: OwnBranchMerge }[];
 }
 
 function recorder(vetted = true): Recorder {
@@ -78,6 +92,8 @@ function recorder(vetted = true): Recorder {
   const notApplicable: string[] = [];
   const repairs: { repo: string; quarantinedTo: string }[] = [];
   const objectRepairs: { repo: string; quarantinedTo: string; recoveredFrom: string }[] = [];
+  const lockRepairs: { repo: string; repair: LockRepair }[] = [];
+  const ownMerges: { repo: string; detail: OwnBranchMerge }[] = [];
   return {
     stats,
     pushes,
@@ -85,6 +101,8 @@ function recorder(vetted = true): Recorder {
     notApplicable,
     repairs,
     objectRepairs,
+    lockRepairs,
+    ownMerges,
     deps: {
       isClockVetted: () => vetted,
       onRepoStat: (_r, s) => stats.push(s),
@@ -93,6 +111,12 @@ function recorder(vetted = true): Recorder {
       onConflictArtifact: (_r, p) => conflicts.push(p),
       onIndexRepaired: (r, quarantinedTo) => repairs.push({ repo: r, quarantinedTo }),
       onObjectsRepaired: (r, quarantinedTo, recoveredFrom) => objectRepairs.push({ repo: r, quarantinedTo, recoveredFrom }),
+      onLockRepaired: (r, repair) => {
+        lockRepairs.push({ repo: r, repair });
+      },
+      onOwnBranchMerged: (r, detail) => {
+        ownMerges.push({ repo: r, detail });
+      },
       machineKey: TEST_MACHINE_KEY,
     },
   };
@@ -1108,4 +1132,385 @@ test('a lost blob that was only staged is dropped from the index and re-staged f
   expect(recA.stats.at(-1)!.syncError).toBeNull();
   expect((await git(dirA, ['show', 'HEAD:b.txt'])).stdout).toBe('staged only');
   expect((await run(['git', 'fsck', '--connectivity-only', '--no-dangling'], { cwd: dirA })).code).toBe(0);
+});
+
+// --- stale git lock self-repair ---------------------------------------------
+// What wedged a live repo for twelve days: an empty .git/index.lock left by a git the daemon's
+// own shutdown SIGKILLed. Every cycle died at `git add` with "Unable to create ... index.lock: File
+// exists", so nothing after step (1) ever ran. These pin the repair and, as importantly, every case
+// in which the lock must be left exactly where it is.
+const OLD_LOCK_MS = 11 * 60_000; // past the default thresholds.staleGitLockMin of 10
+
+async function exists(p: string): Promise<boolean> {
+  try {
+    await stat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ageFile(p: string, ageMs: number): Promise<void> {
+  const t = (Date.now() - ageMs) / 1000;
+  await utimes(p, t, t);
+}
+
+async function waitFor(cond: () => Promise<boolean>, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await cond()) return;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error('condition not met in time');
+}
+
+test('a stale empty index.lock nobody holds is removed, and the same cycle commits', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, 'a.txt'), 'two');
+  const lock = join(dirA, '.git', 'index.lock');
+  await writeFile(lock, '');
+  await ageFile(lock, OLD_LOCK_MS);
+  const before = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+
+  await syncA.syncOnce(repoA);
+
+  expect(await exists(lock)).toBe(false);
+  expect(recA.lockRepairs).toHaveLength(1);
+  expect(recA.lockRepairs[0]!.repo).toBe('r');
+  expect(recA.lockRepairs[0]!.repair).toMatchObject({
+    lock: join('.git', 'index.lock'),
+    reason: 'stale',
+    action: 'removed',
+    sizeBytes: 0,
+  });
+  // One tick: the cycle that cleared the lock also committed the pending edit and reported clean.
+  expect(recA.stats).toHaveLength(1);
+  expect(recA.stats[0]!.syncError).toBeNull();
+  expect((await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim()).not.toBe(before);
+  expect((await git(dirA, ['show', 'HEAD:a.txt'])).stdout).toBe('two');
+});
+
+test('a stale ref lock on the sync branch is removed and the commit goes through', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, 'a.txt'), 'two');
+  const lock = join(dirA, '.git', 'refs', 'heads', 'sync', 'alpha.lock');
+  await writeFile(lock, '');
+  await ageFile(lock, OLD_LOCK_MS);
+
+  await syncA.syncOnce(repoA);
+
+  expect(await exists(lock)).toBe(false);
+  expect(recA.lockRepairs.map((r) => r.repair.lock)).toEqual([join('.git', 'refs', 'heads', 'sync', 'alpha.lock')]);
+  expect((await git(dirA, ['show', 'HEAD:a.txt'])).stdout).toBe('two');
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+});
+
+test('a stale non-empty lock is moved aside with its bytes, not deleted', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  const lock = join(dirA, '.git', 'index.lock');
+  await writeFile(lock, 'half-written index');
+  await ageFile(lock, OLD_LOCK_MS);
+
+  await syncA.syncOnce(repoA);
+
+  expect(await exists(lock)).toBe(false);
+  const repair = recA.lockRepairs[0]!.repair;
+  expect(repair.action).toBe('quarantined');
+  expect(repair.sizeBytes).toBe('half-written index'.length);
+  expect(await readFile(repair.quarantinedTo!, 'utf8')).toBe('half-written index');
+  // Kept outside refs/ and away from the index, where git never reads it.
+  expect(repair.quarantinedTo!.startsWith(join(dirA, '.git', 'sukarfleet-stale-locks'))).toBe(true);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+});
+
+test('a fresh lock is left alone, and the cycle defers quietly instead of reporting an error', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await syncA.syncOnce(repoA); // a first good cycle, so there is a last success to keep
+  const okMs = recA.stats.at(-1)!.lastSyncOkMs;
+  expect(okMs).not.toBeNull();
+
+  await writeFile(join(dirA, 'a.txt'), 'two');
+  const lock = join(dirA, '.git', 'index.lock');
+  await writeFile(lock, '');
+  const before = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+
+  const { lines, restore } = captureLogs();
+  try {
+    await syncA.syncOnce(repoA);
+  } finally {
+    restore();
+  }
+
+  expect(await exists(lock)).toBe(true);
+  expect(recA.lockRepairs).toHaveLength(0);
+  expect((await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(before);
+  // Not a fault: no syncError, and the last real success is kept rather than nulled.
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect(recA.stats.at(-1)!.lastSyncOkMs).toBe(okMs);
+  expect(lines.some((l) => l.msg === 'sync deferred: a git lock is held; retrying next cycle')).toBe(true);
+  expect(lines.some((l) => l.level === 'error')).toBe(false);
+});
+
+test.skipIf(process.platform !== 'linux')('an old lock a live process holds open is left alone', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  const lock = join(dirA, '.git', 'index.lock');
+  await writeFile(lock, '');
+  await ageFile(lock, OLD_LOCK_MS);
+  // Not git, and not working in the repo: only the open descriptor marks it as the holder.
+  const holder = Bun.spawn(['sh', '-c', 'exec 3<"$1"; exec sleep 30', 'sh', lock], { cwd: base, stdio: ['ignore', 'ignore', 'ignore'] });
+  try {
+    await waitFor(async () => {
+      try {
+        return (await readlink(`/proc/${holder.pid}/fd/3`)) === lock;
+      } catch {
+        return false;
+      }
+    });
+    await writeFile(join(dirA, 'a.txt'), 'two');
+    await syncA.syncOnce(repoA);
+
+    expect(await exists(lock)).toBe(true);
+    expect(recA.lockRepairs).toHaveLength(0);
+    expect(recA.stats.at(-1)!.syncError).toBeNull();
+  } finally {
+    holder.kill('SIGKILL');
+    await holder.exited;
+  }
+});
+
+// The case an open-descriptor check alone gets wrong. `git commit -a` writes the new index into
+// index.lock, closes it, and holds it -- with no descriptor open -- for as long as the editor is up.
+// A person composing a commit message for twenty minutes must not have it pulled out from under them.
+test.skipIf(process.platform !== 'linux')('a human commit waiting on its editor keeps its index.lock however old', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, 'a.txt'), 'human edit');
+  const lock = join(dirA, '.git', 'index.lock');
+  const human = Bun.spawn(['git', 'commit', '-a'], {
+    cwd: dirA,
+    env: { ...process.env, GIT_EDITOR: 'sleep 15; true' },
+    stdio: ['ignore', 'ignore', 'ignore'],
+  });
+  try {
+    await waitFor(() => exists(lock));
+    await ageFile(lock, 60 * 60_000);
+
+    await syncA.syncOnce(repoA);
+
+    expect(await exists(lock)).toBe(true);
+    expect(recA.lockRepairs).toHaveLength(0);
+    expect(recA.stats.at(-1)!.syncError).toBeNull();
+  } finally {
+    // SIGTERM, as a person's Ctrl-C would: git removes its own lock on the way out.
+    human.kill('SIGTERM');
+    await human.exited;
+  }
+  expect(await exists(lock)).toBe(false);
+});
+
+test('when the holder check cannot answer, the lock stays and nothing alarms', async () => {
+  const { dirA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  const cfg = makeConfig('alpha', [peer('beta')], dirA);
+  const s = new Syncer(cfg, recA.deps, { ...FAST, lockHolderCheck: async () => 'unknown' });
+  await writeFile(join(dirA, 'a.txt'), 'two');
+  const lock = join(dirA, '.git', 'index.lock');
+  await writeFile(lock, '');
+  await ageFile(lock, OLD_LOCK_MS);
+
+  await s.syncOnce(repoA);
+
+  expect(await exists(lock)).toBe(true);
+  expect(recA.lockRepairs).toHaveLength(0);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+});
+
+test('thresholds.staleGitLockMin decides how old is old enough', async () => {
+  const { dirA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  const cfg = makeConfig('alpha', [peer('beta')], dirA);
+  cfg.thresholds.staleGitLockMin = 60;
+  const s = new Syncer(cfg, recA.deps, FAST);
+  const lock = join(dirA, '.git', 'index.lock');
+  await writeFile(lock, '');
+  await ageFile(lock, OLD_LOCK_MS); // 11 minutes: stale by the default, fresh by this config
+
+  await s.syncOnce(repoA);
+  expect(await exists(lock)).toBe(true);
+
+  await ageFile(lock, 61 * 60_000);
+  await s.syncOnce(repoA);
+  expect(await exists(lock)).toBe(false);
+  expect(recA.lockRepairs).toHaveLength(1);
+});
+
+test('isGitLockBusyError matches git\'s lock-held wording and nothing else', () => {
+  expect(isGitLockBusyError("git add -A -- a.txt failed (code 128): fatal: Unable to create '/r/.git/index.lock': File exists.")).toBe(true);
+  expect(
+    isGitLockBusyError("error: cannot lock ref 'refs/heads/sync/alpha': Unable to create '/r/.git/refs/heads/sync/alpha.lock': File exists."),
+  ).toBe(true);
+  expect(isGitLockBusyError('error: could not lock config file .git/config: File exists')).toBe(true);
+  expect(isGitLockBusyError("error: cannot lock ref 'refs/heads/x': is at 1234 but expected 5678")).toBe(false);
+  expect(isGitLockBusyError('fatal: unknown index entry format 0xe2760000')).toBe(false);
+});
+
+// --- the daemon's own SIGKILL ------------------------------------------------
+// util.run escalates a step that ignores SIGTERM to SIGKILL, and a git killed that way leaves its
+// lock behind. The step's afterKill hook clears it at once rather than waiting out staleGitLockMin.
+test.skipIf(process.platform === 'win32')('a git step the daemon had to SIGKILL does not leave its lock behind', async () => {
+  const { dirA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, 'a.txt'), 'two');
+  const lock = join(dirA, '.git', 'index.lock');
+  let wedged = false;
+  // The `git add` step, swapped for one that takes the index lock and will not die of SIGTERM.
+  const gitRunner = (async (argv: string[], opts: RunOptions = {}): Promise<RunResult> => {
+    if (!wedged && argv[1] === 'add' && argv[2] === '-A' && argv[3] === '--') {
+      wedged = true;
+      return run(['sh', '-c', 'trap "" TERM; : > .git/index.lock; exec sleep 30'], { ...opts, timeoutMs: 300, killGraceMs: 200 });
+    }
+    return run(argv, opts);
+  }) as typeof run;
+  const s = new Syncer(makeConfig('alpha', [peer('beta')], dirA), recA.deps, { ...FAST, gitRunner });
+
+  await s.syncOnce(repoA);
+
+  expect(wedged).toBe(true);
+  expect(await exists(lock)).toBe(false);
+  expect(recA.lockRepairs).toHaveLength(1);
+  expect(recA.lockRepairs[0]!.repair).toMatchObject({ lock: join('.git', 'index.lock'), reason: 'orphaned-by-kill', action: 'removed' });
+  // The killed step itself is still a failed cycle (it timed out); the next one goes straight through.
+  expect(recA.stats.at(-1)!.syncError).toContain('code 124');
+  await s.syncOnce(repoA);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect((await git(dirA, ['show', 'HEAD:a.txt'])).stdout).toBe('two');
+});
+
+// --- own-branch non-fast-forward ---------------------------------------------
+// What stalled two repos' pushes for five days: after a crash, origin held a merge commit on
+// sync/<machine> that the local branch had lost, and every push was rejected as non-fast-forward
+// until a human merged origin's copy back in.
+async function setupWithOrigin(baseFiles: Record<string, string>, vetted = true) {
+  const pair = await setupPair(baseFiles);
+  const bare = join(base, 'origin.git');
+  await git(base, ['init', '-q', '--bare', bare]);
+  await git(pair.dirA, ['remote', 'add', 'origin', `file://${bare}`]);
+  await pair.syncA.syncOnce(pair.repoA); // publishes sync/alpha
+  expect(typeof pair.recA.pushes.at(-1)).toBe('number');
+
+  // A second checkout of origin standing in for the copy of alpha that pushed and then lost it.
+  const ghost = join(base, 'ghost');
+  await git(base, ['clone', '-q', '-b', 'sync/alpha', bare, ghost]);
+  await configRepo(ghost, 'alpha');
+
+  const rec = vetted ? pair.recA : recorder(false);
+  const syncA = vetted ? pair.syncA : new Syncer(makeConfig('alpha', [peer('beta')], pair.dirA), rec.deps, FAST);
+  return { ...pair, bare, ghost, syncA, recA: rec };
+}
+
+test('isNonFastForwardRejection reads git push\'s verdict', () => {
+  expect(isNonFastForwardRejection(' ! [rejected]        sync/alpha -> sync/alpha (non-fast-forward)\nerror: failed to push')).toBe(true);
+  expect(isNonFastForwardRejection(' ! [rejected]        sync/alpha -> sync/alpha (fetch first)')).toBe(true);
+  expect(isNonFastForwardRejection(' ! [remote rejected] sync/alpha -> sync/alpha (pre-receive hook declined)')).toBe(false);
+  expect(isNonFastForwardRejection('fatal: could not read Username')).toBe(false);
+});
+
+test('origin holding a merge commit the local branch lost: merged back, and the push goes through', async () => {
+  const { dirA, bare, ghost, syncA, recA, repoA } = await setupWithOrigin({ 'foo.txt': 'base\n' });
+  // An origin-only merge commit that changes no files.
+  await git(ghost, ['checkout', '-q', '-b', 'side']);
+  await git(ghost, ['commit', '-q', '--allow-empty', '-m', 'side']);
+  await git(ghost, ['checkout', '-q', 'sync/alpha']);
+  await git(ghost, ['merge', '-q', '--no-ff', '-m', 'merge side', 'side']);
+  await git(ghost, ['push', '-q', 'origin', 'sync/alpha']);
+  const originOnly = (await git(ghost, ['rev-parse', 'HEAD'])).stdout.trim();
+
+  await writeFile(join(dirA, 'foo.txt'), 'edited\n');
+  await syncA.syncOnce(repoA);
+
+  expect(typeof recA.pushes.at(-1)).toBe('number');
+  const localHead = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  expect((await git(bare, ['rev-parse', 'refs/heads/sync/alpha'])).stdout.trim()).toBe(localHead);
+  await git(dirA, ['merge-base', '--is-ancestor', originOnly, 'HEAD']);
+  expect(await readFile(join(dirA, 'foo.txt'), 'utf8')).toBe('edited\n');
+  expect(recA.ownMerges).toHaveLength(1);
+  expect(recA.ownMerges[0]!.detail).toMatchObject({ branch: 'sync/alpha', originTip: originOnly, localTipAfter: localHead, conflicts: 0 });
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect((await git(dirA, ['status', '--porcelain'])).stdout.trim()).toBe('');
+});
+
+test('a conflicting origin-only commit is settled by the ordinary newest-wins rule, loser preserved', async () => {
+  const { dirA, bare, ghost, syncA, recA, repoA } = await setupWithOrigin({ 'foo.txt': 'base\n' });
+  const early = { GIT_AUTHOR_DATE: '2026-01-01T00:00:00+00:00', GIT_COMMITTER_DATE: '2026-01-01T00:00:00+00:00' };
+  const late = { GIT_AUTHOR_DATE: '2026-06-01T00:00:00+00:00', GIT_COMMITTER_DATE: '2026-06-01T00:00:00+00:00' };
+  await writeFile(join(ghost, 'foo.txt'), 'origin-version\n');
+  await git(ghost, ['commit', '-q', '-am', 'origin edit'], late);
+  await git(ghost, ['push', '-q', 'origin', 'sync/alpha']);
+  await writeFile(join(dirA, 'foo.txt'), 'local-version\n');
+  await git(dirA, ['commit', '-q', '-am', 'local edit'], early);
+
+  await syncA.syncOnce(repoA);
+
+  expect(await readFile(join(dirA, 'foo.txt'), 'utf8')).toBe('origin-version\n');
+  expect(recA.conflicts).toHaveLength(1);
+  expect(recA.conflicts[0]!).toMatch(/^\.sync-conflicts\/[^/]+-alpha\/foo\.txt$/);
+  expect(await readFile(join(dirA, recA.conflicts[0]!), 'utf8')).toBe('local-version\n');
+  expect(recA.ownMerges[0]!.detail.conflicts).toBe(1);
+  expect(typeof recA.pushes.at(-1)).toBe('number');
+  expect((await git(bare, ['rev-parse', 'refs/heads/sync/alpha'])).stdout.trim()).toBe(
+    (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim(),
+  );
+});
+
+test('an origin-only conflict on an unvetted clock is left for a later cycle, never forced', async () => {
+  const { dirA, bare, ghost, syncA, recA, repoA } = await setupWithOrigin({ 'foo.txt': 'base\n' }, false);
+  await writeFile(join(ghost, 'foo.txt'), 'origin-version\n');
+  await git(ghost, ['commit', '-q', '-am', 'origin edit']);
+  await git(ghost, ['push', '-q', 'origin', 'sync/alpha']);
+  const originTip = (await git(ghost, ['rev-parse', 'HEAD'])).stdout.trim();
+  await writeFile(join(dirA, 'foo.txt'), 'local-version\n');
+  await git(dirA, ['commit', '-q', '-am', 'local edit']);
+  const localTip = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+
+  await syncA.syncOnce(repoA);
+
+  expect(recA.pushes.at(-1)).toBeNull();
+  expect(recA.ownMerges).toHaveLength(0);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  // Neither side rewritten: origin keeps its commit, the local branch keeps its own, tree clean.
+  expect((await git(bare, ['rev-parse', 'refs/heads/sync/alpha'])).stdout.trim()).toBe(originTip);
+  expect((await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(localTip);
+  expect((await git(dirA, ['status', '--porcelain'])).stdout.trim()).toBe('');
+});
+
+// --- bounded error text --------------------------------------------------------
+test('boundErrorText keeps what failed and git\'s verdict, and drops the argv bulk', () => {
+  expect(boundErrorText('fatal: short')).toBe('fatal: short');
+  const paths = Array.from({ length: 20000 }, (_, i) => `notes/some-directory/file-${i}.md`);
+  const huge =
+    `git add -A -- ${paths.join(' ')} failed (code 128): fatal: Unable to create '/r/.git/index.lock': File exists.\n\n` +
+    'Another git process seems to be running in this repository, e.g.\nan editor opened by \'git commit\'.';
+  expect(huge.length).toBeGreaterThan(200_000);
+  const bounded = boundErrorText(huge);
+  expect(bounded.length).toBeLessThanOrEqual(SYNC_ERROR_MAX_CHARS);
+  expect(bounded.startsWith('git add -A -- notes/')).toBe(true);
+  expect(bounded).toContain("fatal: Unable to create '/r/.git/index.lock': File exists.");
+});
+
+test('a cycle that fails on a long argv and long stderr reports a bounded syncError', async () => {
+  const dir = join(base, 'long-error');
+  await initRepo(dir, 'alpha');
+  const rec = recorder();
+  const gitRunner = interceptingRunner(makeClock(), [
+    {
+      match: (argv) => argv[1] === 'add' && argv[2] === '-A' && argv[3] === '--',
+      result: { code: 128, stdout: '', stderr: `${'hint: noise\n'.repeat(1000)}fatal: something specific broke` },
+    },
+  ]);
+  const s = new Syncer(makeConfig('alpha', [], dir), rec.deps, { ...FAST, gitRunner });
+  await s.adoptRepo(dir, 'alpha');
+  for (let i = 0; i < 300; i++) await writeFile(join(dir, `changed-file-number-${i}.txt`), 'x');
+
+  await s.syncOnce({ name: 'r', path: dir });
+
+  const err = rec.stats.at(-1)!.syncError!;
+  expect(err.length).toBeLessThanOrEqual(SYNC_ERROR_MAX_CHARS);
+  expect(err).toContain('git add -A -- <300 paths> failed (code 128)');
+  expect(err).toContain('fatal: something specific broke');
 });

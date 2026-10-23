@@ -112,10 +112,59 @@ from HEAD, and retries the cycle once. You learn about it from a `sync: corrupt 
 from HEAD` line and from the repo's sync fault clearing on its own. The corrupt bytes are kept
 rather than deleted -- they cost 30 KB and they are the only evidence of what happened.
 
-Nothing else in the sync cycle self-heals, and that is deliberate. This repair is safe because the
-index is derived state; it cannot lose a commit, cannot touch a file you edited, and cannot resolve
-a conflict on your behalf. A held `index.lock` (another process is mid-write) and an unmerged index
-(a real conflict, waiting for a human) are both left alone.
+This repair is safe because the index is derived state. It cannot lose a commit, cannot touch a file
+you edited, and cannot resolve a conflict on your behalf. An unmerged index (a real conflict, waiting
+for a human) is left alone. So is any lock another process may still hold, which the next section
+covers.
+
+## An orphaned git lock clears itself
+
+git takes a lock file (`index.lock`, `refs/heads/<branch>.lock`, and a few others) before it writes,
+and deletes it when it is done or when it is told to stop. A git that is SIGKILLed, or that dies in a
+crash, leaves the lock behind, and git never times one out. One repo stopped syncing for twelve days
+this way: every cycle failed at `git add` with `Unable to create '.../index.lock': File exists`.
+
+Three things now stop that from happening or clear it up.
+
+- `systemctl --user stop` no longer exits over a running git. The daemon waits up to 30 seconds for
+  git steps in flight, then sends SIGTERM, which git answers by deleting its own lock. SIGKILL comes
+  only after that, and the daemon removes whatever lock that kill orphaned. The whole thing takes at
+  most 40 seconds, under systemd's 90 second stop timeout.
+- When the daemon has to SIGKILL a git step that hung, it removes the locks that step created.
+- At the start of every sync cycle, a lock last written more than `thresholds.staleGitLockMin` ago
+  (default 10 minutes) is removed if no live process can still own it. The cycle then carries on in
+  the same tick.
+
+"No live process can own it" means more than "nobody has it open". `git commit -a` closes
+`index.lock` before it starts your editor and keeps the lock until the editor exits, with no file
+descriptor open on it. So the daemon also leaves a lock alone while any git that takes locks is
+working in that repository. On Linux it reads this from `/proc`, on macOS from `lsof` and `ps`. On
+Windows it waits until no `git.exe` is running at all, and a lock Windows refuses to rename counts as
+in use. If the check cannot answer, the lock stays and the next cycle asks again.
+
+An empty lock is deleted. A lock with bytes in it is a write that never finished, and git never reads
+it, but it is moved to `.git/sukarfleet-stale-locks/<timestamp>/` rather than deleted, as evidence.
+Every removal is logged as `git lock repair: retired an orphaned lock` and recorded as a signed
+`sync-lock-repaired` audit entry. None of this raises a fault or a notification.
+
+While a lock is held, a cycle that needs it is deferred rather than failed. That used to raise a
+critical sync error, and a desktop notification, any time you and the daemon touched the same repo at
+once. A lock that never clears still shows up, as a stale-sync fault once `syncStaleMin` passes.
+
+## A sync branch origin has and this machine lost is merged back
+
+After a crash, origin can hold a commit on `sync/<this machine>` that the local branch no longer has.
+Every push is then rejected as non-fast-forward. That happened to two repos, for five days, until
+someone merged origin's copy back by hand.
+
+The daemon now does that merge itself, under the same rules as a merge from a peer, and retries the
+push in the same cycle. Union paths go through the `postMerge` regenerator. Other conflicts are
+newest-wins only on a vetted clock, and the losing side is kept under `.sync-conflicts/`. It never
+force-pushes and never rebases. If the merge would not be safe this cycle, it leaves the repo as it
+was and tries again next cycle. Each merge is recorded as a signed `sync-own-branch-merged` audit
+entry.
+
+Nothing else in the sync cycle repairs itself, and that is deliberate.
 
 ## The audit log itself is damaged
 
