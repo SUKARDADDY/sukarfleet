@@ -147,6 +147,7 @@ function collectBytes(
 // them instead of exiting over them (see drainChildren). An entry leaves the set only after its
 // afterKill hook has run, which is what lets the drain's last step wait for that cleanup too.
 interface LiveChild {
+  pid: number;
   terminate(): void;
   forceKill(): void;
 }
@@ -203,6 +204,7 @@ export async function runBytes(argv: string[], opts: RunOptions = {}): Promise<R
 
   let sentKill = false;
   const child: LiveChild = {
+    pid: proc.pid,
     terminate: () => {
       try {
         proc.kill('SIGTERM');
@@ -340,6 +342,12 @@ export async function drainChildren(opts: DrainOptions): Promise<DrainResult> {
 // the rest of the suite can still spawn.
 export function allowChildSpawns(): void {
   refusingSpawns = false;
+}
+
+// The pids of the children running right now. gitlocks.ts exempts them from its "is any git
+// running" rule: they are this daemon's own sync steps, not somebody else's commit.
+export function liveChildPids(): number[] {
+  return [...liveChildren].map((c) => c.pid);
 }
 
 // How many children are running right now. For tests and diagnostics.

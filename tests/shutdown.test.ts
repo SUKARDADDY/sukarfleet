@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { allowChildSpawns, drainChildren, liveChildCount, run, runBytes, RUN_REFUSED_SHUTTING_DOWN } from '../src/util';
 import { reapGitLocks } from '../src/gitlocks';
+import { testScopedLockHolderCheck } from './support/proc-scope';
 import {
   scheduleLoop,
   SHUTDOWN_KILL_WAIT_MS,
@@ -119,7 +120,7 @@ describe('drainChildren', () => {
       timeoutMs: 120_000,
       afterKill: async ({ startedAtMs }) => {
         hooked.push(startedAtMs);
-        await reapGitLocks(dir, { createdSinceMs: startedAtMs, reason: 'orphaned-by-kill', stamp: 't' });
+        await reapGitLocks(dir, { createdSinceMs: startedAtMs, reason: 'orphaned-by-kill', stamp: 't', holderCheck: testScopedLockHolderCheck });
       },
     });
     await waitFor(() => exists(lock));

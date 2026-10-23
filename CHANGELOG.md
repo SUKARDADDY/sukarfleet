@@ -52,8 +52,9 @@ other. Anything else has to be read here first.
   locks removed). A git step the daemon has to SIGKILL no longer leaves its locks behind. Each cycle
   also removes a lock older than `thresholds.staleGitLockMin` (new, default 10 minutes) when no live
   process can still own it, and then carries on in the same tick. A lock someone still holds, such as
-  a `git commit` waiting on its editor, is left alone. Ownership is judged by device and inode, so
-  a git reaching the repo through a symlink, a linked worktree or a sandbox still counts. A cycle
+  a `git commit` waiting on its editor, is left alone. The rule is machine-wide: nothing is removed
+  while any lock-capable git other than the daemon's own is running, or while a process's open files
+  can't be read. A cycle
   blocked by a lock, or by a merge someone left open, is deferred instead of reported as a critical
   error, and a merge the daemon itself left half-done is aborted and redone, never committed. See
   [`docs/OPERATIONS.md`](docs/OPERATIONS.md#an-orphaned-git-lock-clears-itself).
@@ -63,7 +64,8 @@ other. Anything else has to be read here first.
 - **A Linux machine committed a file Windows cannot check out,** `_tmp/x/check:css.log`, and the
   Windows peer's merge failed every cycle after. The auto-commit now leaves out every path Windows
   refuses (`<>:"|?*\`, control characters, a trailing dot or space, reserved names like `CON`) and
-  takes any already in the index out of it with `git rm --cached`, leaving the file on disk.
+  takes any already in the index out of it with `git rm --cached`, leaving the file on disk. The same
+  check runs before every commit the daemon makes, merges and `postMerge` output included.
 - **A single sync error was 226,000 characters long.** It carried the whole `git add -A -- <every
   path>` argv into `/status`, gossip and the MCP tools. Sync errors are now capped at 2,000
   characters and keep git's `fatal:` and `error:` lines.

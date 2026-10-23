@@ -20,24 +20,26 @@
 // Either way a candidate is retired only when nothing alive may still own it, and the holder check
 // fails closed: an answer of "could not tell" keeps the lock, and the next cycle asks again.
 //
-// Why "nobody has it open" is not enough, and the holder check also asks which git processes are
-// working in the repo: git does not keep a lock's file descriptor open while it holds the lock.
+// The holder check is machine-wide and deliberately blunt. A candidate is retired only when, at the
+// moment of checking, (a) no process of this user has the lock file open -- and a process whose open
+// files cannot be read counts as having it open -- and (b) no git process that can take locks is
+// running ANYWHERE on the machine, other than the daemon's own children and the subcommands that
+// never hold a lock for more than an instant (mayHoldRepoLocks).
+//
+// Why (a) is not enough: git does not keep a lock's file descriptor open while it holds the lock.
 // `git commit -a` writes the new index into index.lock, CLOSES it, starts the editor, and renames
 // the lock into place only when the editor exits -- a human composing a message for twenty minutes
 // holds index.lock the whole time with no descriptor open on it. Ref locks are closed the same way
-// between write and rename. A check that only looked for open descriptors would delete that lock out
-// from under a live commit. So a lock counts as held when any process has it open OR any git process
-// that can take locks is working inside the repository.
+// between write and rename.
 //
-// "Inside" is decided by file identity, never by comparing path strings. The same repository has
-// many names: a symlinked path (`git --git-dir=<link>/.git`), a bind mount inside a container or
-// sandbox, a linked worktree whose refs live in the main repo's git dir. A string match missed all
-// three in review, against real git, and deleted live locks. So the check collects the (device,
-// inode) of every directory that is this repository -- its worktree, git dir, common dir, the main
-// worktree and every linked worktree -- and asks of each git process whether its cwd, any path in
-// its argv, or GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR/GIT_INDEX_FILE in its environment resolves to
-// one of those directories or anything beneath one. A git in a different mount namespace is not
-// judged at all: its paths may name nothing here, so it answers 'unknown', which keeps the lock.
+// Why (b) is machine-wide rather than "a git working in this repo": three review rounds in a row
+// found a way to hold this repo's lock from a git whose paths did not look like this repo -- a
+// symlinked or single-component relative --git-dir, GIT_DIR in the environment, a linked worktree,
+// a bind mount in a sandbox, a path with spaces in ps output -- and each one deleted a live lock.
+// Attributing a git to a repository from its paths is a guess, and guessing wrong costs somebody's
+// commit. Not attributing at all costs only time: a long-lived git anywhere (a commit waiting on its
+// editor in some other repo) holds off every repair on the machine until it exits, and the next
+// cycle asks again. IDE `git status` loops are short, so the gaps between them come often enough.
 //
 // Which locks, and why these: the ones a stale copy of wedges sync. index.lock, HEAD.lock and
 // ORIG_HEAD.lock in the per-worktree git dir (add, commit, merge, checkout); config.lock (remote
@@ -58,23 +60,16 @@
 // index, a non-empty lock is moved to <commondir>/sukarfleet-stale-locks/<ts>/ instead of unlinked.
 // An empty lock carries no bytes worth keeping; its name, size and mtime go into the audit entry.
 
-import { link, lstat, mkdir, readdir, readFile, readlink, realpath, rename, stat, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, readdir, readFile, realpath, rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { log, run } from './util';
+import { liveChildPids, log, run } from './util';
 
 export type LockHolderVerdict = 'free' | 'held' | 'unknown';
 
-// Every directory that IS this repository, by name and by (device, inode). See the header for why
-// identity and not the name decides.
-export interface RepoRoots {
-  paths: string[];
-  ids: Set<string>;
-}
-
 // `lockPath` is the lock's canonical path. Injectable through SyncerOptions so a test can force the
-// fail-closed branch.
-export type LockHolderCheck = (lockPath: string, repo: RepoRoots) => Promise<LockHolderVerdict>;
+// fail-closed branch, or scope the scan to its own processes (makeLockHolderCheck).
+export type LockHolderCheck = (lockPath: string) => Promise<LockHolderVerdict>;
 
 export interface GitDirs {
   worktree: string;
@@ -206,7 +201,6 @@ export async function reapGitLocks(repoPath: string, opts: ReapOptions): Promise
 
   const uid = opts.uid !== undefined ? opts.uid : typeof process.getuid === 'function' ? process.getuid() : null;
   const holderCheck = opts.holderCheck ?? defaultLockHolderCheck;
-  const roots = await repoRoots(dirs);
   const repairs: LockRepair[] = [];
 
   for (const lockPath of locks) {
@@ -229,7 +223,7 @@ export async function reapGitLocks(repoPath: string, opts: ReapOptions): Promise
     }
     let verdict: LockHolderVerdict;
     try {
-      verdict = await holderCheck(canonical, roots);
+      verdict = await holderCheck(canonical);
     } catch (err) {
       verdict = 'unknown';
       log('info', 'git lock: holder check failed; leaving the lock for the next cycle', {
@@ -340,86 +334,8 @@ async function retireLock(
   }
 }
 
-// The worktree, git dir and common dir; the main worktree, when the common dir is a `.git` inside
-// one; and every linked worktree registered under <commondir>/worktrees/*/gitdir. A git working in
-// any of them shares this repo's refs, packed-refs and config, so it can hold those locks.
-export async function repoRoots(dirs: GitDirs): Promise<RepoRoots> {
-  const candidates = new Set<string>([dirs.worktree, dirs.gitDir, dirs.commonDir]);
-  if (basename(dirs.commonDir) === '.git') candidates.add(dirname(dirs.commonDir));
-  try {
-    for (const name of await readdir(join(dirs.commonDir, 'worktrees'))) {
-      try {
-        const dotGit = (await readFile(join(dirs.commonDir, 'worktrees', name, 'gitdir'), 'utf8')).trim();
-        if (dotGit) candidates.add(dirname(isAbsolute(dotGit) ? dotGit : join(dirs.commonDir, 'worktrees', name, dotGit)));
-      } catch {
-        // a half-removed worktree: its admin dir is still under the common dir, already covered
-      }
-    }
-  } catch {
-    // no linked worktrees
-  }
-  const roots: RepoRoots = { paths: [], ids: new Set() };
-  for (const p of candidates) {
-    try {
-      roots.paths.push(await realpath(p));
-      const st = await stat(p);
-      roots.ids.add(`${st.dev}:${st.ino}`);
-    } catch {
-      // a registered worktree that was deleted without `git worktree remove`
-    }
-  }
-  return roots;
-}
-
-// Is `path`, or the nearest ancestor of it that exists, one of the repo's directories or beneath
-// one? Walks up by `..` from the resolved directory, so symlinks and bind mounts resolve the way the
-// kernel resolves them for the process that holds them, not the way the string reads.
-async function insideRepo(path: string, roots: RepoRoots): Promise<boolean> {
-  let cur = path;
-  for (let i = 0; i < 64; i++) {
-    try {
-      await stat(cur);
-      break;
-    } catch {
-      const up = dirname(cur);
-      if (up === cur) return false;
-      cur = up;
-    }
-  }
-  let prev = '';
-  for (let i = 0; i < 128; i++) {
-    let id: string;
-    try {
-      const st = await stat(cur);
-      id = `${st.dev}:${st.ino}`;
-    } catch {
-      return false;
-    }
-    if (roots.ids.has(id)) return true;
-    if (id === prev) return false; // `..` of the root is the root
-    prev = id;
-    cur = `${cur}/..`;
-  }
-  return false;
-}
-
-// The argv and environment values that could name a path, resolved against the process's cwd
-// (`cwdBase`, e.g. /proc/<pid>/cwd) when relative. A token like `--git-dir=x` contributes `x`.
-function pathishValues(tokens: readonly string[], cwdBase: string | null): string[] {
-  const out: string[] = [];
-  for (const t of tokens) {
-    const v = t.includes('=') ? t.slice(t.indexOf('=') + 1) : t;
-    if (v.length === 0 || !(v.includes('/') || v === '.' || v === '..')) continue;
-    if (v.startsWith('/')) out.push(v);
-    else if (cwdBase !== null) out.push(`${cwdBase}/${v}`);
-  }
-  return out;
-}
-
-const GIT_PATH_ENV = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE'];
-
-// git subcommands that never hold a lock in the repository they run in for longer than a moment, so
-// a long-lived one does not make every lock in that repo look owned. These are the ones that
+// git subcommands that never hold a lock for longer than a moment, so a long-lived one does not hold
+// off every repair on the machine. These are the ones that
 // actually linger: the remote helpers (an orphaned `git remote-http` on a dead mesh connection can
 // outlive its fetch by minutes -- the daemon's own fetch timeout leaves exactly those behind),
 // credential helpers and their cache daemon, the fsmonitor daemon, the server side of a fetch
@@ -494,29 +410,62 @@ export function mayHoldRepoLocks(argv: readonly string[]): boolean {
   return !LOCK_FREE_SUBCOMMANDS.has(sub);
 }
 
-// The production holder check, per platform. Every branch answers 'unknown' rather than guess when
-// its tools are missing or misbehave.
-export const defaultLockHolderCheck: LockHolderCheck = async (lockPath, roots) => {
-  switch (process.platform) {
-    case 'linux':
-      return await linuxLockHolders(lockPath, roots);
-    case 'darwin':
-      return await macosLockHolders(lockPath, roots);
-    case 'win32':
-      return await windowsLockHolders();
-    default:
-      return 'unknown';
-  }
-};
+export interface HolderCheckOptions {
+  // Which processes to look at at all. Production looks at every one; a test narrows the scan to
+  // its own process tree, so a git some unrelated program runs on the same machine cannot make the
+  // test's verdict depend on timing. Never set in production.
+  includePid?: (pid: number) => boolean | Promise<boolean>;
+  // Test seam for the macOS and Windows tools.
+  probe?: Probe;
+}
 
-// Linux: /proc, read directly. Per process: does it have the lock open (fd identity), and is it a
-// lock-capable git working in this repo (mount namespace, cwd, argv, environment)? Another user's
-// cwd, fd links, environment and namespace are unreadable and skipped, which is sound only because
-// reapGitLocks never considers a lock that another uid created.
-async function linuxLockHolders(lockPath: string, roots: RepoRoots): Promise<LockHolderVerdict> {
+type Probe = (argv: string[]) => Promise<{ code: number; stdout: string; stderr: string } | null>;
+
+// The production holder check, per platform. Every branch answers 'unknown' rather than guess when
+// its tools are missing or misbehave. The daemon's own children (util.liveChildPids) are exempt from
+// rule (b): they are the sync cycle's own git steps, run one at a time, and a lock old enough to be a
+// candidate is not one a step still in flight could have taken.
+export function makeLockHolderCheck(opts: HolderCheckOptions = {}): LockHolderCheck {
+  const probe = opts.probe ?? defaultProbe;
+  return async (lockPath) => {
+    const own = new Set(liveChildPids());
+    switch (process.platform) {
+      case 'linux':
+        return await linuxLockHolders(lockPath, own, opts.includePid);
+      case 'darwin':
+        return await macosLockHolders(lockPath, own, probe);
+      case 'win32':
+        return await windowsLockHolders(own, probe);
+      default:
+        return 'unknown';
+    }
+  };
+}
+
+export const defaultLockHolderCheck: LockHolderCheck = makeLockHolderCheck();
+
+// Linux: /proc, read directly, every process.
+//
+// (a) Open files are matched by (device, inode), so a holder in another mount namespace, or one that
+// opened the lock through a different path, still matches. Only processes running as this user are
+// asked: a lock this user's process created (reapGitLocks never considers any other) is held by a
+// process of this user. "Running as this user" comes from /proc/<pid>/status, not from the owner of
+// /proc/<pid>, which turns to root for a process that made itself non-dumpable -- and such a
+// process's fd directory is unreadable even to its own user. Unreadable means 'unknown', never
+// "nothing open". A process whose /proc entry is gone has exited and holds nothing.
+//
+// (b) A git is recognised by its command name (comm, readable for every process) or argv[0], and its
+// subcommand read from cmdline split on NUL, never on whitespace. A git whose cmdline cannot be read
+// counts as lock-capable. A git in another mount namespace is visible here like any other and counts
+// the same way.
+async function linuxLockHolders(
+  lockPath: string,
+  own: Set<number>,
+  includePid?: (pid: number) => boolean | Promise<boolean>,
+): Promise<LockHolderVerdict> {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
   let pids: string[];
   let lockId: string;
-  let ourNs: string | null = null;
   try {
     pids = (await readdir('/proc')).filter((d) => /^\d+$/.test(d));
     const st = await stat(lockPath);
@@ -524,61 +473,83 @@ async function linuxLockHolders(lockPath: string, roots: RepoRoots): Promise<Loc
   } catch {
     return 'unknown';
   }
-  try {
-    ourNs = await readlink('/proc/self/ns/mnt');
-  } catch {
-    // no namespace links (very old kernel): every readable process is in ours
-  }
   // /proc mounted but empty, or a hidepid mount hiding everything but ourselves: not an answer.
   if (pids.length <= 1) return 'unknown';
+  let verdict: LockHolderVerdict = 'free';
   for (const pid of pids) {
+    if (includePid && !(await includePid(Number(pid)))) continue;
     const base = `/proc/${pid}`;
-    let argv: string[];
+    const gone = async () => !(await exists(base));
+
+    let comm = '';
+    let argv: string[] | null = null;
+    try {
+      comm = (await readFile(`${base}/comm`, 'utf8')).trim();
+    } catch {
+      if (await gone()) continue;
+      // comm is readable for every process; not being able to read it means this one might be a
+      // git and there is no telling.
+      verdict = 'unknown';
+    }
     try {
       argv = (await readFile(`${base}/cmdline`, 'utf8')).split('\0').filter(Boolean);
     } catch {
-      continue; // exited while we looked
+      if (await gone()) continue;
     }
-    if (mayHoldRepoLocks(argv)) {
-      if (ourNs !== null) {
-        try {
-          if ((await readlink(`${base}/ns/mnt`)) !== ourNs) return 'unknown';
-        } catch {
-          // another user's process, or gone
-        }
-      }
-      if (await insideRepo(`${base}/cwd`, roots)) return 'held';
-      let env: string[] = [];
-      try {
-        env = (await readFile(`${base}/environ`, 'utf8'))
-          .split('\0')
-          .filter((e) => GIT_PATH_ENV.some((k) => e.startsWith(`${k}=`)));
-      } catch {
-        // another user's process, or gone
-      }
-      for (const p of pathishValues([...argv.slice(1), ...env], `${base}/cwd`)) {
-        if (await insideRepo(p, roots)) return 'held';
-      }
+    if (!own.has(Number(pid)) && isGitName(comm, argv)) {
+      if (argv === null || argv.length === 0 || mayHoldRepoLocks(argv)) return 'held';
     }
+
+    let mine: boolean;
+    try {
+      const uids = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(await readFile(`${base}/status`, 'utf8'));
+      mine = uid === null || uids === null || uids.slice(1).some((u) => Number(u) === uid);
+    } catch {
+      if (await gone()) continue;
+      mine = true;
+    }
+    if (!mine) continue;
     let fds: string[];
     try {
       fds = await readdir(`${base}/fd`);
     } catch {
+      if (await gone()) continue;
+      verdict = 'unknown'; // keep scanning: a definite 'held' elsewhere is the better answer
       continue;
     }
     for (const fd of fds) {
       try {
         const st = await stat(`${base}/fd/${fd}`);
         if (`${st.dev}:${st.ino}` === lockId) return 'held';
-      } catch {
-        // closed while we looked
+      } catch (err) {
+        // Closed while we looked is ENOENT; anything else is a descriptor we could not see.
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') verdict = 'unknown';
       }
     }
   }
-  return 'free';
+  return verdict;
 }
 
-async function probe(argv: string[]): Promise<{ code: number; stdout: string; stderr: string } | null> {
+// comm is the kernel's name for the executable, truncated to 15 bytes, so `git-remote-https` reads
+// `git-remote-http`; either form starting `git-` is a dashed git helper.
+function isGitName(comm: string, argv: readonly string[] | null): boolean {
+  const names = [basename(comm), argv && argv.length > 0 ? basename(argv[0]!.replace(/\\/g, '/')) : ''];
+  return names.some((n) => {
+    const x = n.toLowerCase().replace(/\.exe$/, '');
+    return x === 'git' || x.startsWith('git-');
+  });
+}
+
+async function exists(p: string): Promise<boolean> {
+  try {
+    await stat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function defaultProbe(argv: string[]): Promise<{ code: number; stdout: string; stderr: string } | null> {
   try {
     return await run(argv, { timeoutMs: 10000, evenWhileDraining: true });
   } catch {
@@ -586,64 +557,64 @@ async function probe(argv: string[]): Promise<{ code: number; stdout: string; st
   }
 }
 
-// macOS: no /proc and no mount namespaces. lsof answers "is it open" -- it matches the file by
-// identity, not by name (exit 0 with a p-line: yes; exit 1 with no output: no; anything else: no
-// answer). ps supplies argv plus environment (-E, readable for our own processes), and lsof again
-// supplies the cwd of each git that could hold a lock. Paths are then judged by identity exactly as
-// on Linux.
-async function macosLockHolders(lockPath: string, roots: RepoRoots): Promise<LockHolderVerdict> {
+// macOS: no /proc. (a) lsof matches the lock by identity (exit 0 with a p-line: open; exit 1 with no
+// output: not open; anything else: no answer). (b) `ps -o comm=` names each process's executable
+// reliably. Its argv is not reliable: `ps -o args=` joins arguments with spaces, so a path with a
+// space in it is indistinguishable from two arguments. So the subcommand is trusted only in the one
+// shape that survives the join -- argv[0] exactly `git` and argv[1] not an option -- and any other git
+// counts as lock-capable.
+export async function macosLockHolders(lockPath: string, own: Set<number>, probe: Probe): Promise<LockHolderVerdict> {
   const open = await probe(['lsof', '-w', '-n', '-P', '-F', 'p', '--', lockPath]);
   if (open === null) return 'unknown';
   if (open.code === 0 && /^p\d+/m.test(open.stdout)) return 'held';
   if (!(open.code === 1 && open.stdout.trim() === '')) return 'unknown';
 
-  const ps = await probe(['ps', '-axwwE', '-o', 'pid=,command=']);
-  if (ps === null || ps.code !== 0) return 'unknown';
-  // Whitespace-split argv: a path with spaces splits wrong, which can only make a token fail to
-  // resolve. The executable and subcommand, which decide mayHoldRepoLocks, never contain one here.
-  const gits = new Map<string, string[]>();
-  for (const line of ps.stdout.split('\n')) {
+  const names = await probe(['ps', '-axww', '-o', 'pid=,comm=']);
+  if (names === null || names.code !== 0) return 'unknown';
+  const gits: string[] = [];
+  for (const line of names.stdout.split('\n')) {
     const m = /^\s*(\d+)\s+(.*)$/.exec(line);
-    if (!m) continue;
-    const tokens = m[2]!.split(/\s+/);
-    if (mayHoldRepoLocks(tokens)) gits.set(m[1]!, tokens);
-  }
-  if (gits.size === 0) return 'free';
-
-  // Exit 1 also means "some of those pids exited meanwhile", with the rest still listed.
-  const cwds = await probe(['lsof', '-w', '-n', '-P', '-a', '-p', [...gits.keys()].join(','), '-d', 'cwd', '-F', 'pn']);
-  if (cwds === null || (cwds.code !== 0 && cwds.code !== 1)) return 'unknown';
-  const cwdOf = new Map<string, string>();
-  let pid = '';
-  for (const line of cwds.stdout.split('\n')) {
-    if (line.startsWith('p')) pid = line.slice(1);
-    else if (line.startsWith('n') && pid) cwdOf.set(pid, line.slice(1));
-  }
-  for (const [p, tokens] of gits) {
-    const cwd = cwdOf.get(p) ?? null;
-    if (cwd !== null && (await insideRepo(cwd, roots))) return 'held';
-    for (const path of pathishValues(tokens.slice(1), cwd)) {
-      if (await insideRepo(path, roots)) return 'held';
+    if (!m || own.has(Number(m[1]))) continue;
+    if (!isGitName(m[2]!.trim(), null)) continue;
+    const dashed = basename(m[2]!.trim()).toLowerCase();
+    // A dashed helper names its own subcommand in its executable: no argv needed.
+    if (dashed.startsWith('git-')) {
+      if (mayHoldRepoLocks([dashed])) return 'held';
+      continue;
     }
+    gits.push(m[1]!);
+  }
+  if (gits.length === 0) return 'free';
+
+  const args = await probe(['ps', '-ww', '-o', 'pid=,args=', '-p', gits.join(',')]);
+  if (args === null || (args.code !== 0 && args.code !== 1)) return 'unknown';
+  const argsOf = new Map<string, string>();
+  for (const line of args.stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (m) argsOf.set(m[1]!, m[2]!);
+  }
+  for (const pid of gits) {
+    const line = argsOf.get(pid);
+    if (line === undefined) continue; // exited between the two ps calls
+    const [argv0, sub] = line.split(' ', 2);
+    if (argv0 !== 'git' || sub === undefined || sub.startsWith('-')) return 'held';
+    if (mayHoldRepoLocks(['git', sub])) return 'held';
   }
   return 'free';
 }
 
-// Windows: no cheap way to read another process's cwd. Any git.exe running at all counts as a
-// holder, which is coarse and errs the right way: git processes there are short-lived, and the next
-// cycle asks again. The coarseness has a known cost: tasklist names only the image, so this cannot
-// tell the daemon's own `git upload-pack` (a peer fetching) or a resident `git fsmonitor--daemon`
-// from a real holder, and a machine running fsmonitor never repairs a stale lock on its own. Reading
-// command lines needs WMI, a PowerShell start per check, and is not worth it until Windows is more
-// than experimental. When none is running, retireLock's rename is the second check -- Windows refuses
-// to rename a file another process has open without delete sharing, and that refusal is read as
-// "in use", never forced.
-async function windowsLockHolders(): Promise<LockHolderVerdict> {
+// Windows: no cheap way to read another process's command line. Any git.exe running at all counts as
+// a holder, which errs the right way, except the daemon's own children (tasklist's second column is
+// the pid). The coarseness has a known cost: it cannot tell a resident `git fsmonitor--daemon` from a
+// real holder, and a machine running fsmonitor never repairs a stale lock on its own. When none is
+// running, retireLock's rename is the second check -- Windows refuses to rename a file another
+// process has open without delete sharing, and that refusal is read as "in use", never forced.
+async function windowsLockHolders(own: Set<number>, probe: Probe): Promise<LockHolderVerdict> {
   const r = await probe(['tasklist', '/FO', 'CSV', '/NH']);
   if (r === null || r.code !== 0) return 'unknown';
   for (const line of r.stdout.split(/\r?\n/)) {
-    const m = /^"([^"]*)"/.exec(line);
-    if (m && m[1]!.toLowerCase() === 'git.exe') return 'held';
+    const m = /^"([^"]*)","(\d+)"/.exec(line);
+    if (m && m[1]!.toLowerCase() === 'git.exe' && !own.has(Number(m[2]))) return 'held';
   }
   return 'free';
 }

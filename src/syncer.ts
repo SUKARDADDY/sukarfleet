@@ -375,6 +375,13 @@ export class Syncer {
       throw new SyncDeferred('an unfinished merge (MERGE_HEAD) is waiting to be completed or aborted by hand');
     }
     await this.abortOwnMerge(repo);
+    if ((await this.mergeOwnership(repo)) !== 'none') {
+      // Neither `merge --abort` nor `reset --merge` could put the tree back -- conflict markers
+      // staged, the file edited again since. Committing now would record those markers as the
+      // merge's resolution and ship them to every machine, so this repo is not committed at all
+      // until a person sorts it out. Deferred, not failed: no alarm, a note once it has lasted.
+      throw new SyncDeferred('a merge this daemon started could not be aborted cleanly; it needs finishing or aborting by hand');
+    }
     log('warn', 'merge repair: aborted a merge this daemon left unfinished; it is redone this cycle', { repo: repo.name });
   }
 
@@ -748,7 +755,9 @@ export class Syncer {
   }
 
   // Take every path a Windows checkout cannot hold out of the index, leaving the files on disk.
-  // Returns how many. The resulting staged deletion is committed by autoCommit like any other
+  // Returns how many. Runs before EVERY commit the daemon makes -- autoCommit, the postMerge
+  // regenerators' commit, a merge's commit -- because each of them stages broadly (`add -A`, or a
+  // merge bringing in a peer's tree), and a filter on one path would be a filter on none. The resulting staged deletion is committed by autoCommit like any other
   // change, so the path leaves every machine's tree -- which is the point: a Windows peer cannot
   // merge a tree that contains it. Recorded in the audit log, because it removes files from
   // everyone else's checkout without anybody asking.
@@ -758,7 +767,19 @@ export class Syncer {
     if (bad.length === 0) return 0;
     for (let i = 0; i < bad.length; i += 200) {
       // --literal-pathspecs: these names are full of `*` and `?`, which git would otherwise glob.
-      await this.gitOk(repo.path, ['--literal-pathspecs', 'rm', '--cached', '-q', '--ignore-unmatch', '--', ...bad.slice(i, i + 200)]);
+      // -f: without it git refuses to drop an entry whose staged content differs from both HEAD and
+      // the file on disk (staged, then edited: status AM), and that refusal failed every cycle
+      // before fetch. --cached still means the file on disk is never touched.
+      await this.gitOk(repo.path, [
+        '--literal-pathspecs',
+        'rm',
+        '--cached',
+        '-f',
+        '-q',
+        '--ignore-unmatch',
+        '--',
+        ...bad.slice(i, i + 200),
+      ]);
     }
     log('warn', 'auto-commit: untracked paths a Windows checkout cannot hold; the files stay on disk', {
       repo: repo.name,
@@ -948,8 +969,12 @@ export class Syncer {
   ): Promise<MergeTipResult> {
     const { theirsTip, peer: peerName } = m;
     let unionRegenNeeded = false;
-    const merge = await this.git(repo.path, ['merge', '--no-ff', '--no-edit', theirsTip]);
+    // --no-commit, then commit ourselves: the merge result is checked for unportable paths (a peer
+    // on an older version may have committed some) before it is recorded.
+    const merge = await this.git(repo.path, ['merge', '--no-ff', '--no-edit', '--no-commit', theirsTip]);
     if (merge.code === 0) {
+      await this.untrackUnportable(repo);
+      await this.gitOk(repo.path, ['commit', '--no-edit']);
       const newHead = await this.head(repo.path);
       return { outcome: newHead !== oursTip ? 'merged' : 'contained', unionRegenNeeded, conflicts: 0 };
     }
@@ -1029,6 +1054,7 @@ export class Syncer {
     }
 
     await this.gitOk(repo.path, ['add', '-A']);
+    await this.untrackUnportable(repo);
     await this.gitOk(repo.path, ['commit', '--no-edit']);
     return { outcome: 'merged', unionRegenNeeded, conflicts: conflicted.length };
   }
@@ -1052,7 +1078,7 @@ export class Syncer {
         throw new Error(`postMerge [${argv.join(' ')}] failed (code ${r.code}): ${r.stderr.trim().slice(0, 300)}`);
       }
     }
-    await this.commitAll(repo.path, `postmerge: ${this.cfg.machine} ${this.isoNow()}`);
+    await this.commitAll(repo, `postmerge: ${this.cfg.machine} ${this.isoNow()}`);
   }
 
   // (5) push sync/<machine> to origin with retries+backoff; skip cleanly when origin is absent.
@@ -1197,8 +1223,10 @@ export class Syncer {
     return ['origin', ...this.cfg.peers.filter((p) => p.name !== this.cfg.machine).map((p) => `fleet-${p.name}`)];
   }
 
-  private async commitAll(repoPath: string, msg: string): Promise<boolean> {
+  private async commitAll(repo: RepoConfig, msg: string): Promise<boolean> {
+    const repoPath = repo.path;
     await this.gitOk(repoPath, ['add', '-A']);
+    await this.untrackUnportable(repo);
     const staged = await this.git(repoPath, ['diff', '--cached', '--quiet']);
     if (staged.code === 0) return false;
     await this.gitOk(repoPath, ['commit', '-m', msg]);

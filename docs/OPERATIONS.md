@@ -137,23 +137,29 @@ Three things now stop that from happening or clear it up.
   (default 10 minutes) is removed if no live process can still own it. The cycle then carries on in
   the same tick.
 
-"No live process can own it" means more than "nobody has it open". `git commit -a` closes
-`index.lock` before it starts your editor and keeps the lock until the editor exits, with no file
-descriptor open on it. So the daemon also leaves a lock alone while any git that takes locks is
-working in that repository. Read-only commands like `log`, `diff` and `show` don't count, so a pager
-left open doesn't block the repair. `status` does count.
+"No live process can own it" is a machine-wide rule, and a blunt one. A lock is removed only when no
+process of yours has the lock file open (a process whose open files can't be read counts as having
+it open), and no git that can take locks is running anywhere on the machine, apart from the daemon's
+own git steps. Read-only commands like `log`, `diff` and `show`, remote and credential helpers,
+`upload-pack`, `fsmonitor--daemon` and `cat-file --batch` don't count, so a pager left open doesn't
+block the repair. `status` does count.
 
-"Working in that repository" is decided by device and inode, not by path. A git counts if its
-current directory, a path in its arguments, or `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or
-`GIT_INDEX_FILE` resolves into the repository, its `.git`, or any linked worktree of it. That covers
-a symlinked path and a linked worktree sharing the repo's refs. A git in another mount namespace (a
-container, a bwrap or flatpak sandbox) can't be judged from outside, so while one is running the
-daemon leaves every old lock alone.
+"Nobody has it open" alone would not be enough. `git commit -a` closes `index.lock` before it
+starts your editor and keeps the lock until the editor exits, with no file descriptor open on it.
+And working out which repository a running git is using, from its paths, turned out to be
+guesswork: review found a symlinked or relative `--git-dir`, `GIT_DIR` in the environment, a linked
+worktree, a bind mount in a sandbox and a path with spaces, and each one fooled it into deleting a
+live lock. So the daemon no longer guesses.
 
-On Linux the daemon reads all of this from `/proc`. On macOS it uses `lsof` and `ps`. On Windows it
-waits until no `git.exe` is running at all, and a lock Windows refuses to rename counts as in use.
-That is coarse: it can't tell a resident `git fsmonitor--daemon`, or a peer fetching through the
-daemon's own `git upload-pack`, from a real holder. A Windows machine running fsmonitor will not
+The cost is time. A long-lived git anywhere on the machine, such as a commit in some other repo
+waiting on its editor, holds off every repair until it exits. IDE `git status` loops are short, so
+there are gaps between them, and each sync cycle asks again.
+
+On Linux the daemon reads all of this from `/proc`. On macOS it uses `lsof` and `ps`, and because
+`ps` joins arguments with spaces it only trusts a git's subcommand when the command line is plain
+`git <subcommand>`. Any other git counts as a holder. On Windows it waits until no `git.exe` other
+than its own is running, and a lock Windows refuses to rename counts as in use. That can't tell a
+resident `git fsmonitor--daemon` from a real holder, so a Windows machine running fsmonitor will not
 clear a stale lock on its own. If the check cannot answer, the lock stays and the next cycle asks
 again.
 
@@ -164,7 +170,10 @@ Every removal is logged as `git lock repair: retired an orphaned lock` and recor
 
 While a lock is held, a cycle that needs it is deferred rather than failed. A merge you left
 unfinished on the sync branch, or unmerged paths from a cherry-pick or stash pop, defer it the same
-way. The daemon never commits or aborts those for you. Deferring used to be a critical sync error
+way. The daemon never commits or aborts those for you. A merge the daemon started itself is
+aborted and redone, and if git refuses to abort it (conflict markers staged, then the file edited
+again) the repo is deferred until you finish or abort that merge by hand. Its markers are never
+committed. Deferring used to be a critical sync error
 and a desktop notification any time you and the daemon touched the same repo at once.
 
 A deferral keeps the time of the last successful cycle. Right after a restart, before any cycle has
@@ -200,8 +209,10 @@ control character in it, ends in a dot or a space, or is a reserved device name 
 `COM1` or `lpt9.txt`. The file stays on disk and is simply not synced. The daemon skips it silently
 every cycle (a debug log line at most).
 
-A path like that which is already in the index, committed by an older version or staged by hand, is
-taken out of the index with `git rm --cached`. The file stays on disk, the removal goes out with the
+This applies to every commit the daemon makes, including what a `postMerge` regenerator writes and
+the result of merging a peer. A path like that which is already in the index, committed by an older
+version or staged by hand, is taken out of the index with `git rm --cached`, even if it was edited
+after it was staged. The file stays on disk, the removal goes out with the
 next auto-commit, and it is recorded as a signed `sync-unportable-untracked` audit entry. That
 includes a file renamed to such a name: the old name is deleted from the repo and the new one stays
 local.

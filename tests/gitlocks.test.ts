@@ -7,7 +7,8 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { listGitLocks, mayHoldRepoLocks, reapGitLocks, repoRoots, resolveGitDirs } from '../src/gitlocks';
+import { listGitLocks, macosLockHolders, mayHoldRepoLocks, reapGitLocks, resolveGitDirs } from '../src/gitlocks';
+import { testScopedLockHolderCheck } from './support/proc-scope';
 import { run } from '../src/util';
 
 let base: string;
@@ -197,25 +198,79 @@ describe('resolveGitDirs and listGitLocks', () => {
     );
   });
 
-  test('the repo\'s identity covers the main worktree and every linked one', async () => {
-    const main = await repo('main');
-    const wt = join(base, 'wt');
-    await git(main, ['worktree', 'add', '-q', '-b', 'side', wt]);
-    const fromMain = await repoRoots((await resolveGitDirs(main))!);
-    const fromWt = await repoRoots((await resolveGitDirs(wt))!);
-    const id = async (p: string) => {
-      const st = await stat(p);
-      return `${st.dev}:${st.ino}`;
-    };
-    for (const roots of [fromMain, fromWt]) {
-      expect(roots.ids.has(await id(main))).toBe(true);
-      expect(roots.ids.has(await id(wt))).toBe(true);
-      expect(roots.ids.has(await id(join(main, '.git')))).toBe(true);
-    }
-  });
-
   test('not a repository: nothing to do', async () => {
     expect(await resolveGitDirs(base)).toBeNull();
     expect(await reapGitLocks(base, { olderThanMs: 0, reason: 'stale', stamp: 't', holderCheck: free })).toEqual([]);
+  });
+});
+
+describe('the machine-wide holder check', () => {
+  test.skipIf(process.platform !== 'linux' || Bun.spawnSync(['python3', '-c', '']).exitCode !== 0)(
+    'a same-user process whose fds cannot be read counts as holding the lock (non-dumpable holder)',
+    async () => {
+      const dir = await repo();
+      const lock = join(dir, '.git', 'index.lock');
+      await writeFile(lock, '');
+      // PR_SET_DUMPABLE=0 makes /proc/<pid>/fd unreadable even to the same user.
+      const holder = Bun.spawn(
+        [
+          'python3',
+          '-c',
+          'import ctypes,sys,time; ctypes.CDLL(None).prctl(4,0,0,0,0); f=open(sys.argv[1]); print("ready",flush=True); time.sleep(30)',
+          lock,
+        ],
+        { stdout: 'pipe', stderr: 'ignore' },
+      );
+      try {
+        const reader = holder.stdout.getReader();
+        await reader.read(); // "ready"
+        reader.releaseLock();
+        const repairs = await reapGitLocks(dir, {
+          olderThanMs: 0,
+          reason: 'stale',
+          stamp: 't',
+          holderCheck: testScopedLockHolderCheck,
+        });
+        expect(repairs).toEqual([]);
+        expect(await exists(lock)).toBe(true);
+      } finally {
+        holder.kill('SIGKILL');
+        await holder.exited;
+      }
+    },
+  );
+
+  test('macOS: a git whose ps line has a path with spaces counts as a holder', async () => {
+    const calls: string[][] = [];
+    const probe = async (argv: string[]) => {
+      calls.push(argv);
+      if (argv[0] === 'lsof') return { code: 1, stdout: '', stderr: '' }; // nobody has it open
+      if (argv.includes('pid=,comm=')) return { code: 0, stdout: '  100 /usr/bin/git\n  200 /bin/zsh\n', stderr: '' };
+      // `ps -o args=` joins argv with spaces: the git dir's path splits into pieces.
+      return { code: 0, stdout: '  100 git --git-dir=/Volumes/Shared Drive/notes repo/.git update-ref --stdin\n', stderr: '' };
+    };
+    expect(await macosLockHolders('/Volumes/Shared Drive/notes repo/.git/refs/heads/x.lock', new Set(), probe)).toBe('held');
+  });
+
+  test('macOS: only lock-free gits and the daemon\'s own children running means free', async () => {
+    const probe = async (argv: string[]) => {
+      if (argv[0] === 'lsof') return { code: 1, stdout: '', stderr: '' };
+      if (argv.includes('pid=,comm='))
+        return {
+          code: 0,
+          stdout: '  100 /usr/bin/git\n  101 /usr/libexec/git-core/git-remote-https\n  102 /usr/bin/git\n  103 /usr/bin/git\n',
+          stderr: '',
+        };
+      return { code: 0, stdout: '  100 git log --oneline\n  102 git cat-file --batch\n', stderr: '' };
+    };
+    // 103 is one of the daemon's own children.
+    expect(await macosLockHolders('/tmp/r/.git/index.lock', new Set([103]), probe)).toBe('free');
+  });
+
+  test('macOS: lsof finding the lock open, or failing, never reads as free', async () => {
+    const open = async (argv: string[]) => (argv[0] === 'lsof' ? { code: 0, stdout: 'p42\n', stderr: '' } : null);
+    expect(await macosLockHolders('/tmp/r/.git/index.lock', new Set(), open)).toBe('held');
+    const broken = async () => null;
+    expect(await macosLockHolders('/tmp/r/.git/index.lock', new Set(), broken)).toBe('unknown');
   });
 });
