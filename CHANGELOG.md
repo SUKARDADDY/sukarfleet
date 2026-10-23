@@ -46,6 +46,30 @@ other. Anything else has to be read here first.
 
 ### Fixed
 
+- **A stale git lock wedged a repo's sync for twelve days.** The daemon exited over a running git on
+  stop, systemd SIGKILLed the git, and the `index.lock` it left made every later `git add` fail.
+  Shutdown now drains its children (wait up to 30 s, then SIGTERM, then SIGKILL with the orphaned
+  locks removed). A git step the daemon has to SIGKILL no longer leaves its locks behind. Each cycle
+  also removes a lock older than `thresholds.staleGitLockMin` (new, default 10 minutes) when no live
+  process can still own it, and then carries on in the same tick. A lock someone still holds, such as
+  a `git commit` waiting on its editor, is left alone. The rule is machine-wide: nothing is removed
+  while anything has the lock open for writing (asked of the kernel with a lease on Linux) or any
+  lock-capable git other than the daemon's own is running anywhere on the machine. A cycle
+  blocked by a lock, or by a merge someone left open, is deferred instead of reported as a critical
+  error, and a merge the daemon itself left half-done is aborted and redone, never committed. See
+  [`docs/OPERATIONS.md`](docs/OPERATIONS.md#an-orphaned-git-lock-clears-itself).
+- **A push rejected as non-fast-forward stayed rejected.** When origin holds commits on this
+  machine's own sync branch that the local branch lost, the cycle now merges origin's copy back under
+  the peer-merge conflict rules and retries the push. It never forces.
+- **A Linux machine committed a file Windows cannot check out,** `_tmp/x/check:css.log`, and the
+  Windows peer's merge failed every cycle after. The auto-commit now leaves out every path Windows
+  refuses (`<>:"|?*\`, control characters, a trailing dot or space, reserved names like `CON`) and
+  takes any already in the index out of it with `git rm --cached`, leaving the file on disk. The same
+  check runs before every commit the daemon makes, merges and `postMerge` output included.
+- **A single sync error was 226,000 characters long.** It carried the whole `git add -A -- <every
+  path>` argv into `/status`, gossip and the MCP tools. Sync errors are now capped at 2,000
+  characters and keep git's `fatal:` and `error:` lines.
+
 - **A laptop that was simply asleep raised a critical alarm, then kept raising it.** `peer-offline`
   fired the moment gossip presence lapsed, at critical urgency, and repeated every
   `alarmRepeatMin` for as long as the machine stayed away. A roamer shut for the weekend was worth

@@ -234,6 +234,7 @@ describe('config', () => {
       peerOfflineAlarmMin: 720,
       clockSkewMaxMs: 5000,
       wedgePolls: 3,
+      staleGitLockMin: 10,
     });
     expect(cfg.peers).toEqual([]);
     expect(cfg.repos).toEqual([]);

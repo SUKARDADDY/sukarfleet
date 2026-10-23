@@ -7,6 +7,7 @@ import { Health, formatDuration } from '../src/health';
 import type { HealthSelf } from '../src/health';
 import type { Urgency } from '../src/notify';
 import { defaultConfig } from '../src/config';
+import { SYNC_DEFERRED_PREFIX } from '../src/util';
 import type { FleetConfig, PeerView, GossipEnvelope } from '../src/types';
 
 interface NotifyCall {
@@ -355,6 +356,27 @@ describe('Health.evaluate', () => {
     const state = await healthB.getState();
     expect(state.faults.length).toBe(1);
     expect(state.faults[0]!.key).toBe('self-sync-error:repoA');
+  });
+
+  test('a deferral note in syncError is shown, never alarmed on; the stale check still applies', async () => {
+    const cfg = healthyCfg({ syncStaleMin: 30 });
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+    const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+    const self = healthySelf();
+    self.repos.repoA = {
+      lastSyncOkMs: t0,
+      lastCommit: 'abc',
+      syncError: `${SYNC_DEFERRED_PREFIX}waiting for another git to release .git/index.lock (since 2026-01-01T12:00:00.000Z)`,
+    };
+
+    await health.evaluate(t0 + 11 * 60000, self, []);
+    expect((await health.getState()).faults).toEqual([]);
+    expect(calls).toEqual([expect.objectContaining({ title: 'sukarfleet: all green' })]);
+
+    // Past syncStaleMin the ordinary stale fault fires, as it would with no note at all.
+    await health.evaluate(t0 + 31 * 60000, self, []);
+    expect((await health.getState()).faults.map((f) => f.key)).toEqual(['self-sync-stale:repoA']);
   });
 
   test('peer online-but-stale wording matches "online, sync stale 47m"', async () => {
