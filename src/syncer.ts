@@ -374,13 +374,19 @@ export class Syncer {
     if (state === 'theirs') {
       throw new SyncDeferred('an unfinished merge (MERGE_HEAD) is waiting to be completed or aborted by hand');
     }
-    await this.abortOwnMerge(repo);
+    const complaint = await this.abortOwnMerge(repo);
     if ((await this.mergeOwnership(repo)) !== 'none') {
       // Neither `merge --abort` nor `reset --merge` could put the tree back -- conflict markers
       // staged, the file edited again since. Committing now would record those markers as the
       // merge's resolution and ship them to every machine, so this repo is not committed at all
       // until a person sorts it out. Deferred, not failed: no alarm, a note once it has lasted.
-      throw new SyncDeferred('a merge this daemon started could not be aborted cleanly; it needs finishing or aborting by hand');
+      // The reason says which: a lock somebody holds (that clears by itself) reads differently from
+      // a tree git will not reset (that needs a person).
+      throw new SyncDeferred(
+        isGitLockBusyError(complaint)
+          ? `${lockBusyReason(complaint)} to abort an unfinished merge`
+          : `a merge this daemon started could not be aborted (${firstVerdict(complaint)}); it needs finishing or aborting by hand`,
+      );
     }
     log('warn', 'merge repair: aborted a merge this daemon left unfinished; it is redone this cycle', { repo: repo.name });
   }
@@ -408,17 +414,22 @@ export class Syncer {
   }
 
   // Abort the merge in progress if, and only if, this daemon started it.
-  private async abortOwnMerge(repo: RepoConfig): Promise<void> {
-    if ((await this.mergeOwnership(repo)) !== 'ours') return;
+  // Abort the merge in progress if, and only if, this daemon started it. Returns git's complaint when
+  // neither --abort nor reset --merge would do it (empty when nothing failed).
+  private async abortOwnMerge(repo: RepoConfig): Promise<string> {
+    if ((await this.mergeOwnership(repo)) !== 'ours') return '';
+    let complaint = '';
     const abort = await this.gitRecover(repo.path, ['merge', '--abort']);
     if (abort.code !== 0) {
       // --abort refuses on some half-states (no ORIG_HEAD); reset --merge is what it runs anyway.
-      await this.gitRecover(repo.path, ['reset', '--merge']);
+      const reset = await this.gitRecover(repo.path, ['reset', '--merge']);
+      if (reset.code !== 0) complaint = reset.stderr.trim() || abort.stderr.trim();
     }
     const dirs = await resolveGitDirs(repo.path);
     if (dirs !== null && !(await pathExists(join(dirs.gitDir, 'MERGE_HEAD')))) {
       await rm(join(dirs.gitDir, MERGE_MARKER), { force: true });
     }
+    return complaint;
   }
 
   // Retire this repo's orphaned git locks before the cycle's first step, so a lock left by a crash
@@ -750,7 +761,7 @@ export class Syncer {
     }
     const staged = await this.git(repoPath, ['diff', '--cached', '--quiet']);
     if (staged.code === 0) return false;
-    await this.gitOk(repoPath, ['commit', '-m', `sync: ${this.cfg.machine} ${this.isoNow()}`]);
+    await this.commitOrDefer(repo, ['-m', `sync: ${this.cfg.machine} ${this.isoNow()}`]);
     return true;
   }
 
@@ -781,17 +792,78 @@ export class Syncer {
         ...bad.slice(i, i + 200),
       ]);
     }
+    // Reported only for a path a commit actually carried -- HEAD's tree, or the tree being merged
+    // in. A path that was merely staged (by hand, or by a broad `add` of a file an earlier untrack
+    // left on disk) was never part of the repo, and reporting it would write an audit entry every
+    // cycle for the same file.
+    const committed = new Set<string>();
+    for (const rev of ['HEAD', 'MERGE_HEAD']) {
+      for (let i = 0; i < bad.length; i += 200) {
+        const r = await this.git(repo.path, ['--literal-pathspecs', 'ls-tree', '-r', '-z', '--name-only', rev, '--', ...bad.slice(i, i + 200)]);
+        if (r.code === 0) for (const p of r.stdout.split('\0')) if (p) committed.add(p);
+      }
+    }
+    const reported = bad.filter((p) => committed.has(p));
+    if (reported.length === 0) {
+      log('debug', 'auto-commit: unstaged paths a Windows checkout cannot hold', { repo: repo.name, paths: bad.slice(0, 10) });
+      return bad.length;
+    }
     log('warn', 'auto-commit: untracked paths a Windows checkout cannot hold; the files stay on disk', {
       repo: repo.name,
-      count: bad.length,
-      paths: bad.slice(0, 10),
+      count: reported.length,
+      paths: reported.slice(0, 10),
     });
     try {
-      await this.deps.onUnportableUntracked?.(repo.name, bad);
+      await this.deps.onUnportableUntracked?.(repo.name, reported);
     } catch (err) {
       log('error', 'auto-commit: recording the untracked paths failed', { repo: repo.name, error: String(err) });
     }
     return bad.length;
+  }
+
+  // `git add -A`, minus every path a Windows checkout cannot hold. The broad add that commitAll and a
+  // merge's resolution used to run re-staged files an earlier untrack had deliberately left on disk,
+  // so the untrack ran again, and logged and audited again, every cycle. Paths are named explicitly
+  // and literally, through the same dropVanished/dropIgnored filters autoCommit uses.
+  private async stagePortable(repo: RepoConfig): Promise<void> {
+    const st = await this.gitOk(repo.path, ['status', '--porcelain', '-z', '--untracked-files=all']);
+    const paths = parsePorcelainZ(st.stdout).filter(isPortablePath);
+    if (paths.length === 0) return;
+    const absent: string[] = [];
+    for (const p of paths) if ((await statSig(join(repo.path, p))) === 'MISSING') absent.push(p);
+    const addable = await this.dropIgnored(repo.path, await this.dropVanished(repo.path, paths, absent));
+    if (addable.length > 0) await this.gitOk(repo.path, ['--literal-pathspecs', 'add', '-A', '--', ...addable]);
+  }
+
+  // Every commit the daemon makes goes through here. A commit that fails while the repo has commit
+  // hooks installed (a transcrypt pre-commit is the live case) is the hook saying no -- something a
+  // person has to look at, and not something retrying every two minutes will change -- so it defers,
+  // with the hook's own words as the reason, instead of failing every cycle. Without hooks a failed
+  // commit is a real error, as before.
+  private async commitOrDefer(repo: RepoConfig, args: string[]): Promise<void> {
+    const r = await this.git(repo.path, ['commit', ...args]);
+    if (r.code === 0) return;
+    const why = r.stderr.trim() || r.stdout.trim();
+    if (await this.hasCommitHooks(repo)) {
+      throw new SyncDeferred(`a commit hook refused the daemon's commit: ${firstVerdict(why)}`);
+    }
+    throw new Error(`git commit ${describeArgs(args)} failed (code ${r.code}): ${why}`);
+  }
+
+  private async hasCommitHooks(repo: RepoConfig): Promise<boolean> {
+    // --git-path hooks honours core.hooksPath.
+    const r = await this.git(repo.path, ['rev-parse', '--git-path', 'hooks']);
+    if (r.code !== 0) return false;
+    const rel = r.stdout.trim();
+    const dir = isAbsolute(rel) ? rel : join(repo.path, rel);
+    for (const hook of ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'pre-merge-commit']) {
+      try {
+        if ((await stat(join(dir, hook))).mode & 0o111) return true;
+      } catch {
+        // not installed
+      }
+    }
+    return false;
   }
 
   // The write-quiet debounce: the subset of `paths` whose (size, mtime) did not move across it,
@@ -969,14 +1041,25 @@ export class Syncer {
   ): Promise<MergeTipResult> {
     const { theirsTip, peer: peerName } = m;
     let unionRegenNeeded = false;
-    // --no-commit, then commit ourselves: the merge result is checked for unportable paths (a peer
-    // on an older version may have committed some) before it is recorded.
-    const merge = await this.git(repo.path, ['merge', '--no-ff', '--no-edit', '--no-commit', theirsTip]);
+    // A plain `git merge`, so hooks run exactly as they always have: pre-merge-commit and
+    // commit-msg, then post-merge -- not pre-commit, which a `--no-commit` + `commit` pair would run
+    // instead. A peer on an older version may have committed a path Windows cannot hold; the merge
+    // records the peer's tree as it is, and a follow-up commit in the same step takes the path out
+    // again, so the tip this cycle pushes is portable either way.
+    const merge = await this.git(repo.path, ['merge', '--no-ff', '--no-edit', theirsTip]);
     if (merge.code === 0) {
-      await this.untrackUnportable(repo);
-      await this.gitOk(repo.path, ['commit', '--no-edit']);
+      if ((await this.untrackUnportable(repo)) > 0) {
+        const staged = await this.git(repo.path, ['diff', '--cached', '--quiet']);
+        if (staged.code !== 0) await this.commitOrDefer(repo, ['-m', `sync: ${this.cfg.machine} ${this.isoNow()}`]);
+      }
       const newHead = await this.head(repo.path);
       return { outcome: newHead !== oursTip ? 'merged' : 'contained', unionRegenNeeded, conflicts: 0 };
+    }
+    if (/Not committing merge/.test(merge.stderr)) {
+      // A pre-merge-commit or commit-msg hook said no. The merge is ours and still open: close it,
+      // and wait for a person rather than retry into the same refusal every cycle.
+      await this.gitRecover(repo.path, ['merge', '--abort']);
+      throw new SyncDeferred(`a merge hook refused the merge of ${m.source}: ${firstVerdict(merge.stderr)}`);
     }
 
     const conflicted = await this.conflictedPaths(repo.path);
@@ -1053,9 +1136,9 @@ export class Syncer {
       }
     }
 
-    await this.gitOk(repo.path, ['add', '-A']);
+    await this.stagePortable(repo);
     await this.untrackUnportable(repo);
-    await this.gitOk(repo.path, ['commit', '--no-edit']);
+    await this.commitOrDefer(repo, ['--no-edit']);
     return { outcome: 'merged', unionRegenNeeded, conflicts: conflicted.length };
   }
 
@@ -1224,12 +1307,11 @@ export class Syncer {
   }
 
   private async commitAll(repo: RepoConfig, msg: string): Promise<boolean> {
-    const repoPath = repo.path;
-    await this.gitOk(repoPath, ['add', '-A']);
+    await this.stagePortable(repo);
     await this.untrackUnportable(repo);
-    const staged = await this.git(repoPath, ['diff', '--cached', '--quiet']);
+    const staged = await this.git(repo.path, ['diff', '--cached', '--quiet']);
     if (staged.code === 0) return false;
-    await this.gitOk(repoPath, ['commit', '-m', msg]);
+    await this.commitOrDefer(repo, ['-m', msg]);
     return true;
   }
 
@@ -1390,6 +1472,14 @@ class SyncDeferred extends Error {
   constructor(readonly reason: string) {
     super(reason);
   }
+}
+
+// git's own one-line verdict out of a complaint: the first `fatal:` or `error:` line, else the first
+// line, kept short enough for a status note.
+function firstVerdict(text: string): string {
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+  const v = lines.find((l) => /^(fatal|error):/i.test(l)) ?? lines[0] ?? 'no reason given';
+  return v.length <= 300 ? v : `${v.slice(0, 300)}…`;
 }
 
 // The lock git named, for the deferral note. Falls back to a generic phrase.

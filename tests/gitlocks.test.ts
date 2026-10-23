@@ -7,7 +7,17 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { listGitLocks, macosLockHolders, mayHoldRepoLocks, reapGitLocks, resolveGitDirs } from '../src/gitlocks';
+import {
+  classifyLinuxProcess,
+  defaultLockHolderCheck,
+  gitLockCapable,
+  linuxLockRef,
+  listGitLocks,
+  macosLockHolders,
+  mayHoldRepoLocks,
+  reapGitLocks,
+  resolveGitDirs,
+} from '../src/gitlocks';
 import { testScopedLockHolderCheck } from './support/proc-scope';
 import { run } from '../src/util';
 
@@ -205,40 +215,100 @@ describe('resolveGitDirs and listGitLocks', () => {
 });
 
 describe('the machine-wide holder check', () => {
-  test.skipIf(process.platform !== 'linux' || Bun.spawnSync(['python3', '-c', '']).exitCode !== 0)(
-    'a same-user process whose fds cannot be read counts as holding the lock (non-dumpable holder)',
-    async () => {
-      const dir = await repo();
-      const lock = join(dir, '.git', 'index.lock');
-      await writeFile(lock, '');
-      // PR_SET_DUMPABLE=0 makes /proc/<pid>/fd unreadable even to the same user.
-      const holder = Bun.spawn(
-        [
-          'python3',
-          '-c',
-          'import ctypes,sys,time; ctypes.CDLL(None).prctl(4,0,0,0,0); f=open(sys.argv[1]); print("ready",flush=True); time.sleep(30)',
-          lock,
-        ],
-        { stdout: 'pipe', stderr: 'ignore' },
-      );
-      try {
-        const reader = holder.stdout.getReader();
-        await reader.read(); // "ready"
-        reader.releaseLock();
-        const repairs = await reapGitLocks(dir, {
-          olderThanMs: 0,
-          reason: 'stale',
-          stamp: 't',
-          holderCheck: testScopedLockHolderCheck,
-        });
-        expect(repairs).toEqual([]);
-        expect(await exists(lock)).toBe(true);
-      } finally {
-        holder.kill('SIGKILL');
-        await holder.exited;
-      }
-    },
-  );
+  // A non-dumpable process: its /proc/<pid>/fd is unreadable even to its own user, as for `(sd-pam)`
+  // under every systemd --user, ssh-agent and most Electron apps. `name` sets its comm.
+  function nonDumpableHolder(lock: string, name: string | null) {
+    const rename = name === null ? '' : `ctypes.CDLL(None).prctl(15, ctypes.c_char_p(b"${name}"), 0, 0, 0); `;
+    return Bun.spawn(
+      [
+        'python3',
+        '-c',
+        `import ctypes,sys,time; ${rename}ctypes.CDLL(None).prctl(4,0,0,0,0); f=open(sys.argv[1]); print("ready",flush=True); time.sleep(30)`,
+        lock,
+      ],
+      { stdout: 'pipe', stderr: 'ignore' },
+    );
+  }
+
+  async function ready(p: ReturnType<typeof nonDumpableHolder>): Promise<void> {
+    const reader = p.stdout.getReader();
+    await reader.read();
+    reader.releaseLock();
+  }
+
+  const python = process.platform === 'linux' && Bun.spawnSync(['python3', '-c', '']).exitCode === 0;
+
+  test.skipIf(!python)('a non-dumpable process that is not git does not block a repair (the accepted gap)', async () => {
+    const dir = await repo();
+    const lock = join(dir, '.git', 'index.lock');
+    await writeFile(lock, '');
+    const holder = nonDumpableHolder(lock, null);
+    try {
+      await ready(holder);
+      const repairs = await reapGitLocks(dir, { olderThanMs: 0, reason: 'stale', stamp: 't', holderCheck: testScopedLockHolderCheck });
+      expect(repairs.map((r) => r.lock)).toEqual([join('.git', 'index.lock')]);
+    } finally {
+      holder.kill('SIGKILL');
+      await holder.exited;
+    }
+  });
+
+  test.skipIf(!python)('a non-dumpable process whose command name is git blocks it, unreadable fds or not', async () => {
+    const dir = await repo();
+    const lock = join(dir, '.git', 'index.lock');
+    await writeFile(lock, '');
+    const holder = nonDumpableHolder(lock, 'git');
+    try {
+      await ready(holder);
+      const repairs = await reapGitLocks(dir, { olderThanMs: 0, reason: 'stale', stamp: 't', holderCheck: testScopedLockHolderCheck });
+      expect(repairs).toEqual([]);
+      expect(await exists(lock)).toBe(true);
+    } finally {
+      holder.kill('SIGKILL');
+      await holder.exited;
+    }
+  });
+
+  // Unscoped: the production check against this machine's real process table. A Linux user session
+  // always has non-dumpable processes of its own; counting them as holders made every verdict
+  // 'unknown' and no lock was ever repaired. The whole-machine verdict may be 'held' if something on
+  // this machine is running git right now, so that part asserts only "not unknown"; the spawned
+  // process's own classification is asserted exactly.
+  test.skipIf(!python)('production check, real process table: a non-dumpable non-git process is not a holder', async () => {
+    const dir = await repo();
+    const lock = join(dir, '.git', 'index.lock');
+    await writeFile(lock, '');
+    const holder = nonDumpableHolder(lock, null);
+    const gitNamed = nonDumpableHolder(lock, 'git');
+    try {
+      await ready(holder);
+      await ready(gitNamed);
+      const ref = await linuxLockRef(lock);
+      expect(await classifyLinuxProcess(holder.pid, ref, new Set())).toBe('other');
+      expect(await classifyLinuxProcess(gitNamed.pid, ref, new Set())).toBe('git-may-lock');
+      expect(await defaultLockHolderCheck(lock)).not.toBe('unknown');
+    } finally {
+      holder.kill('SIGKILL');
+      gitNamed.kill('SIGKILL');
+      await holder.exited;
+      await gitNamed.exited;
+    }
+  });
+
+  test('gitLockCapable trusts the subcommand only when argv[0] is git', () => {
+    expect(gitLockCapable('git', ['git', 'log'])).toBe(false);
+    expect(gitLockCapable('git', ['/usr/bin/git', 'commit', '-a'])).toBe(true);
+    // `exec -a my-committer git commit -a`: comm says git, argv[0] does not.
+    expect(gitLockCapable('git', ['my-committer', 'commit', '-a'])).toBe(true);
+    expect(gitLockCapable('git', ['my-committer', 'log'])).toBe(true);
+    expect(gitLockCapable('git-remote-http', ['/usr/lib/git-core/git-remote-http', 'origin'])).toBe(false);
+    expect(gitLockCapable('python3', ['python3', 'x.py'])).toBe(false);
+  });
+
+  test('global options that take a value are skipped before the subcommand', () => {
+    expect(mayHoldRepoLocks(['git', '--attr-source', 'HEAD', 'log'])).toBe(false);
+    expect(mayHoldRepoLocks(['git', '--shallow-file', 'x', 'show'])).toBe(false);
+  });
 
   test('macOS: a git whose ps line has a path with spaces counts as a holder', async () => {
     const calls: string[][] = [];
@@ -272,5 +342,23 @@ describe('the machine-wide holder check', () => {
     expect(await macosLockHolders('/tmp/r/.git/index.lock', new Set(), open)).toBe('held');
     const broken = async () => null;
     expect(await macosLockHolders('/tmp/r/.git/index.lock', new Set(), broken)).toBe('unknown');
+  });
+});
+
+describe('macOS: a git run by absolute path', () => {
+  const ide = '/Applications/Some Tool.app/Contents/Resources/git/bin/git';
+  const fixture = (argsLine: string) => async (argv: string[]) => {
+    if (argv[0] === 'lsof') return { code: 1, stdout: '', stderr: '' };
+    if (argv.includes('pid=,comm=')) return { code: 0, stdout: `  300 ${ide}\n`, stderr: '' };
+    return { code: 0, stdout: `  300 ${argsLine}\n`, stderr: '' };
+  };
+
+  test('an editor\'s long-lived cat-file --batch, launched by full path, does not block repairs', async () => {
+    expect(await macosLockHolders('/tmp/r/.git/index.lock', new Set(), fixture(`${ide} cat-file --batch`))).toBe('free');
+  });
+
+  test('a commit launched the same way does, and so does an args line that does not start with the exact path', async () => {
+    expect(await macosLockHolders('/tmp/r/.git/index.lock', new Set(), fixture(`${ide} commit -a`))).toBe('held');
+    expect(await macosLockHolders('/tmp/r/.git/index.lock', new Set(), fixture('/somewhere/else/git cat-file --batch'))).toBe('held');
   });
 });

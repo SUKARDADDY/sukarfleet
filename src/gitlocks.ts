@@ -21,10 +21,11 @@
 // fails closed: an answer of "could not tell" keeps the lock, and the next cycle asks again.
 //
 // The holder check is machine-wide and deliberately blunt. A candidate is retired only when, at the
-// moment of checking, (a) no process of this user has the lock file open -- and a process whose open
-// files cannot be read counts as having it open -- and (b) no git process that can take locks is
-// running ANYWHERE on the machine, other than the daemon's own children and the subcommands that
-// never hold a lock for more than an instant (mayHoldRepoLocks).
+// moment of checking, (a) no process of this user that we can see into has the lock file open, and
+// (b) no git process that can take locks is running ANYWHERE on the machine, other than the daemon's
+// own children and the subcommands that never hold a lock for more than an instant
+// (mayHoldRepoLocks). Rule (b) is the one that carries the weight; see linuxLockHolders for the one
+// gap rule (a) leaves, and why it is accepted.
 //
 // Why (a) is not enough: git does not keep a lock's file descriptor open while it holds the lock.
 // `git commit -a` writes the new index into index.lock, CLOSES it, starts the editor, and renames
@@ -60,7 +61,7 @@
 // index, a non-empty lock is moved to <commondir>/sukarfleet-stale-locks/<ts>/ instead of unlinked.
 // An empty lock carries no bytes worth keeping; its name, size and mtime go into the audit entry.
 
-import { link, lstat, mkdir, readdir, readFile, realpath, rename, stat, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, readdir, readFile, readlink, realpath, rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { liveChildPids, log, run } from './util';
@@ -381,7 +382,17 @@ const LOCK_FREE_SUBCOMMANDS = new Set([
   'var',
 ]);
 // Global options that take their value as the next argument.
-const GIT_OPTS_WITH_VALUE = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix']);
+const GIT_OPTS_WITH_VALUE = new Set([
+  '-C',
+  '-c',
+  '--git-dir',
+  '--work-tree',
+  '--namespace',
+  '--config-env',
+  '--super-prefix',
+  '--attr-source',
+  '--shallow-file',
+]);
 
 // Could the process with this argv be a git holding a lock in a repository? Unknown shapes answer
 // yes: a false yes costs one cycle's delay, a false no could cost somebody's commit.
@@ -444,32 +455,39 @@ export function makeLockHolderCheck(opts: HolderCheckOptions = {}): LockHolderCh
 
 export const defaultLockHolderCheck: LockHolderCheck = makeLockHolderCheck();
 
-// Linux: /proc, read directly, every process.
+// Linux: /proc, read directly, every process, each one classified by classifyLinuxProcess.
 //
-// (a) Open files are matched by (device, inode), so a holder in another mount namespace, or one that
-// opened the lock through a different path, still matches. Only processes running as this user are
-// asked: a lock this user's process created (reapGitLocks never considers any other) is held by a
-// process of this user. "Running as this user" comes from /proc/<pid>/status, not from the owner of
-// /proc/<pid>, which turns to root for a process that made itself non-dumpable -- and such a
-// process's fd directory is unreadable even to its own user. Unreadable means 'unknown', never
-// "nothing open". A process whose /proc entry is gone has exited and holds nothing.
+// (a) Open files: only processes running as this user are asked -- a lock this user's process
+// created (reapGitLocks never considers any other) is held by a process of this user. "Running as
+// this user" comes from /proc/<pid>/status, not from the owner of /proc/<pid>, which turns to root
+// for a process that made itself non-dumpable. Descriptors are read with readlink, which never
+// touches the filesystem they point into (a stat could hang on a dead FUSE or NFS mount, and this
+// runs over every process); only a descriptor whose name ends in the lock's own file name is then
+// stat'ed, to match it by (device, inode) even when it was opened through another path or mount
+// namespace.
+//
+// A process whose descriptors cannot be read -- a non-dumpable one: `(sd-pam)` under every
+// `systemd --user`, ssh-agent, most Electron apps -- does NOT block a repair. Counting it did, and it
+// meant a Linux user session never repaired anything. Rule (b) does not depend on reading
+// descriptors, so a git is caught whether its descriptors are readable or not. The accepted gap is a
+// non-dumpable process that is NOT git holding a git lock file open for longer than staleGitLockMin.
+// Only git implementations open .git/*.lock, and the library ones (libgit2, JGit) hold a lock for a
+// moment, so a lock untouched for that long whose only holder is such a process has a hung holder.
 //
 // (b) A git is recognised by its command name (comm, readable for every process) or argv[0], and its
-// subcommand read from cmdline split on NUL, never on whitespace. A git whose cmdline cannot be read
-// counts as lock-capable. A git in another mount namespace is visible here like any other and counts
-// the same way.
+// subcommand read from cmdline split on NUL, never on whitespace (gitLockCapable). A git whose
+// cmdline cannot be read, or whose argv[0] was renamed so the subcommand cannot be trusted, counts as
+// lock-capable. A git in another mount namespace is visible here like any other and counts the same.
 async function linuxLockHolders(
   lockPath: string,
   own: Set<number>,
   includePid?: (pid: number) => boolean | Promise<boolean>,
 ): Promise<LockHolderVerdict> {
-  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
   let pids: string[];
-  let lockId: string;
+  let lock: LinuxLockRef;
   try {
     pids = (await readdir('/proc')).filter((d) => /^\d+$/.test(d));
-    const st = await stat(lockPath);
-    lockId = `${st.dev}:${st.ino}`;
+    lock = await linuxLockRef(lockPath);
   } catch {
     return 'unknown';
   }
@@ -478,56 +496,96 @@ async function linuxLockHolders(
   let verdict: LockHolderVerdict = 'free';
   for (const pid of pids) {
     if (includePid && !(await includePid(Number(pid)))) continue;
-    const base = `/proc/${pid}`;
-    const gone = async () => !(await exists(base));
-
-    let comm = '';
-    let argv: string[] | null = null;
-    try {
-      comm = (await readFile(`${base}/comm`, 'utf8')).trim();
-    } catch {
-      if (await gone()) continue;
-      // comm is readable for every process; not being able to read it means this one might be a
-      // git and there is no telling.
-      verdict = 'unknown';
-    }
-    try {
-      argv = (await readFile(`${base}/cmdline`, 'utf8')).split('\0').filter(Boolean);
-    } catch {
-      if (await gone()) continue;
-    }
-    if (!own.has(Number(pid)) && isGitName(comm, argv)) {
-      if (argv === null || argv.length === 0 || mayHoldRepoLocks(argv)) return 'held';
-    }
-
-    let mine: boolean;
-    try {
-      const uids = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(await readFile(`${base}/status`, 'utf8'));
-      mine = uid === null || uids === null || uids.slice(1).some((u) => Number(u) === uid);
-    } catch {
-      if (await gone()) continue;
-      mine = true;
-    }
-    if (!mine) continue;
-    let fds: string[];
-    try {
-      fds = await readdir(`${base}/fd`);
-    } catch {
-      if (await gone()) continue;
-      verdict = 'unknown'; // keep scanning: a definite 'held' elsewhere is the better answer
-      continue;
-    }
-    for (const fd of fds) {
-      try {
-        const st = await stat(`${base}/fd/${fd}`);
-        if (`${st.dev}:${st.ino}` === lockId) return 'held';
-      } catch (err) {
-        // Closed while we looked is ENOENT; anything else is a descriptor we could not see.
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') verdict = 'unknown';
-      }
-    }
+    const cls = await classifyLinuxProcess(Number(pid), lock, own);
+    if (cls === 'git-may-lock' || cls === 'holds-lock') return 'held';
+    if (cls === 'unreadable-identity') verdict = 'unknown';
   }
   return verdict;
+}
+
+export interface LinuxLockRef {
+  name: string;
+  id: string;
+}
+
+export async function linuxLockRef(lockPath: string): Promise<LinuxLockRef> {
+  const st = await stat(lockPath);
+  return { name: basename(lockPath), id: `${st.dev}:${st.ino}` };
+}
+
+// How one process bears on one lock. Exported so a test can check the production classification of
+// a specific process against the real process table, which a whole-machine verdict cannot pin down
+// on a machine where other things run git.
+export type LinuxProcessClass =
+  | 'gone' // exited while we looked
+  | 'git-may-lock' // a git that can hold a lock, not one of ours: blocks every repair
+  | 'holds-lock' // has this very lock file open
+  | 'unreadable-identity' // comm unreadable: might be a git, no telling
+  | 'other'; // none of the above, including a process whose descriptors cannot be read
+
+export async function classifyLinuxProcess(pid: number, lock: LinuxLockRef, own: ReadonlySet<number>): Promise<LinuxProcessClass> {
+  const base = `/proc/${pid}`;
+  const gone = async () => !(await exists(base));
+  let comm: string;
+  let argv: string[] | null = null;
+  try {
+    comm = (await readFile(`${base}/comm`, 'utf8')).trim();
+  } catch {
+    // comm is readable for every process; not being able to read it means there is no telling.
+    return (await gone()) ? 'gone' : 'unreadable-identity';
+  }
+  try {
+    argv = (await readFile(`${base}/cmdline`, 'utf8')).split('\0').filter(Boolean);
+  } catch {
+    if (await gone()) return 'gone';
+  }
+  if (!own.has(pid) && isGitName(comm, argv) && gitLockCapable(comm, argv)) return 'git-may-lock';
+
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  if (uid !== null) {
+    try {
+      const uids = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(await readFile(`${base}/status`, 'utf8'));
+      if (uids !== null && !uids.slice(1).some((u) => Number(u) === uid)) return 'other';
+    } catch {
+      if (await gone()) return 'gone';
+    }
+  }
+  let fds: string[];
+  try {
+    fds = await readdir(`${base}/fd`);
+  } catch {
+    return (await gone()) ? 'gone' : 'other'; // non-dumpable: see the accepted gap above
+  }
+  for (const fd of fds) {
+    let target: string;
+    try {
+      target = await readlink(`${base}/fd/${fd}`);
+    } catch {
+      continue; // closed while we looked
+    }
+    const t = target.endsWith(' (deleted)') ? target.slice(0, -' (deleted)'.length) : target;
+    if (basename(t) !== lock.name) continue;
+    try {
+      const st = await stat(`${base}/fd/${fd}`);
+      if (`${st.dev}:${st.ino}` === lock.id) return 'holds-lock';
+    } catch {
+      // closed while we looked
+    }
+  }
+  return 'other';
+}
+
+// Can this git process hold a lock? The subcommand is read from argv only when argv[0] really is
+// git; a process whose comm says git but whose argv[0] was renamed (`exec -a`) cannot be read that
+// way and counts as lock-capable. A dashed helper (`git-remote-http`, comm truncated to 15 bytes)
+// names its own subcommand in its executable.
+export function gitLockCapable(comm: string, argv: readonly string[] | null): boolean {
+  const norm = (n: string) => basename(n.replace(/\\/g, '/')).toLowerCase().replace(/\.exe$/, '');
+  const a0 = argv && argv.length > 0 ? norm(argv[0]!) : '';
+  if (a0 === 'git' || a0.startsWith('git-')) return mayHoldRepoLocks(argv!);
+  const c = norm(comm);
+  if (c.startsWith('git-')) return mayHoldRepoLocks([c]);
+  return c === 'git';
 }
 
 // comm is the kernel's name for the executable, truncated to 15 bytes, so `git-remote-https` reads
@@ -560,9 +618,10 @@ async function defaultProbe(argv: string[]): Promise<{ code: number; stdout: str
 // macOS: no /proc. (a) lsof matches the lock by identity (exit 0 with a p-line: open; exit 1 with no
 // output: not open; anything else: no answer). (b) `ps -o comm=` names each process's executable
 // reliably. Its argv is not reliable: `ps -o args=` joins arguments with spaces, so a path with a
-// space in it is indistinguishable from two arguments. So the subcommand is trusted only in the one
-// shape that survives the join -- argv[0] exactly `git` and argv[1] not an option -- and any other git
-// counts as lock-capable.
+// space in it is indistinguishable from two arguments. So the subcommand is trusted only where the
+// join cannot have moved it: the args line begins with exactly the executable's path as comm reports
+// it (an IDE or GitHub Desktop runs git by absolute path), or with plain `git`, followed by a
+// subcommand that is not an option. Any other git counts as lock-capable.
 export async function macosLockHolders(lockPath: string, own: Set<number>, probe: Probe): Promise<LockHolderVerdict> {
   const open = await probe(['lsof', '-w', '-n', '-P', '-F', 'p', '--', lockPath]);
   if (open === null) return 'unknown';
@@ -571,33 +630,35 @@ export async function macosLockHolders(lockPath: string, own: Set<number>, probe
 
   const names = await probe(['ps', '-axww', '-o', 'pid=,comm=']);
   if (names === null || names.code !== 0) return 'unknown';
-  const gits: string[] = [];
+  const gits = new Map<string, string>();
   for (const line of names.stdout.split('\n')) {
     const m = /^\s*(\d+)\s+(.*)$/.exec(line);
     if (!m || own.has(Number(m[1]))) continue;
-    if (!isGitName(m[2]!.trim(), null)) continue;
-    const dashed = basename(m[2]!.trim()).toLowerCase();
+    const comm = m[2]!.trim();
+    if (!isGitName(comm, null)) continue;
+    const dashed = basename(comm).toLowerCase();
     // A dashed helper names its own subcommand in its executable: no argv needed.
     if (dashed.startsWith('git-')) {
       if (mayHoldRepoLocks([dashed])) return 'held';
       continue;
     }
-    gits.push(m[1]!);
+    gits.set(m[1]!, comm);
   }
-  if (gits.length === 0) return 'free';
+  if (gits.size === 0) return 'free';
 
-  const args = await probe(['ps', '-ww', '-o', 'pid=,args=', '-p', gits.join(',')]);
+  const args = await probe(['ps', '-ww', '-o', 'pid=,args=', '-p', [...gits.keys()].join(',')]);
   if (args === null || (args.code !== 0 && args.code !== 1)) return 'unknown';
   const argsOf = new Map<string, string>();
   for (const line of args.stdout.split('\n')) {
-    const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+    const m = /^\s*(\d+) (.*)$/.exec(line);
     if (m) argsOf.set(m[1]!, m[2]!);
   }
-  for (const pid of gits) {
+  for (const [pid, comm] of gits) {
     const line = argsOf.get(pid);
     if (line === undefined) continue; // exited between the two ps calls
-    const [argv0, sub] = line.split(' ', 2);
-    if (argv0 !== 'git' || sub === undefined || sub.startsWith('-')) return 'held';
+    const rest = line.startsWith(`${comm} `) ? line.slice(comm.length + 1) : line.startsWith('git ') ? line.slice(4) : null;
+    const sub = rest === null ? undefined : rest.split(' ', 1)[0];
+    if (!sub || sub.startsWith('-')) return 'held';
     if (mayHoldRepoLocks(['git', sub])) return 'held';
   }
   return 'free';

@@ -1940,6 +1940,8 @@ test('an unportable path staged and then edited (AM) is untracked anyway, and th
   expect(recA.stats.at(-1)!.syncError).toBeNull();
   expect((await git(dirA, ['ls-files'])).stdout.split('\n').filter(Boolean)).toEqual(['a.txt']);
   expect(await readFile(join(dirA, 'check:css.log'), 'utf8')).toBe('edited after staging');
+  // Only staged, never committed: nothing left the repo, so nothing is audited.
+  expect(recA.unportable).toEqual([]);
 });
 
 test('no daemon commit records an unportable path: not a postMerge regeneration, not a merge of an older peer', async () => {
@@ -1957,10 +1959,12 @@ test('no daemon commit records an unportable path: not a postMerge regeneration,
   const ours = (await git(dirA, ['ls-tree', '-r', '--name-only', 'HEAD'])).stdout.split('\n').filter(Boolean).sort();
   expect(ours).toEqual(['a.txt']);
   expect(await exists(join(dirA, 'gen:out.log'))).toBe(true);
-  // Every commit alpha itself made is portable (beta's own commit is beta's business).
-  const alphaCommits = (await git(dirA, ['log', '--format=%H', '--author=alpha', 'sync/alpha'])).stdout.split('\n').filter(Boolean);
+  // No commit alpha authored adds one. The merge commit records beta's tree as beta committed it
+  // (a plain `git merge`, so hooks run as they always did); the follow-up commit in the same step
+  // takes the path out, and the tip that gets pushed is portable.
+  const alphaCommits = (await git(dirA, ['log', '--no-merges', '--format=%H', '--author=alpha', 'sync/alpha'])).stdout.split('\n').filter(Boolean);
   for (const c of alphaCommits) {
-    const added = (await git(dirA, ['show', '--format=', '--name-only', '--diff-filter=AM', '-m', c])).stdout;
+    const added = (await git(dirA, ['show', '--format=', '--name-only', '--diff-filter=AM', c])).stdout;
     expect(added).not.toContain('gen:out.log');
     expect(added).not.toContain('peer:bad.txt');
   }
@@ -1988,4 +1992,133 @@ test('a daemon merge that cannot be aborted is never committed: the repo defers 
   expect(await exists(join(dirA, '.git', 'MERGE_HEAD'))).toBe(true);
   expect((await run(['git', 'grep', '-q', '<<<<<<<', 'HEAD'], { cwd: dirA })).code).toBe(1);
   expect(recA.stats.at(-1)!.syncError).toBeNull();
+});
+
+// --- round 3 ----------------------------------------------------------------------------
+test('an untracked unportable file left on disk is not re-staged, re-untracked and re-audited every merge cycle', async () => {
+  const { dirA, dirB, syncA, syncB, recA, repoA, repoB } = await setupPair({ 'a.txt': 'one' }, [], [['sh', '-c', 'echo regenerated > "gen:out.log"']]);
+  await writeFile(join(dirB, 'peer:bad.txt'), 'from an older version');
+  await git(dirB, ['add', '-A']);
+  await git(dirB, ['commit', '-q', '-m', 'older peer']);
+  // Three merge cycles: each time beta has something new, so alpha merges, runs postMerge and commits.
+  const { lines, restore } = captureLogs();
+  try {
+    for (let i = 0; i < 3; i++) {
+      await writeFile(join(dirB, `b${i}.txt`), String(i));
+      await git(dirB, ['add', '-A']);
+      await git(dirB, ['commit', '-q', '-m', `b${i}`]);
+      await syncA.syncOnce(repoA);
+    }
+  } finally {
+    restore();
+  }
+  // Nothing unportable was ever staged by the daemon's own adds, so nothing had to be unstaged.
+  expect(lines.filter((l) => l.msg === 'auto-commit: unstaged paths a Windows checkout cannot hold')).toEqual([]);
+  void syncB;
+  void repoB;
+  // peer:bad.txt was in a tree alpha merged: reported once. gen:out.log was never in any tree.
+  expect(recA.unportable.flatMap((u) => u.paths)).toEqual(['peer:bad.txt']);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect(await exists(join(dirA, 'gen:out.log'))).toBe(true);
+});
+
+async function installHook(repoDir: string, name: string, body: string): Promise<void> {
+  const p = join(repoDir, '.git', 'hooks', name);
+  await writeFile(p, `#!/bin/sh\n${body}\n`);
+  await chmod(p, 0o755);
+}
+
+test('a clean merge runs the hooks a plain git merge runs: pre-merge-commit, not pre-commit', async () => {
+  const { dirA, dirB, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await installHook(dirA, 'pre-commit', 'exit 1');
+  await installHook(dirA, 'pre-merge-commit', `touch "${join(base, 'pre-merge-commit-ran')}"`);
+  await writeFile(join(dirB, 'a.txt'), 'two');
+  await git(dirB, ['commit', '-q', '-am', 'beta edit']);
+
+  await syncA.syncOnce(repoA);
+
+  expect((await git(dirA, ['show', 'HEAD:a.txt'])).stdout).toBe('two');
+  expect(await exists(join(base, 'pre-merge-commit-ran'))).toBe(true);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+});
+
+test('a hook that refuses the daemon\'s commit defers the repo, with the hook\'s reason, instead of failing', async () => {
+  const { dirA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await installHook(dirA, 'pre-commit', 'echo "error: transcrypt is not configured" >&2; exit 1');
+  await writeFile(join(dirA, 'a.txt'), 'two');
+  const clock = makeClock(Date.now());
+  const s = new Syncer(makeConfig('alpha', [peer('beta')], dirA), recA.deps, { ...FAST, now: clock.now });
+
+  await s.syncOnce(repoA);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  clock.advance(11 * 60_000);
+  await s.syncOnce(repoA);
+  const note = recA.stats.at(-1)!.syncError!;
+  expect(note.startsWith(SYNC_DEFERRED_PREFIX)).toBe(true);
+  expect(note).toContain('transcrypt is not configured');
+});
+
+test('a merge hook that refuses a clean merge defers, and leaves no merge open', async () => {
+  const { dirA, dirB, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await installHook(dirA, 'pre-merge-commit', 'exit 1');
+  await writeFile(join(dirB, 'a.txt'), 'two');
+  await git(dirB, ['commit', '-q', '-am', 'beta edit']);
+  const before = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  const s = new Syncer(makeConfig('alpha', [peer('beta')], dirA), recA.deps, FAST);
+
+  const { lines, restore } = captureLogs();
+  try {
+    await s.syncOnce(repoA);
+  } finally {
+    restore();
+  }
+
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect((await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(before);
+  expect(await exists(join(dirA, '.git', 'MERGE_HEAD'))).toBe(false);
+  expect(lines.some((l) => l.msg === 'sync deferred; retrying next cycle' && String(l.reason).includes('merge hook'))).toBe(true);
+});
+
+test('an unfinished own merge blocked by a held index.lock says so, not "needs a person"', async () => {
+  const { dirA, dirB, recA, repoA } = await setupPair({ 'foo.txt': 'base\n' });
+  await concurrentEdit(dirA, dirB);
+  await git(dirA, ['fetch', '-q', 'fleet-beta']);
+  const betaTip = (await git(dirA, ['rev-parse', 'refs/remotes/fleet-beta/sync/beta'])).stdout.trim();
+  await writeFile(join(dirA, '.git', 'sukarfleet-merge'), `${betaTip}\n`);
+  await run(['git', 'merge', '--no-ff', '--no-edit', betaTip], { cwd: dirA });
+  await writeFile(join(dirA, '.git', 'index.lock'), ''); // fresh: somebody holds it right now
+  const s = new Syncer(makeConfig('alpha', [peer('beta')], dirA), recA.deps, FAST);
+
+  const { lines, restore } = captureLogs();
+  try {
+    await s.syncOnce(repoA);
+  } finally {
+    restore();
+  }
+
+  const deferral = lines.find((l) => l.msg === 'sync deferred; retrying next cycle');
+  expect(String(deferral?.reason)).toContain('index.lock');
+  expect(String(deferral?.reason)).not.toContain('by hand');
+  expect(await exists(join(dirA, '.git', 'MERGE_HEAD'))).toBe(true);
+});
+
+test.skipIf(process.platform !== 'linux')('a git whose argv[0] was renamed (exec -a) still counts as a holder', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, 'a.txt'), 'edit');
+  const lock = join(dirA, '.git', 'index.lock');
+  const renamed = Bun.spawn(['bash', '-c', 'exec -a my-committer git commit -a'], {
+    cwd: dirA,
+    env: { ...process.env, GIT_EDITOR: 'sleep 15; true' },
+    stdio: ['ignore', 'ignore', 'ignore'],
+  });
+  try {
+    await waitFor(() => exists(lock));
+    await ageFile(lock, 20 * 60_000);
+    await syncA.syncOnce(repoA);
+    expect(await exists(lock)).toBe(true);
+    expect(recA.lockRepairs).toHaveLength(0);
+  } finally {
+    renamed.kill('SIGTERM');
+    await renamed.exited;
+  }
 });
