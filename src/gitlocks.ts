@@ -67,8 +67,8 @@
 import { link, lstat, mkdir, readdir, readFile, readlink, realpath, rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { dlopen, FFIType, read } from 'bun:ffi';
-import { liveChildPids, log, run } from './util';
+import { liveChildPids, log, run, runBytes } from './util';
+import { LEASE_EXIT, LEASE_PROBE_SCRIPT, type LeaseVerdict } from './leaseprobe';
 
 export type LockHolderVerdict = 'free' | 'held' | 'unknown';
 
@@ -487,7 +487,7 @@ async function linuxLockHolders(
   includePid: ((pid: number) => boolean | Promise<boolean>) | undefined,
   leaseProbe: LeaseProbe,
 ): Promise<LockHolderVerdict> {
-  const lease = leaseProbe(lockPath);
+  const lease = await leaseProbe(lockPath);
   if (lease === 'writer') return 'held';
   let pids: string[];
   let lock: LinuxLockRef | null = null;
@@ -509,88 +509,51 @@ async function linuxLockHolders(
   return verdict;
 }
 
-export type LeaseVerdict = 'no-writer' | 'writer' | 'unsupported';
-export type LeaseProbe = (lockPath: string) => LeaseVerdict;
+export type { LeaseVerdict };
+export type LeaseProbe = (lockPath: string) => Promise<LeaseVerdict>;
 
-// Linux's fcntl constants, from <asm-generic/fcntl.h> and <asm-generic/errno-base.h>, which x86_64,
-// arm64 and riscv64 all use unchanged (checked against the x86_64 headers, which include the
-// generic file verbatim). Other architectures redefine some of them, so there the probe reports
-// 'unsupported' rather than pass a flag that means something else.
-const LINUX_GENERIC_ARCHES = new Set(['x64', 'arm64', 'riscv64']);
-const O_RDONLY = 0;
-const O_NONBLOCK = 0o4000;
-const O_CLOEXEC = 0o2000000;
-const F_SETLEASE = 1024; // F_LINUX_SPECIFIC_BASE + 0
-const F_RDLCK = 0;
-const F_UNLCK = 2;
-const EAGAIN = 11;
-const ENOENT = 2;
-
-interface LibcLease {
-  open: (path: Uint8Array, flags: number, mode: number) => number;
-  fcntl: (fd: number, cmd: number, arg: number) => number;
-  close: (fd: number) => number;
-  errno: () => number;
+// The lease is taken in a short-lived child, never in the daemon. While a process holds a lease,
+// any other process opening the file for writing makes the kernel send the lease holder SIGIO, and
+// SIGIO's default action is to terminate. Bun installs no handler, so a writer that turned up in the
+// microseconds between taking the lease and dropping it killed the daemon outright -- reproduced in
+// review within a few hundred probes -- and a daemon killed that way is exactly the unclean exit
+// that leaves git locks behind. In a child, the worst a signal can do is kill the child.
+//
+// The parent reads only the child's exit status and never depends on how the child handles
+// signals: one of leaseprobe.ts's three exit codes is an answer, and anything else -- death by any
+// signal (a SIGIO is a writer appearing), the timeout, a spawn that failed or was refused -- reads as
+// 'writer', which keeps the lock. The child runs only for a lock
+// that is already a stale candidate, so its start-up cost is paid rarely.
+export function makeLeaseProbe(argvFor: (lockPath: string) => string[] = leaseProbeArgv): LeaseProbe {
+  return async (lockPath) => {
+    try {
+      // evenWhileDraining, like the lsof and tasklist probes: the drain's own SIGKILL cleanup
+      // (runBytes's afterKill) is what asks this question during a shutdown, and a refusal there
+      // would leave every lock that kill orphaned for the next boot's stale pass.
+      return interpretLeaseChild(
+        await runBytes(argvFor(lockPath), { timeoutMs: LEASE_PROBE_TIMEOUT_MS, evenWhileDraining: true }),
+      );
+    } catch {
+      return 'writer'; // could not even spawn: no answer, so keep the lock
+    }
+  };
 }
 
-let libcLease: LibcLease | null | undefined;
+export const kernelLeaseProbe: LeaseProbe = makeLeaseProbe();
 
-// bun:ffi straight into libc: no compiler, no native module, no new dependency. Loaded on first use
-// and never again; a libc that cannot be opened leaves the probe permanently 'unsupported'.
-function loadLibcLease(): LibcLease | null {
-  if (libcLease !== undefined) return libcLease;
-  libcLease = null;
-  if (process.platform !== 'linux' || !LINUX_GENERIC_ARCHES.has(process.arch)) return null;
-  {
-    for (const name of ['libc.so.6', 'libc.so']) {
-      try {
-        const lib = dlopen(name, {
-          open: { args: [FFIType.ptr, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-          fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-          close: { args: [FFIType.i32], returns: FFIType.i32 },
-          __errno_location: { args: [], returns: FFIType.ptr },
-        });
-        libcLease = {
-          open: (path, flags, mode) => lib.symbols.open(path, flags, mode),
-          fcntl: (fd, cmd, arg) => lib.symbols.fcntl(fd, cmd, arg),
-          close: (fd) => lib.symbols.close(fd),
-          errno: () => {
-            const p = lib.symbols.__errno_location();
-            return p === null ? -1 : read.i32(p, 0);
-          },
-        };
-        return libcLease;
-      } catch {
-        // try the next name
-      }
-    }
-  }
-  return null;
+const LEASE_PROBE_TIMEOUT_MS = 10_000;
+
+function leaseProbeArgv(lockPath: string): string[] {
+  return [process.execPath, LEASE_PROBE_SCRIPT, lockPath];
 }
 
-// Every answer it can get wrong lands on the safe side: a misread EAGAIN is 'unsupported' (the
-// fail-closed fallback), and any other misread errno is 'unsupported' too. Only a granted lease is
-// 'no-writer'.
-export const kernelLeaseProbe: LeaseProbe = (lockPath) => {
-  const libc = loadLibcLease();
-  if (libc === null) return 'unsupported';
-  const fd = libc.open(Buffer.from(`${lockPath}\0`), O_RDONLY | O_NONBLOCK | O_CLOEXEC, 0);
-  if (fd < 0) {
-    const e = libc.errno();
-    // EAGAIN on open: somebody holds a lease of their own on it. ENOENT: released meanwhile, and
-    // there is nothing left to reap. Neither is a licence to remove anything.
-    return e === EAGAIN || e === ENOENT ? 'writer' : 'unsupported';
-  }
-  try {
-    if (libc.fcntl(fd, F_SETLEASE, F_RDLCK) === 0) {
-      libc.fcntl(fd, F_SETLEASE, F_UNLCK);
-      return 'no-writer';
-    }
-    return libc.errno() === EAGAIN ? 'writer' : 'unsupported';
-  } finally {
-    libc.close(fd);
-  }
-};
+// Exported for the test that pins the mapping, death by SIGIO included.
+export function interpretLeaseChild(r: { code: number; signalCode?: string; timedOut?: boolean }): LeaseVerdict {
+  if (r.signalCode || r.timedOut) return 'writer';
+  if (r.code === LEASE_EXIT.noWriter) return 'no-writer';
+  if (r.code === LEASE_EXIT.unsupported) return 'unsupported';
+  return 'writer';
+}
 
 export interface LinuxLockRef {
   name: string;

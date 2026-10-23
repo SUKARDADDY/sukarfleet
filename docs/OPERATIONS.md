@@ -155,7 +155,9 @@ longer guesses.
 On Linux, "open for writing" is asked of the kernel. The daemon opens the lock read-only and asks
 for a read lease (`fcntl F_SETLEASE`), which the kernel grants only when no process anywhere has the
 file open for writing, whichever user or mount namespace it runs in and whether or not it hides its
-open files. The lease is dropped straight away. Filesystems without leases (NFS, many FUSE and
+open files. The lease is dropped straight away, and it is taken by a short-lived child process, not
+the daemon. If a writer opens the file while the lease is held, the kernel sends the lease holder
+SIGIO, which kills it. A dead child just means "a writer showed up", and the lock stays. Filesystems without leases (NFS, many FUSE and
 overlay mounts, or `fs.leases-enable=0`) fall back to reading every process's open files from
 `/proc`. There a process of yours whose open files can't be read, such as `(sd-pam)` under
 `systemd --user`, `ssh-agent` or most Electron apps, counts as a possible holder. So on such a

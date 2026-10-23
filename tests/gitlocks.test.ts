@@ -11,7 +11,9 @@ import {
   classifyLinuxProcess,
   defaultLockHolderCheck,
   gitLockCapable,
+  interpretLeaseChild,
   kernelLeaseProbe,
+  makeLeaseProbe,
   linuxLockRef,
   listGitLocks,
   makeLockHolderCheck,
@@ -21,7 +23,7 @@ import {
   resolveGitDirs,
 } from '../src/gitlocks';
 import { isInTestTree, testScopedLockHolderCheck } from './support/proc-scope';
-import { run } from '../src/util';
+import { allowChildSpawns, drainChildren, run, RUN_REFUSED_SHUTTING_DOWN } from '../src/util';
 
 let base: string;
 
@@ -304,14 +306,14 @@ describe('the machine-wide holder check', () => {
     const dir = await repo();
     const lock = join(dir, '.git', 'index.lock');
     await writeFile(lock, '');
-    expect(kernelLeaseProbe(lock)).toBe('no-writer');
+    expect(await kernelLeaseProbe(lock)).toBe('no-writer');
     expect(await defaultLockHolderCheck(lock)).not.toBe('unknown');
     const writer = Bun.spawn(['sh', '-c', 'exec 3<>"$1"; echo ready; exec sleep 30', 'sh', lock], { stdout: 'pipe' });
     try {
       const r = writer.stdout.getReader();
       await r.read();
       r.releaseLock();
-      expect(kernelLeaseProbe(lock)).toBe('writer');
+      expect(await kernelLeaseProbe(lock)).toBe('writer');
       expect(await defaultLockHolderCheck(lock)).toBe('held');
     } finally {
       writer.kill('SIGKILL');
@@ -325,7 +327,7 @@ describe('the machine-wide holder check', () => {
     const dir = await repo();
     const lock = join(dir, '.git', 'index.lock');
     await writeFile(lock, '');
-    const noLeases = makeLockHolderCheck({ includePid: isInTestTree, leaseProbe: () => 'unsupported' });
+    const noLeases = makeLockHolderCheck({ includePid: isInTestTree, leaseProbe: async () => 'unsupported' });
     expect(await noLeases(lock)).toBe('free');
     const hidden = nonDumpable(lock, { mode: 'r' });
     try {
@@ -404,5 +406,68 @@ describe('macOS: a git run by absolute path', () => {
   test('a commit launched the same way does, and so does an args line that does not start with the exact path', async () => {
     expect(await macosLockHolders('/tmp/r/.git/index.lock', new Set(), fixture(`${ide} commit -a`))).toBe('held');
     expect(await macosLockHolders('/tmp/r/.git/index.lock', new Set(), fixture('/somewhere/else/git cat-file --batch'))).toBe('held');
+  });
+});
+
+// --- the lease is taken in a child, never in the daemon -----------------------------------------
+// While a process holds a lease, a writer opening the file makes the kernel send that process SIGIO,
+// whose default action terminates it. Taken in the daemon, that killed the daemon -- reproduced in
+// review within a few hundred probes against a writer loop.
+describe('lease probe isolation', () => {
+  test.skipIf(process.platform !== 'linux')(
+    'racing a writer, the production probe and check never take their caller down, and never say unknown',
+    async () => {
+      const dir = await repo();
+      const lock = join(dir, '.git', 'index.lock');
+      await writeFile(lock, '');
+      const support = join(import.meta.dir, 'support');
+      const writer = Bun.spawn([process.execPath, join(support, 'lease-race-writer.ts'), lock, '12000'], { stdout: 'pipe', stderr: 'ignore' });
+      const r = writer.stdout.getReader();
+      await r.read();
+      r.releaseLock();
+      const prober = Bun.spawn([process.execPath, join(support, 'lease-race-prober.ts'), lock, '6000'], { stdout: 'pipe', stderr: 'pipe' });
+      const exitCode = await prober.exited;
+      const out = await new Response(prober.stdout).text();
+      writer.kill('SIGKILL');
+      await writer.exited;
+
+      expect(prober.signalCode).toBeNull();
+      expect(exitCode).toBe(0);
+      const counts = JSON.parse(out) as Record<string, number>;
+      expect(Object.keys(counts).every((k) => k === 'free' || k === 'held' || k === 'no-writer' || k === 'writer')).toBe(true);
+      expect(Object.values(counts).reduce((a, b) => a + b, 0)).toBeGreaterThan(20);
+    },
+    30_000,
+  );
+
+  test('a probe child that dies of SIGIO, or of anything, reads as a writer', async () => {
+    expect(interpretLeaseChild({ code: 0, signalCode: 'SIGIO' })).toBe('writer');
+    expect(interpretLeaseChild({ code: 124, timedOut: true })).toBe('writer');
+    expect(interpretLeaseChild({ code: 0 })).toBe('writer');
+    expect(interpretLeaseChild({ code: 1 })).toBe('writer');
+    expect(interpretLeaseChild({ code: 40 })).toBe('no-writer');
+    expect(interpretLeaseChild({ code: 42 })).toBe('unsupported');
+    if (process.platform !== 'win32') {
+      // A real child killed by SIGIO, through the production spawn path.
+      const killedBySigio = makeLeaseProbe(() => ['sh', '-c', 'kill -IO $$; sleep 5']);
+      expect(await killedBySigio('/nonexistent')).toBe('writer');
+    }
+    const cannotSpawn = makeLeaseProbe(() => ['/nonexistent/no-such-binary']);
+    expect(await cannotSpawn('/nonexistent')).toBe('writer');
+  });
+
+  // The drain's own SIGKILL cleanup asks this question during a shutdown, so the probe runs then too,
+  // like the lsof and tasklist probes. A spawn that is refused anyway reads as a writer.
+  test.skipIf(process.platform !== 'linux')('while a shutdown drains, the probe still answers; a refused one reads as a writer', async () => {
+    const dir = await repo();
+    const lock = join(dir, '.git', 'index.lock');
+    await writeFile(lock, '');
+    await drainChildren({ settleMs: 0, termGraceMs: 0, killWaitMs: 0 });
+    try {
+      expect(await kernelLeaseProbe(lock)).toBe('no-writer');
+    } finally {
+      allowChildSpawns();
+    }
+    expect(interpretLeaseChild({ code: RUN_REFUSED_SHUTTING_DOWN })).toBe('writer');
   });
 });
