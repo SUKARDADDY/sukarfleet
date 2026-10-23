@@ -3,7 +3,7 @@
 // Single writer per machine on sync/<machine>. main is never touched here.
 
 import { join, dirname, isAbsolute } from 'node:path';
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import type { FleetConfig, RepoConfig, PresenceRepoStat, MachineKey } from './types';
 import { run, runBytes, log, atomicWrite, nowMs, sleep as utilSleep, TransitionGate, SYNC_DEFERRED_PREFIX } from './util';
 import { buildAuthHeader } from './keys';
@@ -835,16 +835,22 @@ export class Syncer {
     if (addable.length > 0) await this.gitOk(repo.path, ['--literal-pathspecs', 'add', '-A', '--', ...addable]);
   }
 
-  // Every commit the daemon makes goes through here. A commit that fails while the repo has commit
-  // hooks installed (a transcrypt pre-commit is the live case) is the hook saying no -- something a
-  // person has to look at, and not something retrying every two minutes will change -- so it defers,
-  // with the hook's own words as the reason, instead of failing every cycle. Without hooks a failed
-  // commit is a real error, as before.
+  // Every commit the daemon makes goes through here. A commit a hook refuses (a transcrypt pre-commit
+  // is the live case) is something a person has to look at, and not something retrying every two
+  // minutes will change, so it defers, with the hook's own words as the reason, instead of failing
+  // every cycle. Everything else stays an ordinary syncError, exactly as before.
+  //
+  // "A hook refused it" has to be established, not assumed from a hook being installed: an empty
+  // author name with a perfectly happy pre-commit hook is git's own failure and must stay visible.
+  // git reports its own failures through die(), exit 128; a refusing pre-commit or commit-msg hook
+  // makes `git commit` exit 1. Exit 1 also covers "nothing to commit" and an empty message, which
+  // git says in so many words, so those are excluded by name.
   private async commitOrDefer(repo: RepoConfig, args: string[]): Promise<void> {
     const r = await this.git(repo.path, ['commit', ...args]);
     if (r.code === 0) return;
     const why = r.stderr.trim() || r.stdout.trim();
-    if (await this.hasCommitHooks(repo)) {
+    const gitSaidWhy = /nothing (added )?to commit|empty commit message/i.test(`${r.stdout}\n${r.stderr}`);
+    if (r.code === 1 && !gitSaidWhy && (await this.hasCommitHooks(repo))) {
       throw new SyncDeferred(`a commit hook refused the daemon's commit: ${firstVerdict(why)}`);
     }
     throw new Error(`git commit ${describeArgs(args)} failed (code ${r.code}): ${why}`);
@@ -1604,9 +1610,13 @@ async function pathExists(p: string): Promise<boolean> {
   }
 }
 
+// lstat, not stat: these are directory entries, and git commits a symlink as the link itself. A stat
+// followed the link, so a symlink pointing at something that does not exist (yet) read as MISSING,
+// dropVanished then dropped it as vanished, and it was never committed -- while the cycle reported
+// success with `?? the-link` still sitting in the tree.
 async function statSig(abs: string): Promise<string> {
   try {
-    const s = await stat(abs);
+    const s = await lstat(abs);
     return `${s.size}:${s.mtimeMs}`;
   } catch {
     return 'MISSING';

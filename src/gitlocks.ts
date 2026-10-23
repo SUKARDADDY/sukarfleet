@@ -21,11 +21,14 @@
 // fails closed: an answer of "could not tell" keeps the lock, and the next cycle asks again.
 //
 // The holder check is machine-wide and deliberately blunt. A candidate is retired only when, at the
-// moment of checking, (a) no process of this user that we can see into has the lock file open, and
-// (b) no git process that can take locks is running ANYWHERE on the machine, other than the daemon's
-// own children and the subcommands that never hold a lock for more than an instant
-// (mayHoldRepoLocks). Rule (b) is the one that carries the weight; see linuxLockHolders for the one
-// gap rule (a) leaves, and why it is accepted.
+// moment of checking, (a) no process has the lock file open for writing, and (b) no git process that
+// can take locks is running ANYWHERE on the machine, other than the daemon's own children and the
+// subcommands that never hold a lock for more than an instant (mayHoldRepoLocks). (a) catches a
+// holder that keeps its descriptor open, whatever it is; (b) catches a git between writing a lock
+// and renaming it, when it holds the lock with no descriptor open at all. The one thing neither can
+// see is a holder that is not git and keeps a lock with no descriptor open for longer than
+// staleGitLockMin -- there is nothing left on the machine that points from such a process to the
+// lock. See linuxLockHolders for how (a) is answered.
 //
 // Why (a) is not enough: git does not keep a lock's file descriptor open while it holds the lock.
 // `git commit -a` writes the new index into index.lock, CLOSES it, starts the editor, and renames
@@ -64,6 +67,7 @@
 import { link, lstat, mkdir, readdir, readFile, readlink, realpath, rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { dlopen, FFIType, read } from 'bun:ffi';
 import { liveChildPids, log, run } from './util';
 
 export type LockHolderVerdict = 'free' | 'held' | 'unknown';
@@ -428,6 +432,8 @@ export interface HolderCheckOptions {
   includePid?: (pid: number) => boolean | Promise<boolean>;
   // Test seam for the macOS and Windows tools.
   probe?: Probe;
+  // Test seam for the Linux lease probe, to drive the lease-unsupported fallback.
+  leaseProbe?: LeaseProbe;
 }
 
 type Probe = (argv: string[]) => Promise<{ code: number; stdout: string; stderr: string } | null>;
@@ -442,7 +448,7 @@ export function makeLockHolderCheck(opts: HolderCheckOptions = {}): LockHolderCh
     const own = new Set(liveChildPids());
     switch (process.platform) {
       case 'linux':
-        return await linuxLockHolders(lockPath, own, opts.includePid);
+        return await linuxLockHolders(lockPath, own, opts.includePid, opts.leaseProbe ?? kernelLeaseProbe);
       case 'darwin':
         return await macosLockHolders(lockPath, own, probe);
       case 'win32':
@@ -455,24 +461,21 @@ export function makeLockHolderCheck(opts: HolderCheckOptions = {}): LockHolderCh
 
 export const defaultLockHolderCheck: LockHolderCheck = makeLockHolderCheck();
 
-// Linux: /proc, read directly, every process, each one classified by classifyLinuxProcess.
+// Linux.
 //
-// (a) Open files: only processes running as this user are asked -- a lock this user's process
-// created (reapGitLocks never considers any other) is held by a process of this user. "Running as
-// this user" comes from /proc/<pid>/status, not from the owner of /proc/<pid>, which turns to root
-// for a process that made itself non-dumpable. Descriptors are read with readlink, which never
-// touches the filesystem they point into (a stat could hang on a dead FUSE or NFS mount, and this
-// runs over every process); only a descriptor whose name ends in the lock's own file name is then
-// stat'ed, to match it by (device, inode) even when it was opened through another path or mount
-// namespace.
+// (a) "Does anything have the lock open for writing" is asked of the kernel, not worked out from
+// /proc. A read lease (fcntl F_SETLEASE, F_RDLCK) on a descriptor opened read-only is granted only
+// when no process on the machine has the file open for writing -- any process, any mount namespace,
+// dumpable or not -- and git's lockfile.c always opens a lock O_RDWR|O_CREAT|O_EXCL. The lease is
+// released and the descriptor closed at once (kernelLeaseProbe). Walking /proc/<pid>/fd cannot give
+// that answer: a non-dumpable process (`(sd-pam)` under every `systemd --user`, ssh-agent, most
+// Electron apps, or a writer that chose to be) hides its descriptors even from its own user, and a
+// review probe showed exactly such a writer losing its lock mid-write.
 //
-// A process whose descriptors cannot be read -- a non-dumpable one: `(sd-pam)` under every
-// `systemd --user`, ssh-agent, most Electron apps -- does NOT block a repair. Counting it did, and it
-// meant a Linux user session never repaired anything. Rule (b) does not depend on reading
-// descriptors, so a git is caught whether its descriptors are readable or not. The accepted gap is a
-// non-dumpable process that is NOT git holding a git lock file open for longer than staleGitLockMin.
-// Only git implementations open .git/*.lock, and the library ones (libgit2, JGit) hold a lock for a
-// moment, so a lock untouched for that long whose only holder is such a process has a hung holder.
+// Where the filesystem has no leases (NFS, many FUSE and overlay mounts) or they are switched off
+// (fs.leases-enable=0), the scan falls back to walking descriptors, and there a same-user process
+// whose descriptors cannot be read answers 'unknown'. On such a filesystem a machine running any
+// non-dumpable process never repairs a lock on its own; that is the price of not guessing.
 //
 // (b) A git is recognised by its command name (comm, readable for every process) or argv[0], and its
 // subcommand read from cmdline split on NUL, never on whitespace (gitLockCapable). A git whose
@@ -481,13 +484,16 @@ export const defaultLockHolderCheck: LockHolderCheck = makeLockHolderCheck();
 async function linuxLockHolders(
   lockPath: string,
   own: Set<number>,
-  includePid?: (pid: number) => boolean | Promise<boolean>,
+  includePid: ((pid: number) => boolean | Promise<boolean>) | undefined,
+  leaseProbe: LeaseProbe,
 ): Promise<LockHolderVerdict> {
+  const lease = leaseProbe(lockPath);
+  if (lease === 'writer') return 'held';
   let pids: string[];
-  let lock: LinuxLockRef;
+  let lock: LinuxLockRef | null = null;
   try {
     pids = (await readdir('/proc')).filter((d) => /^\d+$/.test(d));
-    lock = await linuxLockRef(lockPath);
+    if (lease === 'unsupported') lock = await linuxLockRef(lockPath);
   } catch {
     return 'unknown';
   }
@@ -498,10 +504,93 @@ async function linuxLockHolders(
     if (includePid && !(await includePid(Number(pid)))) continue;
     const cls = await classifyLinuxProcess(Number(pid), lock, own);
     if (cls === 'git-may-lock' || cls === 'holds-lock') return 'held';
-    if (cls === 'unreadable-identity') verdict = 'unknown';
+    if (cls === 'unreadable-identity' || cls === 'unreadable-fds') verdict = 'unknown';
   }
   return verdict;
 }
+
+export type LeaseVerdict = 'no-writer' | 'writer' | 'unsupported';
+export type LeaseProbe = (lockPath: string) => LeaseVerdict;
+
+// Linux's fcntl constants, from <asm-generic/fcntl.h> and <asm-generic/errno-base.h>, which x86_64,
+// arm64 and riscv64 all use unchanged (checked against the x86_64 headers, which include the
+// generic file verbatim). Other architectures redefine some of them, so there the probe reports
+// 'unsupported' rather than pass a flag that means something else.
+const LINUX_GENERIC_ARCHES = new Set(['x64', 'arm64', 'riscv64']);
+const O_RDONLY = 0;
+const O_NONBLOCK = 0o4000;
+const O_CLOEXEC = 0o2000000;
+const F_SETLEASE = 1024; // F_LINUX_SPECIFIC_BASE + 0
+const F_RDLCK = 0;
+const F_UNLCK = 2;
+const EAGAIN = 11;
+const ENOENT = 2;
+
+interface LibcLease {
+  open: (path: Uint8Array, flags: number, mode: number) => number;
+  fcntl: (fd: number, cmd: number, arg: number) => number;
+  close: (fd: number) => number;
+  errno: () => number;
+}
+
+let libcLease: LibcLease | null | undefined;
+
+// bun:ffi straight into libc: no compiler, no native module, no new dependency. Loaded on first use
+// and never again; a libc that cannot be opened leaves the probe permanently 'unsupported'.
+function loadLibcLease(): LibcLease | null {
+  if (libcLease !== undefined) return libcLease;
+  libcLease = null;
+  if (process.platform !== 'linux' || !LINUX_GENERIC_ARCHES.has(process.arch)) return null;
+  {
+    for (const name of ['libc.so.6', 'libc.so']) {
+      try {
+        const lib = dlopen(name, {
+          open: { args: [FFIType.ptr, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+          fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+          close: { args: [FFIType.i32], returns: FFIType.i32 },
+          __errno_location: { args: [], returns: FFIType.ptr },
+        });
+        libcLease = {
+          open: (path, flags, mode) => lib.symbols.open(path, flags, mode),
+          fcntl: (fd, cmd, arg) => lib.symbols.fcntl(fd, cmd, arg),
+          close: (fd) => lib.symbols.close(fd),
+          errno: () => {
+            const p = lib.symbols.__errno_location();
+            return p === null ? -1 : read.i32(p, 0);
+          },
+        };
+        return libcLease;
+      } catch {
+        // try the next name
+      }
+    }
+  }
+  return null;
+}
+
+// Every answer it can get wrong lands on the safe side: a misread EAGAIN is 'unsupported' (the
+// fail-closed fallback), and any other misread errno is 'unsupported' too. Only a granted lease is
+// 'no-writer'.
+export const kernelLeaseProbe: LeaseProbe = (lockPath) => {
+  const libc = loadLibcLease();
+  if (libc === null) return 'unsupported';
+  const fd = libc.open(Buffer.from(`${lockPath}\0`), O_RDONLY | O_NONBLOCK | O_CLOEXEC, 0);
+  if (fd < 0) {
+    const e = libc.errno();
+    // EAGAIN on open: somebody holds a lease of their own on it. ENOENT: released meanwhile, and
+    // there is nothing left to reap. Neither is a licence to remove anything.
+    return e === EAGAIN || e === ENOENT ? 'writer' : 'unsupported';
+  }
+  try {
+    if (libc.fcntl(fd, F_SETLEASE, F_RDLCK) === 0) {
+      libc.fcntl(fd, F_SETLEASE, F_UNLCK);
+      return 'no-writer';
+    }
+    return libc.errno() === EAGAIN ? 'writer' : 'unsupported';
+  } finally {
+    libc.close(fd);
+  }
+};
 
 export interface LinuxLockRef {
   name: string;
@@ -515,15 +604,21 @@ export async function linuxLockRef(lockPath: string): Promise<LinuxLockRef> {
 
 // How one process bears on one lock. Exported so a test can check the production classification of
 // a specific process against the real process table, which a whole-machine verdict cannot pin down
-// on a machine where other things run git.
+// on a machine where other things run git. With `lock` null (the lease answered (a)) only rule (b)
+// is asked; with a lock (the fallback) the process's descriptors are read too.
 export type LinuxProcessClass =
   | 'gone' // exited while we looked
   | 'git-may-lock' // a git that can hold a lock, not one of ours: blocks every repair
   | 'holds-lock' // has this very lock file open
   | 'unreadable-identity' // comm unreadable: might be a git, no telling
-  | 'other'; // none of the above, including a process whose descriptors cannot be read
+  | 'unreadable-fds' // fallback only: a process of this user whose descriptors cannot be read
+  | 'other';
 
-export async function classifyLinuxProcess(pid: number, lock: LinuxLockRef, own: ReadonlySet<number>): Promise<LinuxProcessClass> {
+export async function classifyLinuxProcess(
+  pid: number,
+  lock: LinuxLockRef | null,
+  own: ReadonlySet<number>,
+): Promise<LinuxProcessClass> {
   const base = `/proc/${pid}`;
   const gone = async () => !(await exists(base));
   let comm: string;
@@ -540,7 +635,14 @@ export async function classifyLinuxProcess(pid: number, lock: LinuxLockRef, own:
     if (await gone()) return 'gone';
   }
   if (!own.has(pid) && isGitName(comm, argv) && gitLockCapable(comm, argv)) return 'git-may-lock';
+  if (lock === null) return 'other';
 
+  // The fallback descriptor walk. Only processes running as this user: reapGitLocks never considers
+  // a lock another uid created. "Running as this user" comes from /proc/<pid>/status, not from the
+  // owner of /proc/<pid>, which turns to root for a non-dumpable process. Descriptors are read with
+  // readlink, which never touches the filesystem they point into (a stat could hang on a dead FUSE
+  // or NFS mount); only one whose name ends in the lock's own file name is stat'ed, to match it by
+  // (device, inode) whatever path or mount namespace it was opened through.
   const uid = typeof process.getuid === 'function' ? process.getuid() : null;
   if (uid !== null) {
     try {
@@ -554,7 +656,7 @@ export async function classifyLinuxProcess(pid: number, lock: LinuxLockRef, own:
   try {
     fds = await readdir(`${base}/fd`);
   } catch {
-    return (await gone()) ? 'gone' : 'other'; // non-dumpable: see the accepted gap above
+    return (await gone()) ? 'gone' : 'unreadable-fds';
   }
   for (const fd of fds) {
     let target: string;

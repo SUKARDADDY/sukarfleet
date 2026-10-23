@@ -138,40 +138,43 @@ Three things now stop that from happening or clear it up.
   the same tick.
 
 "No live process can own it" is a machine-wide rule, and a blunt one. A lock is removed only when no
-process of yours that the daemon can see into has the lock file open, and no git that can take
-locks is running anywhere on the machine, apart from the daemon's own git steps. A git is recognised
-by its command name even if it renamed its `argv[0]`, and then counts as able to take locks. Read-only commands like `log`, `diff` and `show`, remote and credential helpers,
-`upload-pack`, `fsmonitor--daemon` and `cat-file --batch` don't count, so a pager left open doesn't
-block the repair. `status` does count.
+process on the machine has the lock file open for writing, and no git that can take locks is running
+anywhere on the machine, apart from the daemon's own git steps. A git is recognised by its command
+name even if it renamed its `argv[0]`, and then counts as able to take locks. Read-only commands like
+`log`, `diff` and `show`, remote and credential helpers, `upload-pack`, `fsmonitor--daemon` and
+`cat-file --batch` don't count, so a pager left open doesn't block the repair. `status` does count.
 
-"Nobody has it open" alone would not be enough. `git commit -a` closes `index.lock` before it
-starts your editor and keeps the lock until the editor exits, with no file descriptor open on it.
-And working out which repository a running git is using, from its paths, turned out to be
-guesswork: review found a symlinked or relative `--git-dir`, `GIT_DIR` in the environment, a linked
-worktree, a bind mount in a sandbox and a path with spaces, and each one fooled it into deleting a
-live lock. So the daemon no longer guesses.
+Both halves are needed. git opens every lock read-write, so a holder with the lock open is caught by
+the first. But `git commit -a` closes `index.lock` before it starts your editor and keeps the lock
+until the editor exits, with no file open on it, and only the second catches that. Working out
+which repository a running git is using, from its paths, turned out to be guesswork: review found a
+symlinked or relative `--git-dir`, `GIT_DIR` in the environment, a linked worktree, a bind mount in a
+sandbox and a path with spaces, and each one fooled it into deleting a live lock. So the daemon no
+longer guesses.
 
-There is one accepted gap. Some processes hide their open files even from their own user: `(sd-pam)`
-under every `systemd --user`, `ssh-agent`, most Electron apps. Treating them as holders meant a Linux
-desktop never repaired a lock at all, so they are ignored. The gap is a process like that, which is
-not git, holding a git lock file open for longer than `staleGitLockMin`. Only git implementations open
-`.git/*.lock`, and library ones such as libgit2 and JGit hold a lock for a moment, so a lock untouched
-that long whose only holder is such a process has a hung holder. Any git is still caught by name,
-whether its open files can be read or not.
+On Linux, "open for writing" is asked of the kernel. The daemon opens the lock read-only and asks
+for a read lease (`fcntl F_SETLEASE`), which the kernel grants only when no process anywhere has the
+file open for writing, whichever user or mount namespace it runs in and whether or not it hides its
+open files. The lease is dropped straight away. Filesystems without leases (NFS, many FUSE and
+overlay mounts, or `fs.leases-enable=0`) fall back to reading every process's open files from
+`/proc`. There a process of yours whose open files can't be read, such as `(sd-pam)` under
+`systemd --user`, `ssh-agent` or most Electron apps, counts as a possible holder. So on such a
+filesystem a machine running any of those never clears a lock on its own.
+
+What nothing can see is a holder that is not git and keeps a lock with no file open for longer than
+`staleGitLockMin`. Nothing on the machine points from such a process to the lock.
 
 The cost is time. A long-lived git anywhere on the machine, such as a commit in some other repo
 waiting on its editor, holds off every repair until it exits. IDE `git status` loops are short, so
 there are gaps between them, and each sync cycle asks again.
 
-On Linux the daemon reads all of this from `/proc`, using `readlink` on open files so a dead network
-mount can't hang the check. On macOS it uses `lsof` and `ps`. Because `ps` joins arguments with
-spaces, it only trusts a git's subcommand when the command line starts with exactly the git it ran
-(plain `git`, or the full path an IDE uses) followed by the subcommand. Any other git counts as a
-holder. On Windows it waits until no `git.exe` other
-than its own is running, and a lock Windows refuses to rename counts as in use. That can't tell a
-resident `git fsmonitor--daemon` from a real holder, so a Windows machine running fsmonitor will not
-clear a stale lock on its own. If the check cannot answer, the lock stays and the next cycle asks
-again.
+On macOS the daemon uses `lsof` and `ps`. Because `ps` joins arguments with spaces, it only trusts a
+git's subcommand when the command line starts with exactly the git it ran (plain `git`, or the full
+path an IDE uses) followed by the subcommand. Any other git counts as a holder. On Windows it waits
+until no `git.exe` other than its own is running, and a lock Windows refuses to rename counts as in
+use. That can't tell a resident `git fsmonitor--daemon` from a real holder, so a Windows machine
+running fsmonitor will not clear a stale lock on its own. If the check cannot answer, the lock stays
+and the next cycle asks again.
 
 An empty lock is deleted. A lock with bytes in it is a write that never finished, and git never reads
 it, but it is moved to `.git/sukarfleet-stale-locks/<timestamp>/` rather than deleted, as evidence.

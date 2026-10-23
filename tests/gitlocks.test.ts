@@ -4,21 +4,23 @@
 // (a stale lock in a real cycle, a human's commit, a held descriptor) live in syncer.test.ts.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   classifyLinuxProcess,
   defaultLockHolderCheck,
   gitLockCapable,
+  kernelLeaseProbe,
   linuxLockRef,
   listGitLocks,
+  makeLockHolderCheck,
   macosLockHolders,
   mayHoldRepoLocks,
   reapGitLocks,
   resolveGitDirs,
 } from '../src/gitlocks';
-import { testScopedLockHolderCheck } from './support/proc-scope';
+import { isInTestTree, testScopedLockHolderCheck } from './support/proc-scope';
 import { run } from '../src/util';
 
 let base: string;
@@ -216,82 +218,124 @@ describe('resolveGitDirs and listGitLocks', () => {
 
 describe('the machine-wide holder check', () => {
   // A non-dumpable process: its /proc/<pid>/fd is unreadable even to its own user, as for `(sd-pam)`
-  // under every systemd --user, ssh-agent and most Electron apps. `name` sets its comm.
-  function nonDumpableHolder(lock: string, name: string | null) {
-    const rename = name === null ? '' : `ctypes.CDLL(None).prctl(15, ctypes.c_char_p(b"${name}"), 0, 0, 0); `;
-    return Bun.spawn(
-      [
-        'python3',
-        '-c',
-        `import ctypes,sys,time; ${rename}ctypes.CDLL(None).prctl(4,0,0,0,0); f=open(sys.argv[1]); print("ready",flush=True); time.sleep(30)`,
-        lock,
-      ],
-      { stdout: 'pipe', stderr: 'ignore' },
-    );
+  // under every systemd --user, ssh-agent and most Electron apps. `name` sets its comm. `mode` 'w'
+  // opens the lock the way git does (read-write) and, on a line from stdin, finishes the way git
+  // does: renames the lock over its target.
+  function nonDumpable(lock: string, opts: { name?: string; mode: 'r' | 'w' }) {
+    const rename = opts.name ? `ctypes.CDLL(None).prctl(15, ctypes.c_char_p(b"${opts.name}"), 0, 0, 0); ` : '';
+    const body =
+      opts.mode === 'w'
+        ? 'fd=os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_EXCL); os.write(fd, b"new index"); print("ready",flush=True); sys.stdin.readline(); os.rename(sys.argv[1], sys.argv[1][:-5]); print("renamed",flush=True)'
+        : 'f=open(sys.argv[1]); print("ready",flush=True); time.sleep(30)';
+    return Bun.spawn(['python3', '-c', `import ctypes,os,sys,time; ${rename}ctypes.CDLL(None).prctl(4,0,0,0,0); ${body}`, lock], {
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
   }
 
-  async function ready(p: ReturnType<typeof nonDumpableHolder>): Promise<void> {
+  async function line(p: ReturnType<typeof nonDumpable>): Promise<string> {
     const reader = p.stdout.getReader();
-    await reader.read();
+    const { value } = await reader.read();
     reader.releaseLock();
+    return new TextDecoder().decode(value ?? new Uint8Array()).trim();
   }
 
   const python = process.platform === 'linux' && Bun.spawnSync(['python3', '-c', '']).exitCode === 0;
 
-  test.skipIf(!python)('a non-dumpable process that is not git does not block a repair (the accepted gap)', async () => {
+  // The review probe: a hung writer is not an orphan. It can wake up, and when it does it renames
+  // the lock into place; if the lock was taken from under it, the rename fails and its write is lost.
+  test.skipIf(!python)('a non-dumpable writer mid-write keeps its lock, and its rename succeeds afterwards', async () => {
+    const dir = await repo();
+    const lock = join(dir, '.git', 'index.lock');
+    const writer = nonDumpable(lock, { mode: 'w' });
+    try {
+      // Created the way git's lockfile.c creates a lock: O_RDWR | O_CREAT | O_EXCL.
+      expect(await line(writer)).toBe('ready');
+    } catch (err) {
+      writer.kill('SIGKILL');
+      throw err;
+    }
+    await utimes(lock, (Date.now() - 20 * 60_000) / 1000, (Date.now() - 20 * 60_000) / 1000);
+    const repairs = await reapGitLocks(dir, { olderThanMs: 60_000, reason: 'stale', stamp: 't', holderCheck: testScopedLockHolderCheck });
+    expect(repairs).toEqual([]);
+    writer.stdin.write('go\n');
+    writer.stdin.end();
+    expect(await writer.exited).toBe(0);
+    expect(await readFile(join(dir, '.git', 'index'), 'utf8')).toBe('new index');
+  });
+
+  test.skipIf(!python)('a non-dumpable process that only reads the lock is not a writer and does not block', async () => {
     const dir = await repo();
     const lock = join(dir, '.git', 'index.lock');
     await writeFile(lock, '');
-    const holder = nonDumpableHolder(lock, null);
+    const reader = nonDumpable(lock, { mode: 'r' });
     try {
-      await ready(holder);
+      expect(await line(reader)).toBe('ready');
       const repairs = await reapGitLocks(dir, { olderThanMs: 0, reason: 'stale', stamp: 't', holderCheck: testScopedLockHolderCheck });
       expect(repairs.map((r) => r.lock)).toEqual([join('.git', 'index.lock')]);
     } finally {
-      holder.kill('SIGKILL');
-      await holder.exited;
+      reader.kill('SIGKILL');
+      await reader.exited;
     }
   });
 
-  test.skipIf(!python)('a non-dumpable process whose command name is git blocks it, unreadable fds or not', async () => {
+  test.skipIf(!python)('a non-dumpable process whose command name is git blocks it, writer or not', async () => {
     const dir = await repo();
     const lock = join(dir, '.git', 'index.lock');
     await writeFile(lock, '');
-    const holder = nonDumpableHolder(lock, 'git');
+    const gitNamed = nonDumpable(lock, { name: 'git', mode: 'r' });
     try {
-      await ready(holder);
+      expect(await line(gitNamed)).toBe('ready');
       const repairs = await reapGitLocks(dir, { olderThanMs: 0, reason: 'stale', stamp: 't', holderCheck: testScopedLockHolderCheck });
       expect(repairs).toEqual([]);
       expect(await exists(lock)).toBe(true);
     } finally {
-      holder.kill('SIGKILL');
-      await holder.exited;
+      gitNamed.kill('SIGKILL');
+      await gitNamed.exited;
     }
   });
 
   // Unscoped: the production check against this machine's real process table. A Linux user session
-  // always has non-dumpable processes of its own; counting them as holders made every verdict
-  // 'unknown' and no lock was ever repaired. The whole-machine verdict may be 'held' if something on
-  // this machine is running git right now, so that part asserts only "not unknown"; the spawned
-  // process's own classification is asserted exactly.
-  test.skipIf(!python)('production check, real process table: a non-dumpable non-git process is not a holder', async () => {
+  // always has non-dumpable processes of its own; the lease does not care, so the verdict is never
+  // 'unknown' here. It may be 'held' if something on this machine is running git right now, so the
+  // whole-machine verdict asserts only "not unknown"; the lease itself is asserted exactly.
+  test.skipIf(process.platform !== 'linux')('production check, real machine: a lock nobody writes is lease-free, and the verdict is never unknown', async () => {
     const dir = await repo();
     const lock = join(dir, '.git', 'index.lock');
     await writeFile(lock, '');
-    const holder = nonDumpableHolder(lock, null);
-    const gitNamed = nonDumpableHolder(lock, 'git');
+    expect(kernelLeaseProbe(lock)).toBe('no-writer');
+    expect(await defaultLockHolderCheck(lock)).not.toBe('unknown');
+    const writer = Bun.spawn(['sh', '-c', 'exec 3<>"$1"; echo ready; exec sleep 30', 'sh', lock], { stdout: 'pipe' });
     try {
-      await ready(holder);
-      await ready(gitNamed);
-      const ref = await linuxLockRef(lock);
-      expect(await classifyLinuxProcess(holder.pid, ref, new Set())).toBe('other');
-      expect(await classifyLinuxProcess(gitNamed.pid, ref, new Set())).toBe('git-may-lock');
-      expect(await defaultLockHolderCheck(lock)).not.toBe('unknown');
+      const r = writer.stdout.getReader();
+      await r.read();
+      r.releaseLock();
+      expect(kernelLeaseProbe(lock)).toBe('writer');
+      expect(await defaultLockHolderCheck(lock)).toBe('held');
     } finally {
-      holder.kill('SIGKILL');
-      gitNamed.kill('SIGKILL');
-      await holder.exited;
-      await gitNamed.exited;
+      writer.kill('SIGKILL');
+      await writer.exited;
+    }
+  });
+
+  // Where leases are not available (NFS, FUSE, overlay, fs.leases-enable=0) the descriptor walk is
+  // all there is, and a process whose descriptors cannot be read keeps every lock.
+  test.skipIf(!python)('without lease support, an unreadable same-user process fails closed', async () => {
+    const dir = await repo();
+    const lock = join(dir, '.git', 'index.lock');
+    await writeFile(lock, '');
+    const noLeases = makeLockHolderCheck({ includePid: isInTestTree, leaseProbe: () => 'unsupported' });
+    expect(await noLeases(lock)).toBe('free');
+    const hidden = nonDumpable(lock, { mode: 'r' });
+    try {
+      expect(await line(hidden)).toBe('ready');
+      expect(await noLeases(lock)).toBe('unknown');
+      expect(await classifyLinuxProcess(hidden.pid, await linuxLockRef(lock), new Set())).toBe('unreadable-fds');
+      expect(await classifyLinuxProcess(hidden.pid, null, new Set())).toBe('other');
+    } finally {
+      hidden.kill('SIGKILL');
+      await hidden.exited;
     }
   });
 

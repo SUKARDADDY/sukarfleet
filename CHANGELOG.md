@@ -53,7 +53,8 @@ other. Anything else has to be read here first.
   also removes a lock older than `thresholds.staleGitLockMin` (new, default 10 minutes) when no live
   process can still own it, and then carries on in the same tick. A lock someone still holds, such as
   a `git commit` waiting on its editor, is left alone. The rule is machine-wide: nothing is removed
-  while any lock-capable git other than the daemon's own is running anywhere on the machine. A cycle
+  while anything has the lock open for writing (asked of the kernel with a lease on Linux) or any
+  lock-capable git other than the daemon's own is running anywhere on the machine. A cycle
   blocked by a lock, or by a merge someone left open, is deferred instead of reported as a critical
   error, and a merge the daemon itself left half-done is aborted and redone, never committed. See
   [`docs/OPERATIONS.md`](docs/OPERATIONS.md#an-orphaned-git-lock-clears-itself).

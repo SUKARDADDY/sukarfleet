@@ -1271,8 +1271,9 @@ test.skipIf(process.platform !== 'linux')('an old lock a live process holds open
   const lock = join(dirA, '.git', 'index.lock');
   await writeFile(lock, '');
   await ageFile(lock, OLD_LOCK_MS);
-  // Not git, and not working in the repo: only the open descriptor marks it as the holder.
-  const holder = Bun.spawn(['sh', '-c', 'exec 3<"$1"; exec sleep 30', 'sh', lock], { cwd: base, stdio: ['ignore', 'ignore', 'ignore'] });
+  // Not git, and not working in the repo: only the descriptor, open for writing as git opens every
+  // lock, marks it as the holder.
+  const holder = Bun.spawn(['sh', '-c', 'exec 3<>"$1"; exec sleep 30', 'sh', lock], { cwd: base, stdio: ['ignore', 'ignore', 'ignore'] });
   try {
     await waitFor(async () => {
       try {
@@ -2121,4 +2122,41 @@ test.skipIf(process.platform !== 'linux')('a git whose argv[0] was renamed (exec
     renamed.kill('SIGTERM');
     await renamed.exited;
   }
+});
+
+// --- round 4 ----------------------------------------------------------------------------
+test.skipIf(process.platform === 'win32')('a dangling symlink a postMerge regenerator writes is committed, not dropped as vanished', async () => {
+  const { dirA, dirB, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' }, [], [['ln', '-sf', 'future-target', 'generated-link']]);
+  await writeFile(join(dirB, 'a.txt'), 'two');
+  await git(dirB, ['commit', '-q', '-am', 'beta edit']);
+
+  await syncA.syncOnce(repoA);
+
+  expect((await git(dirA, ['ls-tree', '--name-only', 'HEAD'])).stdout.split('\n').filter(Boolean).sort()).toEqual(['a.txt', 'generated-link']);
+  expect((await git(dirA, ['status', '--porcelain'])).stdout.trim()).toBe('');
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+});
+
+test.skipIf(process.platform === 'win32')('a dangling symlink created in the worktree is auto-committed like any file', async () => {
+  const { dirA, syncA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await symlink('not-there-yet', join(dirA, 'link'));
+
+  await syncA.syncOnce(repoA);
+
+  expect((await git(dirA, ['ls-tree', '--name-only', 'HEAD'])).stdout).toContain('link');
+  expect((await git(dirA, ['status', '--porcelain'])).stdout.trim()).toBe('');
+});
+
+test('a commit git itself refuses (empty author name) stays a syncError even with a passing hook installed', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await installHook(dirA, 'pre-commit', 'exit 0');
+  await git(dirA, ['config', 'user.name', '']);
+  await writeFile(join(dirA, 'a.txt'), 'two');
+
+  await syncA.syncOnce(repoA);
+
+  const err = recA.stats.at(-1)!.syncError;
+  expect(err).not.toBeNull();
+  expect(err!.startsWith(SYNC_DEFERRED_PREFIX)).toBe(false);
+  expect(err).toContain('empty ident name');
 });
