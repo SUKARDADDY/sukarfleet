@@ -116,6 +116,11 @@ refuses to give.
 So: the seam says **unsupported** out loud, and sync is unaffected. Run the sync half on Windows and
 drive admin from a Linux machine.
 
+Native Windows account commands use the separate MCP SSH access lane: register an existing
+key and host-key pin with `platform: "windows"`, then use `fleet.run`. It uses PowerShell and
+a Windows Job Object for bounded execution without sudo or a target installation. It does
+not elevate; `asRoot:true` is refused. See the native access section in the README.
+
 **Installing: two scopes, one EXE.** `sukarfleet-setup-windows-x86_64.exe` from the release asks
 which one you want, and they install different things.
 

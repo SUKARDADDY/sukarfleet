@@ -152,6 +152,19 @@ background children. Exit 124 may mean the deadline expired or the command itsel
 is never automatically retried. Both JSON argv and the shell-quoted SSH command are limited
 to 64 KiB. Quote expansion can make a command exceed that bound even when its original argv fits.
 
+Windows targets register with `platform: "windows"`. `fleet.run` uses the existing SSH account
+and key, Windows PowerShell 5.1 and a kill-on-close Job Object. No target installation or
+authentication change is needed. The child joins the job while suspended, before it can launch
+descendants. The deadline and normal completion both terminate the job's remaining processes.
+Arguments travel as base64 JSON on stdin, outside the remote shell's command line. Windows limits
+the child command line to 32,766 characters. Invoke `.exe` or `.com` programs; use `cmd.exe`
+explicitly for batch files. `asRoot:true` is refused on Windows. This is account access, with
+the account's existing rights, rather than the sudo-based `fleet.admin_run` lane. A full node
+can also have a matching SSH access registration; its mesh pairing and sync stay in place.
+An explicit completion record preserves the child's exit code even when the Windows SSH shell
+maps nonzero exits to 1. The origin retains that bounded record after output truncation. A missing
+record or a failed SSH connection leaves completion unknown and is never automatically retried.
+
 `fleet.screenshot` uses macOS screencapture and returns a PNG capped at 1600 pixels on its
 longest edge. macOS must grant Screen Recording to the responsible capture process, and
 desktop interaction separately needs Accessibility or Automation permission. A successful

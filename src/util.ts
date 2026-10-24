@@ -31,6 +31,9 @@ export interface RunOptions {
   // collectBytes: cancelling the reader early is what the pipe-wedge guards below exist to avoid.
   // A value <= 0 captures nothing rather than falling back to unlimited (fail closed).
   maxCaptureBytes?: number;
+  // Retain a separate bounded stderr suffix for transport completion records, even when the
+  // normal prefix capture is truncated. Does not change the returned stderr prefix.
+  stderrTailBytes?: number;
   // Called after THIS runner killed the child with SIGKILL and it died of it, before the result is
   // returned -- either the timeout escalation below or drainChildren's last resort. SIGKILL is the
   // one signal a child cannot clean up after: git removes its own .lock files on SIGTERM, and on
@@ -57,6 +60,7 @@ export interface RunBytesResult {
   code: number;
   stdout: Uint8Array;
   stderr: string;
+  stderrTail?: string;
   truncated?: boolean;
   // A local deadline or signal supplies no exit status from a remote transport.
   timedOut?: boolean;
@@ -77,6 +81,7 @@ function unrefTimer(t: ReturnType<typeof setTimeout>): void {
 interface CollectedBytes {
   bytes: Uint8Array;
   truncated: boolean;
+  tail?: Uint8Array;
 }
 
 // Incremental stream collector whose pending read can be cancelled. Unlike
@@ -90,6 +95,7 @@ interface CollectedBytes {
 function collectBytes(
   stream: ReadableStream<Uint8Array>,
   maxBytes?: number,
+  tailBytes = 0,
 ): {
   done: Promise<CollectedBytes>;
   cancel: () => void;
@@ -99,11 +105,13 @@ function collectBytes(
     const chunks: Uint8Array[] = [];
     let kept = 0;
     let truncated = false;
+    let tail: Uint8Array = new Uint8Array();
     try {
       for (;;) {
         const { value, done: eof } = await reader.read();
         if (eof) break;
         if (!value) continue;
+        if (tailBytes > 0) tail = Uint8Array.from(Buffer.concat([tail, value]).subarray(-tailBytes));
         if (maxBytes === undefined) {
           chunks.push(value);
           continue;
@@ -133,7 +141,7 @@ function collectBytes(
       out.set(c, off);
       off += c.length;
     }
-    return { bytes: out, truncated };
+    return { bytes: out, truncated, ...(tailBytes > 0 ? { tail } : {}) };
   })();
   return {
     done,
@@ -224,14 +232,8 @@ export async function runBytes(argv: string[], opts: RunOptions = {}): Promise<R
   liveChildren.add(child);
 
   try {
-    const stdin = proc.stdin;
-    if (opts.stdin !== undefined && stdin) {
-      stdin.write(opts.stdin);
-      await stdin.end();
-    }
-
     const out = collectBytes(proc.stdout, opts.maxCaptureBytes);
-    const err = collectBytes(proc.stderr, opts.maxCaptureBytes);
+    const err = collectBytes(proc.stderr, opts.maxCaptureBytes, opts.stderrTailBytes);
 
     let timedOut = false;
     const termTimer = setTimeout(() => {
@@ -244,6 +246,19 @@ export async function runBytes(argv: string[], opts: RunOptions = {}): Promise<R
       child.forceKill();
     }, timeoutMs + killGraceMs);
     unrefTimer(killTimer);
+
+    // Start draining output and arm the deadline before flushing input. A target that never
+    // reads stdin must not wedge a large Windows payload before its timeout even exists.
+    const stdin = proc.stdin;
+    if (opts.stdin !== undefined && stdin) {
+      try {
+        stdin.write(opts.stdin);
+        await stdin.end();
+      } catch {
+        // A process that exits or is killed may close stdin before consuming it. Its captured
+        // result below, including any deadline/signal, still describes what actually happened.
+      }
+    }
 
     const exitCode = await proc.exited;
     clearTimeout(termTimer);
@@ -273,6 +288,7 @@ export async function runBytes(argv: string[], opts: RunOptions = {}): Promise<R
       stdout: stdoutRes.bytes,
       stderr: new TextDecoder().decode(stderrRes.bytes),
     };
+    if (stderrRes.tail) result.stderrTail = new TextDecoder().decode(stderrRes.tail);
     if (timedOut) result.timedOut = true;
     if (proc.signalCode) result.signalCode = proc.signalCode;
     // Left absent (not `false`) with no cap, so the uncapped result object keeps its historical shape.
