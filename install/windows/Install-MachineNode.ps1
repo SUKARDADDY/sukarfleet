@@ -590,8 +590,11 @@ function Get-AdoptionPlan {
     if (-not (Test-Path -LiteralPath (Join-Path $path '.git'))) {
       Write-Die "repo '$name' is listed at $path, which is not a git repository. Fix the config or remove the entry, then re-run. Nothing was stopped and nothing was moved."
     }
-    $dirty = @(Get-AdoptedRepoChanges -RepoPath $path)
-    if ($null -eq $dirty -or ($dirty.Count -eq 1 -and $dirty[0] -eq $AdoptGitFailed)) {
+    # Not wrapped in @(...): the function already returns one array (its unary comma keeps an
+    # empty one an array), and a second wrapping turns a clean repository's empty answer into one
+    # element, which reads as one uncommitted change.
+    $dirty = Get-AdoptedRepoChanges -RepoPath $path
+    if ($dirty.Count -eq 1 -and $dirty[0] -eq $AdoptGitFailed) {
       Write-Die "git could not read the state of '$name' at $path. Nothing was stopped and nothing was moved."
     }
     $plan = Get-RepoAdoptionPlan -RepoPath $path -ProfileDir $profileDir
