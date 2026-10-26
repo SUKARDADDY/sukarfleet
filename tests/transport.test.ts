@@ -883,6 +883,22 @@ describe('Transport route audit', () => {
     expect(t.unroutedPeers().map((u) => u.peerId)).toEqual(['300']);
   });
 
+  test('a route that comes back clears the alarm even when the peer center is unreadable', async () => {
+    const state: { peers: string; center: string | null } = { peers: peerListJson(GAMMA_LOST), center: centerJson(CENTER_GAMMA_LOST) };
+    const t = new Transport(defaultConfig('alpha'), { runner: auditRunner(state) });
+    for (let i = 1; i <= ROUTE_MISS_POLLS; i++) await t.pollOnce(i * 1000);
+    expect(t.unroutedPeers().map((u) => u.peerId)).toEqual(['300']);
+    state.peers = peerListJson(ALL_ROUTED);
+    state.center = null;
+    await t.pollOnce(9000);
+    expect(t.unroutedPeers()).toEqual([]);
+    // And the streak is gone too: one later miss starts from zero.
+    state.peers = peerListJson(GAMMA_LOST);
+    state.center = centerJson(CENTER_GAMMA_LOST);
+    await t.pollOnce(10000);
+    expect(t.unroutedPeers()).toEqual([]);
+  });
+
   test('a peer that comes back between polls breaks the streak', async () => {
     const state = { peers: peerListJson(GAMMA_LOST), center: centerJson(CENTER_GAMMA_LOST) };
     const t = new Transport(defaultConfig('alpha'), { runner: auditRunner(state) });

@@ -535,6 +535,11 @@ export class Transport {
         log('warn', 'transport: easytier-cli peer-center output not usable JSON', {});
       }
       this.lastCenter = null;
+      // The peer list alone can still prove a recovery: an id routed again is no longer lost, even
+      // on a poll that cannot read the peer center. Clear it now rather than keeping a critical
+      // alarm up until the next readable poll.
+      for (const id of routedIds) this.routeMissStreak.delete(id);
+      this.confirmedUnrouted = this.confirmedUnrouted.filter((u) => !routedIds.has(u.peerId));
       return;
     }
     this.lastCenter = center;
