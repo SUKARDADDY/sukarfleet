@@ -260,9 +260,10 @@ icacls C:\AI_Agent /T /grant:r "sukarfleet-operators:(OI)(CI)(M)"
 Use the same group as for the token. An account outside it loses both read and write access to that
 tree. Repositories the installer left outside the
 shared root, because they sit under a dot-directory of an adopted profile, carry their own access
-list: apply the same two commands to each of them. The installer rewrites the shared root's access
-list on every run and puts `Users` back with modify, so repeat both `icacls` lines after each
-upgrade.
+list: apply the same two commands to each of them. The installer lays down the shared root's
+access list once, on the first machine-wide install, and records that in
+`C:\ProgramData\sukarfleet\node\shared-root-acl.applied`. Later upgrades leave your list as it is
+and only check the service account's own access, so narrow it once, after the first install.
 
 With the default, every local account is trusted, as stated above, and none of this applies.
 

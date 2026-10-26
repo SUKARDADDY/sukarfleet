@@ -908,8 +908,20 @@ Write-Step "git reads safe.directory $SafeDirectoryGlob from a machine-wide conf
 # Step 6: the shared root
 # ---------------------------------------------------------------------------
 
+# Written once the full shared-root ACL below has been laid down on this machine. From then on the
+# ACL belongs to the administrator: SECURITY.md tells them to take write access away from accounts
+# they exclude, and re-granting BUILTIN\Users Modify on every upgrade would hand those accounts back
+# the ability to make git run their code as the service. Later runs only make sure the service
+# account itself can still write there.
+$SharedRootAclMarker = Join-Path $NodeDir 'shared-root-acl.applied'
+
 function Set-SharedRootAcl {
   param([Parameter(Mandatory)] [string] $Sid)
+  if (Test-Path -LiteralPath $SharedRootAclMarker) {
+    [void] (Grant-SidAccess -Path $SharedRoot -Sid $Sid -Rights 'Modify' -Inherit -What "granting the service account access to $SharedRoot")
+    Write-Note "  $SharedRoot keeps the access list it has; only the service account's access was checked"
+    return
+  }
   Invoke-Icacls -Arguments @($SharedRoot, '/inheritance:r') -What "removing inherited access from $SharedRoot"
   # Not CREATOR OWNER. A file an operator creates in this tree has to stay writable by the
   # daemon, or the first commit after someone edits a file by hand fails on a permission.
@@ -919,6 +931,7 @@ function Set-SharedRootAcl {
     "*${SidUsers}:(OI)(CI)(M)") -What "granting access to $SharedRoot"
   [void] (Grant-SidAccess -Path $SharedRoot -Sid $Sid -Rights 'Modify' -Inherit -What "granting the service account access to $SharedRoot")
   Invoke-Icacls -Arguments @($SharedRoot, '/setowner', "*$SidAdmins") -What "taking ownership of $SharedRoot"
+  Write-Utf8File -Path $SharedRootAclMarker -Content ("shared root access list applied " + (Get-Date -Format o) + "`n")
 }
 
 if (-not (Test-Path -LiteralPath $SharedRoot)) { [void] (New-Item -ItemType Directory -Force -Path $SharedRoot) }
