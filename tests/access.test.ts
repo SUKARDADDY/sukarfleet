@@ -8,7 +8,7 @@ import { defaultConfig, loadConfig, patchConfig } from '../src/config';
 import type { AccessTargetConfig, AuditEntry } from '../src/types';
 import { runBytes } from '../src/util';
 import { createMcpFetchHandler } from '../src/mcp';
-import { WINDOWS_BOOTSTRAP, windowsExitCode } from '../src/windows-access';
+import { WINDOWS_BOOTSTRAP, windowsExitCode, windowsRunPayload } from '../src/windows-access';
 
 const dirs: string[] = [];
 afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
@@ -289,4 +289,15 @@ test('a process that does not consume a large stdin payload still has a working 
   const r = await runBytes(['/bin/sh', '-c', 'exec sleep 10'],
     { stdin: 'x'.repeat(1024 * 1024), timeoutMs: 20, killGraceMs: 20 });
   expect(r.timedOut).toBe(true); expect(Date.now() - began).toBeLessThan(2000);
+});
+
+test('a Windows executable given as a path is resolved literally; a bare name is looked up on PATH', () => {
+  const ps = windowsRunPayload(['C:\\Tools\\[v1]\\tool.exe'], 30, 'r');
+  // A path goes to Get-Item -LiteralPath: wildcard escaping would insert backticks into
+  // C:\Tools\[v1]\tool.exe and look for a file by that altered name.
+  expect(ps).toContain("if($a.IndexOfAny([char[]]'\\/:') -ge 0){$src=(Get-Item -LiteralPath $a");
+  // Only a bare name is escaped, because Get-Command -Name treats it as a pattern.
+  expect(ps).toContain('Get-Command -Name ([System.Management.Automation.WildcardPattern]::Escape($a))');
+  expect(ps).toContain('[FleetJob]::Run($src,');
+  expect(ps).not.toContain('$exe.Source');
 });

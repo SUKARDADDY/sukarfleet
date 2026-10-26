@@ -86,13 +86,14 @@ $p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}')) | 
 Add-Type -TypeDefinition @'
 ${JOB_RUNNER}
 '@
-$exe=Get-Command -Name ([System.Management.Automation.WildcardPattern]::Escape($p.argv[0])) -CommandType Application -ErrorAction Stop | Select-Object -First 1
-if([IO.Path]::GetExtension($exe.Source) -notin @('.exe','.com')){throw 'Use cmd.exe explicitly for batch files'}
+$a=[string]$p.argv[0]
+if($a.IndexOfAny([char[]]'\\/:') -ge 0){$src=(Get-Item -LiteralPath $a -ErrorAction Stop).FullName}else{$src=(Get-Command -Name ([System.Management.Automation.WildcardPattern]::Escape($a)) -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source}
+if([IO.Path]::GetExtension($src) -notin @('.exe','.com')){throw 'Use cmd.exe explicitly for batch files'}
 $rest=New-Object 'System.Collections.Generic.List[string]'
 for($i=1;$i -lt $p.argv.Count;$i++){$rest.Add([string]$p.argv[$i])}
 # The outer SSH shell can collapse nonzero native exits to 1. Emit a completion record only
 # after the job has closed. The origin retains this bounded suffix separately from stderr.
-$code=[FleetJob]::Run($exe.Source,$rest.ToArray(),[int]$p.timeoutSec)
+$code=[FleetJob]::Run($src,$rest.ToArray(),[int]$p.timeoutSec)
 [Console]::Error.WriteLine(([Environment]::NewLine+'FLEET-WINDOWS-'+$p.runId+':'+$code))
 [Environment]::Exit(0)
 `;
