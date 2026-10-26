@@ -101,3 +101,4 @@
 # carry it -- the binary is built from this tree, so its hash cannot exist until
 # the tag does.
 0.1.0  x86_64   SHA256-FILLED-AT-RELEASE  sukarfleet-setup-windows-x86_64.exe
+0.2.0  x86_64   SHA256-FILLED-AT-RELEASE  sukarfleet-setup-windows-x86_64.exe
