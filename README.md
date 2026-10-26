@@ -29,7 +29,7 @@ untried — see [`docs/PLATFORMS.md`](docs/PLATFORMS.md), which is specific abou
 One command, on Debian or Ubuntu:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SUKARDADDY/sukarfleet/v0.1.0/install/get.sh | sh
+curl -fsSL https://raw.githubusercontent.com/SUKARDADDY/sukarfleet/v0.2.0/install/get.sh | sh
 ```
 
 It clones this repository at that tag into `~/.local/share/sukarfleet/app` and runs

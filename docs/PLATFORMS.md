@@ -42,7 +42,7 @@ never, ever appears to succeed.
 **Installing.** One command on Debian or Ubuntu:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SUKARDADDY/sukarfleet/v0.1.0/install/get.sh | sh
+curl -fsSL https://raw.githubusercontent.com/SUKARDADDY/sukarfleet/v0.2.0/install/get.sh | sh
 ```
 
 It clones the tag into `~/.local/share/sukarfleet/app` and runs `install/quickstart.sh`, which

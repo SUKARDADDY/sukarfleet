@@ -12,7 +12,33 @@ other. Anything else has to be read here first.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-26
+
+Every machine in a fleet can now be driven from one agent through MCP: full nodes, machines reached
+over SSH only, and native Windows accounts. Windows gains an installer with a machine-wide service,
+sync heals the stale locks and lost commits that used to need a person, and a mesh peer that loses
+its route on one node is detected and re-announced without a restart. **Wire change:**
+`/pair/hello` accepts an optional `enrollId` (see the enrollment entry below); a hello without one
+is unchanged, so 0.1 and 0.2 machines pair and sync with each other.
+
 ### Added
+
+- **MCP access to machines that run no node.** `fleet.access_register` records an existing SSH
+  account on another machine, with its private key and a pinned host key, and `fleet.run` runs an
+  audited command there with a deadline that ends the whole process group. `fleet.screenshot`
+  returns a macOS machine's screen as an inline PNG, through a GUI permission broker when the login
+  session needs one. These machines sync nothing and are listed apart from full nodes in
+  `fleet.peers`. SSH ignores ambient configuration and forwarding, and a transport failure reports
+  the command's completion as unknown and is never retried.
+- **Native Windows commands through `fleet.run`.** A Windows account registers with
+  `platform: "windows"`. The command runs in Windows PowerShell 5.1 inside a kill-on-close Job
+  Object, so the deadline ends everything it started. Nothing is installed on the target, and
+  `asRoot` is refused because the lane cannot elevate there.
+- **Peer-only Git sync, set up through MCP.** `fleet.repo_add` adopts an existing checkout for sync
+  between machines without a restart, and a fresh macOS machine can be paired and initialised from
+  MCP. A peer-only repository never pushes a branch or a derived `main` to origin, and it syncs on
+  its own loop, so retries in another repository do not hold it up. macOS vets its clock with a
+  read-only SNTP measurement, so auto-commit works there.
 
 - **One-click enrollment, generated from the console.** The Fleet screen has an "Add a machine" card
   that writes a single double-clickable `.cmd` for a Windows machine that is not here yet. It
@@ -224,5 +250,6 @@ First public release. It has run the maintainers' own two-machine fleet daily si
   [`docs/PLATFORMS.md`](docs/PLATFORMS.md) is specific about which seam is which.
 - There is no aarch64 tray build, and the installer says so and prints the web console URL instead.
 
-[Unreleased]: https://github.com/SUKARDADDY/sukarfleet/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/SUKARDADDY/sukarfleet/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/SUKARDADDY/sukarfleet/releases/tag/v0.2.0
 [0.1.0]: https://github.com/SUKARDADDY/sukarfleet/releases/tag/v0.1.0
