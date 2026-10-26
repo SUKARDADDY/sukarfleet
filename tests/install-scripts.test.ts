@@ -533,3 +533,15 @@ describe('uninstall says what it actually took off', () => {
     expect(script).toContain('if [ "${#REMOVED[@]}" -gt 0 ]; then\n  log "stopped and removed');
   });
 });
+
+test('the sukarfleet pins in easytier-pins.txt carry only this tree\'s own version', async () => {
+  const version = (JSON.parse(await Bun.file(join(import.meta.dir, '..', 'package.json')).text()) as { version: string }).version;
+  const pins = await Bun.file(join(import.meta.dir, '..', 'install', 'easytier-pins.txt')).text();
+  const ours = pins
+    .split('\n')
+    .map((l) => l.trim().split(/\s+/))
+    .filter((c) => c.length >= 4 && !c[0]!.startsWith('#') && c[3]!.startsWith('sukarfleet-'));
+  expect(ours.length).toBeGreaterThan(0);
+  // A stale filled line above the current one is what the installers would pick first.
+  expect(ours.filter((c) => c[0] !== version).map((c) => c.join(' '))).toEqual([]);
+});
