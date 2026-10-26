@@ -709,6 +709,7 @@ try {
 # into a browser prompt, one trailing newline so `type` and `cat` both show it on its own line.
 # The file is not rotated on a re-run: the tray and every operator who already pasted it would
 # be locked out by an upgrade.
+$TokenCreated = $false
 if (Test-Path -LiteralPath $TokenFile) {
   Write-Note "console token already at $TokenFile - left as it is, so anyone holding it keeps working"
 } else {
@@ -718,13 +719,25 @@ if (Test-Path -LiteralPath $TokenFile) {
   $token = [Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=')
   Write-Utf8File -Path $TokenFile -Content ($token + "`n")
   $token = $null
+  $TokenCreated = $true
   Write-Step "wrote the console token to $TokenFile"
 }
 # Readable by every account on this machine, and that is the ruling, not an oversight: a
 # machine-wide node is operated by whoever is sitting at the machine. SECURITY.md carries the
 # one icacls line that narrows it to a group instead.
-Invoke-Icacls -Arguments @($TokenFile, '/grant', "*${SidUsers}:(R)") -What "letting local accounts read $TokenFile"
-Write-Note '  every local account can read that file, and so operate this node. Narrow it with the line in SECURITY.md if this machine is shared with someone who should not.'
+# The default is applied only to a token this run created. On a re-run the ACL belongs to the
+# administrator: SECURITY.md tells them to remove BUILTIN\Users from it, and granting Users read
+# again on every upgrade would hand the token back to the accounts they excluded. The service
+# account reads the token through the access the node directory passes down, which
+# Set-NodeDirAcl above has just rewritten; the explicit entry below keeps that read working even
+# if an administrator has cut inheritance on the file.
+if ($TokenCreated) {
+  Invoke-Icacls -Arguments @($TokenFile, '/grant', "*${SidUsers}:(R)") -What "letting local accounts read $TokenFile"
+  Write-Note '  every local account can read that file, and so operate this node. Narrow it with the line in SECURITY.md if this machine is shared with someone who should not.'
+} else {
+  Write-Note '  the token file access list is left as the administrator set it'
+}
+[void] (Grant-SidAccess -Path $TokenFile -Sid $ServiceSid -Rights 'Read' -Soft -What "letting the service account read $TokenFile")
 
 # ---------------------------------------------------------------------------
 # Step 5: git
@@ -1457,7 +1470,12 @@ if (-not $serviceUp -and $ServiceAccount -ne 'NT AUTHORITY\LocalService') {
   # Inheritance is dynamic, so rewriting the two roots reaches everything under them.
   Set-NodeDirAcl -Sid $ServiceSid
   Set-SharedRootAcl -Sid $ServiceSid
-  Invoke-Icacls -Arguments @($TokenFile, '/grant', "*${SidUsers}:(R)") -What "letting local accounts read $TokenFile"
+  # Same rule as step 4: the Users default only for a token this run created, so an upgrade that
+  # falls back to LocalService does not undo an administrator's narrowing of the file.
+  if ($TokenCreated) {
+    Invoke-Icacls -Arguments @($TokenFile, '/grant', "*${SidUsers}:(R)") -What "letting local accounts read $TokenFile"
+  }
+  [void] (Grant-SidAccess -Path $TokenFile -Sid $ServiceSid -Rights 'Read' -Soft -What "letting LocalService read $TokenFile")
   [void] (Grant-SidAccess -Path $ProgramRoot -Sid $ServiceSid -Rights 'ReadAndExecute, WriteAttributes' -Inherit -What "letting LocalService read $ProgramRoot")
   # A repo adoption left in place was granted to the account this install has just stopped using,
   # and nothing under a profile inherits from the two roots above.

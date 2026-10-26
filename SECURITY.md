@@ -239,8 +239,9 @@ Narrowing it is one line, run after the install:
 icacls C:\ProgramData\sukarfleet\node\console-token /remove:g "BUILTIN\Users" /grant "sukarfleet-operators:(R)"
 ```
 
-Create the group first and put the accounts you trust in it. The daemon reads the file on every
-request, so leave the service account's own read entry alone. Nothing else in the install depends on
+Create the group first and put the accounts you trust in it. The installer grants `Users` read only
+when it creates the token, so a later upgrade keeps your narrowed list. The daemon reads the file on
+every request, so leave the service account's own read entry alone. Nothing else in the install depends on
 `Users` being able to read that file.
 
 **The service is not SYSTEM.** It runs as the virtual account `NT SERVICE\sukarfleet-node`, which has
