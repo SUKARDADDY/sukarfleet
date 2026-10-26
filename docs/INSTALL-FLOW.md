@@ -52,7 +52,7 @@ pair.
 ### 2.1 The one command
 
 ```
-curl -fsSL https://raw.githubusercontent.com/SUKARDADDY/sukarfleet/v0.1.0/install/get.sh | sh
+curl -fsSL https://raw.githubusercontent.com/SUKARDADDY/sukarfleet/v0.2.0/install/get.sh | sh
 ```
 
 That is the whole entry point (decision 1). The ref is a release tag, not `main`: a stranger who runs
@@ -65,7 +65,7 @@ one root command is printed for you to read and run yourself (decision 2).
 The pipe target is thin on purpose: `get.sh` has no install logic, it clones the same tag to
 `~/.local/share/sukarfleet/app`, prints the commit it checked out, and executes
 `install/quickstart.sh` from that checkout (**new in S7**), so the thing that installs is the
-repository at a tag. And auditing it first is `git clone --branch v0.1.0 <repo-url>` and reading
+repository at a tag. And auditing it first is `git clone --branch v0.2.0 <repo-url>` and reading
 `install/quickstart.sh` there. Two `README.md` sentences go when this lands: `README.md:29-30`,
 which requires "a mesh network between your machines (the daemon does not create one)" and decision
 7 reverses, and `README.md:46`, which already claims `install-elevated.sh` "installs the mesh
@@ -507,7 +507,7 @@ construction (`quickstart.sh:4-5`); what is missing is the summary that makes th
 (**new in S7**):
 
 ```
-[get] updating the checkout at ~/.local/share/sukarfleet/app to v0.1.0
+[get] updating the checkout at ~/.local/share/sukarfleet/app to v0.2.0
 [get] checkout stage done in 4s
 [quickstart] t+1s   config exists at ~/.config/sukarfleet/config.json -- left untouched.
 [quickstart] t+2s   sukarfleet.service enabled and active; mesh secret installed
@@ -696,7 +696,7 @@ The daemon has no distro dependency. This is what the installer would have done,
 someone the preflight refuses.
 
 1. `curl -fsSL https://bun.sh/install | bash`
-2. `git clone --branch v0.1.0 <repo-url> ~/.local/share/sukarfleet/app`
+2. `git clone --branch v0.2.0 <repo-url> ~/.local/share/sukarfleet/app`
 3. `cd ~/.local/share/sukarfleet/app && bun install --frozen-lockfile`
 4. `SUKARFLEET_SKIP_DISTRO_CHECK=1 ./install/quickstart.sh` (**new in S7**: the escape hatch).
    Nothing in it is apt-specific once the check is past.
