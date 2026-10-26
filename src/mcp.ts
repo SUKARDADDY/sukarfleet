@@ -33,6 +33,7 @@ import type {
 } from './types';
 import { log } from './util';
 import type { AccessOnly } from './access';
+import type { SyncSetup } from './syncsetup';
 
 export const MCP_LOOPBACK_HOST = '127.0.0.1';
 export const MCP_LOOPBACK_PORT = 7719;
@@ -73,6 +74,8 @@ export interface McpDeps {
   adminRun: (req: AdminRunRequest) => Promise<AdminRunResult>;
   adminStatus: () => Promise<AdminStatusEntry[]>;
   access?: Pick<AccessOnly, 'call'>;
+  syncSetup?: Pick<SyncSetup, 'call'>;
+  initializeNode?: (args: Record<string, unknown>) => Promise<unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +157,16 @@ interface McpToolDef {
 }
 
 const TOOLS: McpToolDef[] = [
+  { name: 'fleet.node_init', description: 'Initialize a fresh macOS sync node through the macOS installer MCP bootstrap. Refuses existing configuration; unavailable on a running node.',
+    inputSchema: { type: 'object', properties: { machine: { type: 'string' }, meshIp: { type: 'string' }, reason: { type: 'string' } }, required: ['machine', 'meshIp', 'reason'], additionalProperties: false } },
+  { name: 'fleet.sync_status', description: 'Read local native Git sync repositories and clock readiness.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'fleet.pair_code', description: 'Mint a short-lived native fleet pairing code. Requires agent-origin access; the code is not audited.',
+    inputSchema: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'], additionalProperties: false } },
+  { name: 'fleet.pair_redeem', description: 'Redeem a native fleet pairing code through the existing authenticated pairing protocol.',
+    inputSchema: { type: 'object', properties: { code: { type: 'string' }, host: { type: 'string' }, port: { type: 'integer' }, reason: { type: 'string' } }, required: ['code', 'host', 'port', 'reason'], additionalProperties: false } },
+  { name: 'fleet.repo_add', description: 'Adopt an existing local Git checkout for native peer-only sync. Preserves the working tree; never pushes to origin. Takes effect without restarting.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string' }, path: { type: 'string' }, reason: { type: 'string' } }, required: ['name', 'path', 'reason'], additionalProperties: false } },
   {
     name: 'fleet.access_list',
     description: 'List access-only SSH machines registered on this origin. These machines do not run a node or sync repositories. Reachability is not implied.',
@@ -331,12 +344,22 @@ async function runAdminCommand(args: Record<string, unknown>, deps: McpDeps): Pr
 }
 
 async function callTool(name: string, args: Record<string, unknown>, deps: McpDeps): Promise<ToolCallResult> {
+  if (name === 'fleet.node_init') {
+    if (!deps.initializeNode) return errorResult('node initialization is only available through the macOS installer bootstrap');
+    try { return textResult(await deps.initializeNode(args)); }
+    catch (error) { return errorResult(String(error)); }
+  }
+  if (['fleet.sync_status', 'fleet.pair_code', 'fleet.pair_redeem', 'fleet.repo_add'].includes(name)) {
+    if (!deps.syncSetup) return errorResult('sync setup is not configured on this server');
+    try { return textResult(await deps.syncSetup.call(name, args)); }
+    catch (error) { return errorResult(String(error)); }
+  }
   if (['fleet.access_list', 'fleet.access_register', 'fleet.run', 'fleet.screenshot'].includes(name)) {
     if (!deps.access) return errorResult('access-only transport is not configured on this server');
     return deps.access.call(name, args);
   }
   if (name === 'fleet.peers') {
-    const accessOnly = (deps.cfg.accessTargets ?? []).map((t) => ({
+    const accessOnly = (deps.cfg.accessTargets ?? []).filter((t) => !deps.cfg.peers.some((p) => p.name === t.name)).map((t) => ({
       name: t.name, meshIp: t.host, platform: t.platform, origin: deps.cfg.machine,
       mode: 'access-only', nodeInstalled: false, sync: false,
     }));

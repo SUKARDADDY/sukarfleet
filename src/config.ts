@@ -263,6 +263,7 @@ function validateRepo(r: unknown, i: number): void {
   const repo = r as Record<string, unknown>;
   if (typeof repo.name !== 'string' || !repo.name) fail(`repos[${i}].name must be a non-empty string`);
   if (typeof repo.path !== 'string' || !repo.path) fail(`repos[${i}].path must be a non-empty string`);
+  if (repo.peerOnly !== undefined && typeof repo.peerOnly !== 'boolean') fail(`repos[${i}].peerOnly must be boolean`);
   if (repo.postMerge !== undefined) {
     const bad =
       !Array.isArray(repo.postMerge) ||
@@ -285,10 +286,12 @@ function validate(cfg: FleetConfig): void {
   cfg.peers.forEach((p, i) => validatePeer(p, i));
   if (cfg.accessTargets !== undefined) {
     if (!Array.isArray(cfg.accessTargets)) fail('accessTargets must be an array');
-    const names = new Set([cfg.machine, ...cfg.peers.map((p) => p.name)]);
+    const names = new Set([cfg.machine]);
     for (const target of cfg.accessTargets) {
       validateAccessTarget(target);
       if (names.has(target.name)) fail('access target name conflicts with another machine');
+      const peer = cfg.peers.find((p) => p.name === target.name);
+      if (peer && peer.meshIp !== target.host) fail('access target and peer with the same name must use the same address');
       names.add(target.name);
     }
   }

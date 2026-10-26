@@ -1174,6 +1174,10 @@ export class Syncer {
   // A non-fast-forward rejection is not retried as-is (waiting cannot change the answer): it gets
   // one reconcileOwnBranch per cycle, and an immediate retry if that merged origin's copy in.
   private async pushOrigin(repo: RepoConfig, vetted: boolean): Promise<void> {
+    if (repo.peerOnly) {
+      this.deps.onGithubPushNotApplicable?.(repo.name);
+      return;
+    }
     const originUrl = await this.git(repo.path, ['remote', 'get-url', 'origin']);
     if (originUrl.code !== 0) {
       // No GitHub backup for this repo. Say so explicitly rather than leaving the boot-time null

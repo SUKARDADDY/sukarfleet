@@ -40,6 +40,7 @@ export interface AccessTargetConfig {
 export interface RepoConfig {
   name: string;
   path: string;
+  peerOnly?: boolean; // Native peer sync without pushing branches or derived main to origin.
   postMerge?: string[][]; // argv arrays run after successful merge
 }
 
