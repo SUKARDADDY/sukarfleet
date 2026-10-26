@@ -138,6 +138,11 @@ Adoption exports the scheduled task to `C:\ProgramData\sukarfleet\node\adopted-t
 the credential store, the state directory, the fleet SSH key and the sukarfleet lines out of
 `authorized_keys`. The machine keeps its place in the fleet and nothing re-pairs.
 
+It also removes that user's own tray launchers, the `HKCU\...\Run\sukarfleet-tray` value and the
+`sukarfleet console.lnk` Start menu shortcut, because both start a tray with no token file, and
+that tray cannot operate a machine-wide node. The `HKLM` Run value starts the right one. The
+per-user tray binary stays where it is.
+
 Most repositories the old node was syncing are renamed into the shared root -- a single
 `Directory.Move`, which is atomic and keeps links as links. (`robocopy /MOVE` was tried first and
 is not what runs: it deleted files out of the source as it copied them and then refused the tree's

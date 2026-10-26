@@ -1105,6 +1105,97 @@ function Grant-RepoInPlace {
   Write-Note "  the service account can write there, and $gitPath is marked safe for the service and for every account on this machine"
 }
 
+# The per-user installer (Install-Sukarfleet.ps1) starts the tray two ways: an HKCU Run value
+# named 'sukarfleet-tray' and a Start menu shortcut named 'sukarfleet console.lnk'. Neither passes
+# --token-file, so after adoption the tray they launch cannot operate the machine-wide node. This
+# removes both for the adopted profile and leaves the machine-wide HKLM Run value as the only
+# launcher. The elevated process runs as an administrator whose HKCU is not the adopted user's,
+# so it works in that user's hive: HKEY_USERS\<sid> when they are signed in, otherwise
+# NTUSER.DAT loaded for the length of the edit. Nothing here stops the adoption: a registration
+# that cannot be removed is reported with the command that removes it.
+$UserTrayShortcutName = 'sukarfleet console.lnk'
+
+function Get-AdoptedUserSid {
+  param($Task, [Parameter(Mandatory)] [string] $ProfileDir)
+  $uid = ''
+  if ($Task) { $uid = [string] (Get-Prop -Object $Task.Principal -Name 'UserId' -Default '') }
+  if ($uid -match '^S-1-') { return $uid }
+  if ($uid) {
+    try { return (New-Object Security.Principal.NTAccount($uid)).Translate([Security.Principal.SecurityIdentifier]).Value }
+    catch { }
+  }
+  # -UserProfileDir names a profile with no account attached, so find the SID the other way:
+  # the ProfileList entry whose folder is this one.
+  $want = $ProfileDir.TrimEnd('\')
+  foreach ($k in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue)) {
+    $img = [string] (Get-Prop -Object (Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue) -Name 'ProfileImagePath' -Default '')
+    if ($img -and ([Environment]::ExpandEnvironmentVariables($img)).TrimEnd('\') -ieq $want) { return [string] $k.PSChildName }
+  }
+  return ''
+}
+
+function Remove-AdoptedTrayStartup {
+  param($Task, [Parameter(Mandatory)] [string] $ProfileDir)
+
+  $shortcut = Join-Path $ProfileDir ('AppData\Roaming\Microsoft\Windows\Start Menu\Programs\' + $UserTrayShortcutName)
+  if (Test-Path -LiteralPath $shortcut) {
+    try {
+      Remove-Item -LiteralPath $shortcut -Force -ErrorAction Stop
+      Write-Note "  removed the adopted user's Start menu shortcut $shortcut (it started a tray with no token file)"
+    } catch {
+      Write-Warn "could not remove $shortcut : $($_.Exception.Message). Delete it; it starts a tray that cannot operate this node."
+    }
+  }
+
+  $sid = Get-AdoptedUserSid -Task $Task -ProfileDir $ProfileDir
+  if (-not $sid) {
+    Write-Warn "could not tell which account owns $ProfileDir, so its '$RunValueName' sign-in entry was not checked. Remove the HKCU Run value '$RunValueName' for that account."
+    return
+  }
+  $mount = ''
+  $hiveName = ''
+  if (Test-Path -LiteralPath "Registry::HKEY_USERS\$sid") {
+    $mount = "Registry::HKEY_USERS\$sid"
+  } else {
+    $name = 'sukarfleet-adopt-' + [Guid]::NewGuid().ToString('N')
+    $ntuser = Join-Path $ProfileDir 'NTUSER.DAT'
+    $r = Invoke-Native -Exe 'reg.exe' -Arguments @('load', "HKU\$name", $ntuser)
+    if ($r.ExitCode -ne 0) {
+      Write-Warn "could not load $ntuser to remove the '$RunValueName' sign-in entry: $((($r.Output | Out-String)).Trim()). Remove the HKCU Run value '$RunValueName' for that account."
+      return
+    }
+    $hiveName = $name
+    $mount = "Registry::HKEY_USERS\$name"
+  }
+  try {
+    $runKey = "$mount\Software\Microsoft\Windows\CurrentVersion\Run"
+    $cur = [string] (Get-Prop -Object (Get-ItemProperty -LiteralPath $runKey -Name $RunValueName -ErrorAction SilentlyContinue) -Name $RunValueName -Default '')
+    if (-not $cur) {
+      Write-Note "  the adopted user has no '$RunValueName' sign-in entry"
+    } elseif ($cur -like '*--token-file*') {
+      Write-Note "  the adopted user's '$RunValueName' sign-in entry already passes a token file; left as it is"
+    } else {
+      Remove-ItemProperty -LiteralPath $runKey -Name $RunValueName -ErrorAction Stop
+      Write-Note "  removed the adopted user's HKCU Run value '$RunValueName' ($cur): it started a tray with no token file, and the machine-wide Run value starts the right one"
+    }
+  } catch {
+    Write-Warn "could not remove the '$RunValueName' sign-in entry for $sid : $($_.Exception.Message). Remove the HKCU Run value '$RunValueName' for that account."
+  } finally {
+    if ($hiveName) {
+      # PowerShell keeps a handle on keys it has opened until the garbage collector runs, and
+      # reg unload refuses while one is open.
+      for ($i = 0; $i -lt 5; $i++) {
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        $u = Invoke-Native -Exe 'reg.exe' -Arguments @('unload', "HKU\$hiveName")
+        if ($u.ExitCode -eq 0) { break }
+        if ($i -eq 4) { Write-Warn "could not unload the loaded hive of $ProfileDir ($((($u.Output | Out-String)).Trim())). It unloads at the next restart." }
+        else { Start-Sleep -Seconds 1 }
+      }
+    }
+  }
+}
+
 function Invoke-Adoption {
   param([Parameter(Mandatory)] $Task)
 
@@ -1142,6 +1233,7 @@ function Invoke-Adoption {
     $trayProcs | Stop-Process -Force -ErrorAction SilentlyContinue
     Write-Note '  stopped the running tray; the machine-wide install starts its own at the next sign-in'
   }
+  Remove-AdoptedTrayStartup -Task $Task -ProfileDir $profileDir
 
   # --- identity -------------------------------------------------------------
   $srcKey = Join-Path $srcConfigDir 'machine-key.json'
