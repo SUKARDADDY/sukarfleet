@@ -138,8 +138,7 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile
 
 [Code]
 
-const
-  FILE_ATTRIBUTE_REPARSE_POINT = $400;
+// FILE_ATTRIBUTE_REPARSE_POINT ($400) is one of Inno Setup's own constants; redefining it does not compile.
 
 var
   PageIdentity: TInputQueryWizardPage;
