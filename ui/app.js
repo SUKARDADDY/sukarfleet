@@ -266,11 +266,11 @@ function yesNo(v) {
 //
 // A machine-wide node is reachable by every account on the PC, so it answers the console API with
 // 401 console-token-required until the caller presents its token. The token is kept in
-// sessionStorage and in this page's memory, nothing else: it dies with the tab, it is never written to disk by this page,
-// and a forwarded tab keeps its own copy per port, which is the same rule every other path here
-// follows. sessionStorage throws in a few hardened configurations, so every touch is guarded, and
-// the page keeps the submitted token in a variable too: when storage throws, that variable is what
-// lets a correct token unlock the console. It lives only as long as the page, like the storage copy.
+// sessionStorage and in this page's memory, nothing else: it dies with the tab, it is never
+// written to disk by this page, and a forwarded tab keeps its own copy per port, which is the same
+// rule every other path here follows. sessionStorage throws in a few hardened configurations, so
+// every touch is guarded, and the memory copy is what lets a correct token unlock the console
+// when storage throws.
 
 const CONSOLE_TOKEN_KEY = 'sukarfleetConsoleToken';
 
