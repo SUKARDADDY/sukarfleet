@@ -21,12 +21,23 @@ NotifyAccess=all
 # old, shorter WatchdogSec).
 WatchdogSec=120
 # On watchdog timeout, deliver SIGTERM (not the SIGABRT default) to the bun
-# main process only; child processes (git fetch helpers) get SIGKILL via
-# KillMode=mixed. Neither signal produces a core dump, so apport stops raising
-# "git-remote-http crashed" / "bun crashed" dialogs for what is really our own
-# watchdog firing. node.ts handles SIGTERM with a graceful shutdown (the event
-# loop stays live even when a sync await is stuck), and systemd still
-# escalates to SIGKILL after TimeoutStopSec if that handler never exits.
+# main process only; KillMode=mixed sends SIGKILL to whatever children are
+# still left once it exits. Neither signal produces a core dump, so apport
+# stops raising "git-remote-http crashed" / "bun crashed" dialogs for what is
+# really our own watchdog firing. node.ts handles SIGTERM with a graceful
+# shutdown that drains its own children before exiting: it waits up to 30 s
+# for in-flight git steps, then SIGTERMs them (git deletes its own lock files
+# on SIGTERM), then SIGKILLs and clears the locks those leave behind -- 40 s
+# at most, well inside the default TimeoutStopSec of 90 s. The drain only
+# knows the children the daemon spawned itself, so KillMode=mixed's SIGKILL
+# can still land on something else: an orphaned git-remote-http on a dead
+# connection (lock-free), or a `git gc --auto` / maintenance run that a git
+# command detached into the background, which can be holding packed-refs.lock
+# or a ref lock. A lock that kill leaves is cleared by the stale-lock pass at
+# the start of a later sync cycle (thresholds.staleGitLockMin). Every wait in
+# the drain is bounded by a timer, so the event loop stays live and the
+# handler exits even when a sync await is stuck, and systemd still escalates
+# to SIGKILL after TimeoutStopSec if it somehow does not.
 WatchdogSignal=SIGTERM
 KillMode=mixed
 WorkingDirectory=__SUKARFLEET_REPO__

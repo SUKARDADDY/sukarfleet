@@ -95,6 +95,11 @@ export interface FleetConfig {
     peerOfflineAlarmMin: number;
     clockSkewMaxMs: number;
     wedgePolls: number;
+    // How long a git lock file in a synced repo must sit unwritten before the sync cycle considers
+    // it possibly orphaned (see gitlocks.ts). Age only nominates a lock; it is removed only when no
+    // live process can still own it, so this is a floor on how soon a crash's leftover is cleared,
+    // not a timeout imposed on anybody's git.
+    staleGitLockMin: number;
   };
   // SSH admin lane. Deliberately FLAT -- no nested `thresholds` object -- so mergeDefaults stays
   // one line and the top-level `thresholds` shape is untouched. See AdminConfig below.

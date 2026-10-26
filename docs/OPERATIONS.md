@@ -112,10 +112,136 @@ from HEAD, and retries the cycle once. You learn about it from a `sync: corrupt 
 from HEAD` line and from the repo's sync fault clearing on its own. The corrupt bytes are kept
 rather than deleted -- they cost 30 KB and they are the only evidence of what happened.
 
-Nothing else in the sync cycle self-heals, and that is deliberate. This repair is safe because the
-index is derived state; it cannot lose a commit, cannot touch a file you edited, and cannot resolve
-a conflict on your behalf. A held `index.lock` (another process is mid-write) and an unmerged index
-(a real conflict, waiting for a human) are both left alone.
+This repair is safe because the index is derived state. It cannot lose a commit, cannot touch a file
+you edited, and cannot resolve a conflict on your behalf. An unmerged index (a real conflict, waiting
+for a human) is left alone. So is any lock another process may still hold, which the next section
+covers.
+
+## An orphaned git lock clears itself
+
+git takes a lock file (`index.lock`, `refs/heads/<branch>.lock`, and a few others) before it writes,
+and deletes it when it is done or when it is told to stop. A git that is SIGKILLed, or that dies in a
+crash, leaves the lock behind, and git never times one out. One repo stopped syncing for twelve days
+this way: every cycle failed at `git add` with `Unable to create '.../index.lock': File exists`.
+
+Three things now stop that from happening or clear it up.
+
+- `systemctl --user stop` no longer exits over a running git. The daemon waits up to 30 seconds for
+  git steps in flight, then sends SIGTERM, which git answers by deleting its own lock. SIGKILL comes
+  only after that, and the daemon removes whatever lock that kill orphaned. The whole thing takes at
+  most 40 seconds, under systemd's 90 second stop timeout. A merge the daemon was in the middle of
+  is still aborted after the 30 seconds run out, and if the process dies before it can be, the next
+  cycle aborts and redoes it. Conflict markers are never committed.
+- When the daemon has to SIGKILL a git step that hung, it removes the locks that step created.
+- At the start of every sync cycle, a lock last written more than `thresholds.staleGitLockMin` ago
+  (default 10 minutes) is removed if no live process can still own it. The cycle then carries on in
+  the same tick.
+
+"No live process can own it" is a machine-wide rule, and a blunt one. A lock is removed only when no
+process on the machine has the lock file open for writing, and no git that can take locks is running
+anywhere on the machine, apart from the daemon's own git steps. A git is recognised by its command
+name even if it renamed its `argv[0]`, and then counts as able to take locks. Read-only commands like
+`log`, `diff` and `show`, remote and credential helpers, `upload-pack`, `fsmonitor--daemon` and
+`cat-file --batch` don't count, so a pager left open doesn't block the repair. `status` does count.
+
+Both halves are needed. git opens every lock read-write, so a holder with the lock open is caught by
+the first. But `git commit -a` closes `index.lock` before it starts your editor and keeps the lock
+until the editor exits, with no file open on it, and only the second catches that. Working out
+which repository a running git is using, from its paths, turned out to be guesswork: review found a
+symlinked or relative `--git-dir`, `GIT_DIR` in the environment, a linked worktree, a bind mount in a
+sandbox and a path with spaces, and each one fooled it into deleting a live lock. So the daemon no
+longer guesses.
+
+On Linux, "open for writing" is asked of the kernel. The daemon opens the lock read-only and asks
+for a read lease (`fcntl F_SETLEASE`), which the kernel grants only when no process anywhere has the
+file open for writing, whichever user or mount namespace it runs in and whether or not it hides its
+open files. The lease is dropped straight away, and it is taken by a short-lived child process, not
+the daemon. If a writer opens the file while the lease is held, the kernel sends the lease holder
+SIGIO, which kills it. A dead child just means "a writer showed up", and the lock stays. Filesystems without leases (NFS, many FUSE and
+overlay mounts, or `fs.leases-enable=0`) fall back to reading every process's open files from
+`/proc`. There a process of yours whose open files can't be read, such as `(sd-pam)` under
+`systemd --user`, `ssh-agent` or most Electron apps, counts as a possible holder. So on such a
+filesystem a machine running any of those never clears a lock on its own.
+
+What nothing can see is a holder that is not git and keeps a lock with no file open for longer than
+`staleGitLockMin`. Nothing on the machine points from such a process to the lock.
+
+The cost is time. A long-lived git anywhere on the machine, such as a commit in some other repo
+waiting on its editor, holds off every repair until it exits. IDE `git status` loops are short, so
+there are gaps between them, and each sync cycle asks again.
+
+On macOS the daemon uses `lsof` and `ps`. Because `ps` joins arguments with spaces, it only trusts a
+git's subcommand when the command line starts with exactly the git it ran (plain `git`, or the full
+path an IDE uses) followed by the subcommand. Any other git counts as a holder. On Windows it waits
+until no `git.exe` other than its own is running, and a lock Windows refuses to rename counts as in
+use. That can't tell a resident `git fsmonitor--daemon` from a real holder, so a Windows machine
+running fsmonitor will not clear a stale lock on its own. If the check cannot answer, the lock stays
+and the next cycle asks again.
+
+An empty lock is deleted. A lock with bytes in it is a write that never finished, and git never reads
+it, but it is moved to `.git/sukarfleet-stale-locks/<timestamp>/` rather than deleted, as evidence.
+Every removal is logged as `git lock repair: retired an orphaned lock` and recorded as a signed
+`sync-lock-repaired` audit entry. None of this raises a fault or a notification.
+
+While a lock is held, a cycle that needs it is deferred rather than failed. A merge you left
+unfinished on the sync branch, or unmerged paths from a cherry-pick or stash pop, defer it the same
+way. The daemon never commits or aborts those for you. A merge the daemon started itself is
+aborted and redone, and if git refuses to abort it (conflict markers staged, then the file edited
+again) the repo is deferred until you finish or abort that merge by hand. Its markers are never
+committed. If the abort failed because another git holds `index.lock`, the note says that instead,
+and the next cycle tries again.
+
+A git hook can also stop a cycle. If a `pre-commit`, `commit-msg` or `pre-merge-commit` hook refuses
+one of the daemon's commits or merges (a misconfigured transcrypt is the usual one), the repo is
+deferred with the hook's own message as the reason, instead of failing every cycle. Merges from
+peers run as a plain `git merge`, so the hooks that run are the ones a plain merge runs. Deferring used to be a critical sync error
+and a desktop notification any time you and the daemon touched the same repo at once.
+
+A deferral keeps the time of the last successful cycle. Right after a restart, before any cycle has
+succeeded, that is the time the daemon started, so a lock held across a restart doesn't count as
+"never synced". Once a deferral has lasted `staleGitLockMin`, the repo's `syncError` in `/status`
+reads `deferred: <reason>`, for example the lock git is waiting on. That note never raises a fault.
+If the wait goes on past `syncStaleMin`, the ordinary stale-sync fault fires, and the note is there
+to explain it.
+
+## A sync branch origin has and this machine lost is merged back
+
+After a crash, origin can hold a commit on `sync/<this machine>` that the local branch no longer has.
+Every push is then rejected as non-fast-forward. That happened to two repos, for five days, until
+someone merged origin's copy back by hand.
+
+The daemon now does that merge itself, under the same rules as a merge from a peer, and retries the
+push in the same cycle. Union paths go through the `postMerge` regenerator. Other conflicts are
+newest-wins only on a vetted clock, and the losing side is kept under `.sync-conflicts/`. It never
+force-pushes and never rebases. If the merge would not be safe this cycle, it leaves the repo as it
+was and tries again next cycle. Each merge is recorded as a signed `sync-own-branch-merged` audit
+entry.
+
+The flip side is that you can't rewrite `sync/<this machine>` on origin while the daemon runs: it
+would merge origin's old history straight back in before you got to force-push. Stop the daemon on
+that machine first, rewrite and force-push both copies, then start it again.
+
+## Files Windows can't check out stay out of the commit
+
+The fleet is mixed, so every path the daemon commits has to be one Windows can hold. A Linux machine
+once committed `_tmp/x/check:css.log`, and from then on every merge on the Windows peer failed with
+`invalid path`. Now the auto-commit leaves out any file whose name has `< > : " | ? * \` or a
+control character in it, ends in a dot or a space, or is a reserved device name like `CON`, `nul`,
+`COM1` or `lpt9.txt`. The file stays on disk and is simply not synced. The daemon skips it silently
+every cycle (a debug log line at most).
+
+This applies to every commit the daemon makes, including what a `postMerge` regenerator writes and
+the result of merging a peer. The daemon never stages such a file again once it has left it on disk.
+A merge records the peer's tree as the peer committed it, and a commit straight after it takes the
+path out, so what gets pushed is portable. A path like that which is already in the index, committed by an older
+version or staged by hand, is taken out of the index with `git rm --cached`, even if it was edited
+after it was staged. The file stays on disk, the removal goes out with the
+next auto-commit, and it is recorded as a signed `sync-unportable-untracked` audit entry if a
+commit had carried it. A path that was only ever staged leaves no audit entry. That
+includes a file renamed to such a name: the old name is deleted from the repo and the new one stays
+local.
+
+Nothing else in the sync cycle repairs itself, and that is deliberate.
 
 ## The audit log itself is damaged
 
