@@ -13,8 +13,9 @@ set -eu
 here=$(CDPATH= cd -P -- "$(dirname -- "$0")/../src-tauri" && pwd -P)
 home=$(CDPATH= cd -P -- "$HOME" 2>/dev/null && pwd -P || printf '%s' "$HOME")
 # RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS outrank every config file and every --config value, so
-# either one, however harmless it looks, would silently drop the remap below.
-if [ -n "${RUSTFLAGS:-}" ] || [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+# either one, however harmless it looks, would silently drop the remap below. Set counts, not
+# just non-empty: cargo takes an empty value as an override too.
+if [ "${RUSTFLAGS+set}" = set ] || [ "${CARGO_ENCODED_RUSTFLAGS+set}" = set ]; then
   echo "build-release: unset RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS; they replace the path remap this build needs" >&2
   exit 2
 fi
