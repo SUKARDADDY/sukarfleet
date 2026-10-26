@@ -110,10 +110,12 @@ Root: HKLM; Subkey: "Software\sukarfleet"; ValueType: string; ValueName: "Shared
 ; C:\ProgramData\sukarfleet\install-machine.log, Setup exits 0, and the software IS installed --
 ; which is why the uninstaller in Apps and features is the way back out of one.
 ;
-; The command each entry would have run is a cmd that does nothing, so the Setup log says where
-; the work actually happened.
-Filename: "{cmd}"; Parameters: "/C rem sukarfleet: the install ran in this entry's BeforeInstall"; StatusMsg: "Installing the machine-wide node. This takes a few minutes."; Flags: waituntilterminated runhidden; Check: IsAdminInstallMode; BeforeInstall: InstallMachineNode
-Filename: "{cmd}"; Parameters: "/C rem sukarfleet: the install ran in this entry's BeforeInstall"; StatusMsg: "Installing the node for this account. This takes a few minutes."; Flags: waituntilterminated runhidden; Check: not IsAdminInstallMode; BeforeInstall: InstallUserNode
+; The program each entry names is a PowerShell that exits 0 and does nothing else, so the Setup
+; log shows an entry that ran and the BeforeInstall above it as where the work happened. No
+; answer from the wizard or the command line appears on any command line in this file: see "The
+; answers travel as data" in [Code].
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NonInteractive -Command exit 0"; StatusMsg: "Installing the machine-wide node. This takes a few minutes."; Flags: waituntilterminated runhidden; Check: IsAdminInstallMode; BeforeInstall: InstallMachineNode
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NonInteractive -Command exit 0"; StatusMsg: "Installing the node for this account. This takes a few minutes."; Flags: waituntilterminated runhidden; Check: not IsAdminInstallMode; BeforeInstall: InstallUserNode
 
 [UninstallDelete]
 ; bun install writes node_modules into {app} after Setup has copied its files, so Setup never
@@ -128,10 +130,16 @@ Type: filesandordirs; Name: "{app}\node_modules"
 Type: dirifempty; Name: "{commonpf64}\sukarfleet"; Check: IsAdminInstallMode
 
 [UninstallRun]
-Filename: "powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\install\windows\Uninstall-MachineNode.ps1"" -AppDir ""{app}"" -SharedRoot ""{reg:HKLM\Software\sukarfleet,SharedRoot|C:\AI_Agent}"""; RunOnceId: "RemoveMachineNode"; Flags: waituntilterminated runhidden; Check: IsAdminInstallMode
-Filename: "powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\install\windows\Uninstall-UserNode.ps1"""; RunOnceId: "RemoveUserNode"; Flags: waituntilterminated runhidden; Check: not IsAdminInstallMode
+; {app} is the only value on these command lines. Uninstall-MachineNode.ps1 reads the shared root
+; from the registry value above itself, rather than having a path somebody typed into the wizard
+; spliced into an elevated command line.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\install\windows\Uninstall-MachineNode.ps1"" -AppDir ""{app}"""; RunOnceId: "RemoveMachineNode"; Flags: waituntilterminated runhidden; Check: IsAdminInstallMode
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\install\windows\Uninstall-UserNode.ps1"""; RunOnceId: "RemoveUserNode"; Flags: waituntilterminated runhidden; Check: not IsAdminInstallMode
 
 [Code]
+
+const
+  FILE_ATTRIBUTE_REPARSE_POINT = $400;
 
 var
   PageIdentity: TInputQueryWizardPage;
@@ -142,6 +150,9 @@ var
   PerUserTaskExists: Boolean;
   SecretFilePath: String;
   SecretIsOurs: Boolean;
+  // The restricted directory the settings files and a typed secret are written into. Empty
+  // until EnsureStagingDir has created it and applied its access list.
+  StagingDir: String;
 
 // ---------------------------------------------------------------------------
 // Command line
@@ -276,6 +287,7 @@ begin
   PerUserTaskExists := ScheduledTaskExists();
   SecretFilePath := '';
   SecretIsOurs := False;
+  StagingDir := '';
 
   PageIdentity := CreateInputQueryPage(wpSelectDir,
     'This machine',
@@ -303,7 +315,7 @@ begin
   PageSecret := CreateInputQueryPage(PageRole.ID,
     'Mesh secret',
     'The one secret every machine in this fleet shares',
-    'On a Linux fleet machine it is the network_secret line in /etc/easytier/fleet.toml, readable as root. It is not echoed, and it is written to a file only this account can read, which the elevated stage consumes and overwrites.');
+    'On a Linux fleet machine it is the network_secret line in /etc/easytier/fleet.toml, readable as root. It is not echoed, and it is written to a file only this account, Administrators and SYSTEM can read, which the install consumes and overwrites.');
   PageSecret.Add('Network secret:', True);
 
   PageShared := CreateInputQueryPage(PageSecret.ID,
@@ -375,13 +387,331 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// The secret never travels as an argument
+// The answers travel as data
+//
+// No answer from the wizard or from Setup's command line is ever put on a command line. Setup
+// used to start the scripts through cmd.exe, splicing each answer between double quotes so cmd
+// could redirect the output to a log. A value holding a double quote and an ampersand, such as
+// a peer field pasted as  tcp://192.0.2.1:11010" & echo X & rem "  closed the quotes and ran
+// the rest as a second command, under the elevated token.
+//
+// Now every answer goes into a JSON settings file, written into a directory this installer has
+// just created and restricted, and powershell.exe is started directly, with no shell between,
+// on a command line that holds fixed switches and two paths this installer built itself: the
+// script and the settings file. The script reads its answers from that file, applies the same
+// checks it applies to its parameters, and writes its own log. Two things hold that in place:
+// PowerShellArgs below is the only place a script's command line is built, and
+// tests/installer-settings.test.ts checks every Exec in this file against that rule.
+// ---------------------------------------------------------------------------
+
+function PowerShellExe(): String;
+begin
+  Result := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+end;
+
+function IcaclsExe(): String;
+begin
+  Result := ExpandConstant('{sys}\icacls.exe');
+end;
+
+// The scripts, by fixed path. The preflight runs the copy PrepareToInstall unpacks into {tmp},
+// because nothing is in {app} yet when it runs.
+function MachineScript(): String;
+begin
+  Result := ExpandConstant('{app}\install\windows\Install-MachineNode.ps1');
+end;
+
+function UserScript(): String;
+begin
+  Result := ExpandConstant('{app}\install\windows\Install-Sukarfleet.ps1');
+end;
+
+function PreflightScript(): String;
+begin
+  Result := ExpandConstant('{tmp}\Install-MachineNode.ps1');
+end;
+
+// One path as one argument, in double quotes. It is only ever handed a path this installer built
+// from an Inno constant and a fixed name. Windows does not allow a double quote in a path, and a
+// trailing backslash would escape the closing quote, so a path with either is refused rather
+// than quoted around.
+function QuoteArg(const Path: String): String;
+begin
+  if Path = '' then
+    RaiseException('Internal error: an empty path was about to be passed as an argument.');
+  if Pos('"', Path) > 0 then
+    RaiseException('Internal error: ' + Path + ' holds a double quote and was not passed as an argument.');
+  if Path[Length(Path)] = '\' then
+    RaiseException('Internal error: ' + Path + ' ends in a backslash and was not passed as an argument.');
+  Result := '"' + Path + '"';
+end;
+
+// The whole command line any install script is started with. -NonInteractive makes a prompt
+// fail instead of wait, which is the only honest answer with nobody at the keyboard.
+function PowerShellArgs(const ScriptPath, SettingsPath: String): String;
+begin
+  Result := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + QuoteArg(ScriptPath) +
+    ' -SettingsFile ' + QuoteArg(SettingsPath);
+end;
+
+// Exec waits for powershell.exe and hands back its exit code, and the scripts exit 1 on every
+// refusal, so a refusal arrives here as a number.
+function RunPowerShell(const ScriptPath, SettingsPath: String; var ResultCode: Integer): Boolean;
+begin
+  Result := Exec(PowerShellExe(), PowerShellArgs(ScriptPath, SettingsPath), '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode);
+end;
+
+// ---------------------------------------------------------------------------
+// JSON
+//
+// EscapeJson is the one place a value is made safe to put between JSON quotes, and JsonString is
+// the one place those quotes are added. Everything outside printable ASCII becomes a \u escape,
+// which keeps the file pure ASCII: SaveStringToFile writes in the ANSI code page, and a path
+// with a letter outside it would otherwise arrive changed.
+// ---------------------------------------------------------------------------
+
+function EscapeJson(const S: String): String;
+var
+  I, Code: Integer;
+  Hex: String;
+begin
+  Hex := '0123456789abcdef';
+  Result := '';
+  for I := 1 to Length(S) do
+  begin
+    Code := Ord(S[I]);
+    if Code = 34 then
+      Result := Result + '\"'
+    else if Code = 92 then
+      Result := Result + '\\'
+    else if (Code < 32) or (Code > 126) then
+      Result := Result + '\u' + Hex[((Code shr 12) and 15) + 1] + Hex[((Code shr 8) and 15) + 1] +
+        Hex[((Code shr 4) and 15) + 1] + Hex[(Code and 15) + 1]
+    else
+      Result := Result + S[I];
+  end;
+end;
+
+function JsonString(const S: String): String;
+begin
+  Result := '"' + EscapeJson(S) + '"';
+end;
+
+function JsonBool(const B: Boolean): String;
+begin
+  if B then Result := 'true' else Result := 'false';
+end;
+
+procedure AddJsonMember(var Members: String; const Name, JsonValue: String);
+begin
+  if Members <> '' then Members := Members + ',' + #13#10;
+  Members := Members + '  ' + JsonString(Name) + ': ' + JsonValue;
+end;
+
+procedure AddJsonString(var Members: String; const Name, Value: String);
+begin
+  AddJsonMember(Members, Name, JsonString(Value));
+end;
+
+procedure AddJsonBool(var Members: String; const Name: String; const Value: Boolean);
+begin
+  AddJsonMember(Members, Name, JsonBool(Value));
+end;
+
+function JsonObject(const Members: String): String;
+begin
+  Result := '{' + #13#10 + Members + #13#10 + '}' + #13#10;
+end;
+
+// ---------------------------------------------------------------------------
+// The restricted directory
+//
+// The settings files and a typed mesh secret are written into one directory, created fresh by
+// this installer, with inheritance removed and Administrators and SYSTEM given full control. A
+// per-account install also grants OWNER RIGHTS, which is the account that created the directory
+// and the files in it: the per-account scripts run as that account and have to read them. The
+// access list goes on the directory BEFORE anything is written into it, so every file inherits
+// it the moment it exists and there is no window in which a secret sits under a wider one. If
+// the list cannot be applied, the directory is removed and nothing is written: an unrestricted
+// secret is never the fallback.
+//
+// Machine-wide, the directory lives in {tmp}, which Setup removes when it ends. Per-account, it
+// lives in the state directory Install-Sukarfleet.ps1 recognises as the installer's own, which
+// is what makes that script shred a secret it finds there once it has used it.
+// DeinitializeSetup removes it either way.
+// ---------------------------------------------------------------------------
+
+// True when something exists at Path, a dangling link included. FindFirst reports the entry
+// itself, where FileExists and DirExists would follow a link and answer for its target.
+function PathExists(const Path: String): Boolean;
+var
+  FindRec: TFindRec;
+begin
+  Result := FindFirst(Path, FindRec);
+  if Result then FindClose(FindRec);
+end;
+
+function IsReparsePoint(const Path: String): Boolean;
+var
+  FindRec: TFindRec;
+begin
+  Result := False;
+  if FindFirst(Path, FindRec) then
+  begin
+    try
+      Result := (FindRec.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0;
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+function StagingParent(): String;
+begin
+  if IsAdminInstallMode then
+    Result := ExpandConstant('{tmp}')
+  else
+    Result := ExpandConstant('{%USERPROFILE}') + '\.local\state\sukarfleet';
+end;
+
+// The icacls command line for the directory. Fixed apart from the directory's own path, which
+// EnsureStagingDir built from StagingParent and a counter. Well-known SIDs, because the names
+// are spelled differently on a Windows that is not in English.
+function StagingAclArgs(const Dir: String): String;
+begin
+  Result := QuoteArg(Dir) + ' /inheritance:r /grant:r *S-1-5-18:(OI)(CI)(F) *S-1-5-32-544:(OI)(CI)(F)';
+  if not IsAdminInstallMode then Result := Result + ' *S-1-3-4:(OI)(CI)(F)';
+end;
+
+// Returns '' once StagingDir exists and is restricted, or the sentence saying why it is not.
+// Safe to call again: a second call checks that the directory is still the one it made.
+function EnsureStagingDir(): String;
+var
+  Parent, Candidate, Dir: String;
+  I, ResultCode: Integer;
+begin
+  Result := '';
+  if StagingDir <> '' then
+  begin
+    if (not DirExists(StagingDir)) or IsReparsePoint(StagingDir) then
+      Result := 'the installer''s settings directory ' + StagingDir + ' was removed or replaced while Setup was running.';
+    Exit;
+  end;
+
+  Parent := StagingParent();
+  if not ForceDirectories(Parent) then
+  begin
+    Result := 'could not create ' + Parent + '.';
+    Exit;
+  end;
+
+  // A fresh name every time. CreateDir fails on a name that is already taken, by a directory, a
+  // file or a link, so whatever this ends up with is a directory this call made.
+  Dir := '';
+  for I := 1 to 50 do
+  begin
+    if Dir = '' then
+    begin
+      Candidate := Parent + '\setup-' + GetDateTimeString('yyyymmddhhnnss', #0, #0) + '-' + IntToStr(I);
+      if not PathExists(Candidate) then
+      begin
+        if CreateDir(Candidate) then Dir := Candidate;
+      end;
+    end;
+  end;
+  if Dir = '' then
+  begin
+    Result := 'could not create a new directory under ' + Parent + ' for the installer''s settings.';
+    Exit;
+  end;
+  if IsReparsePoint(Dir) then
+  begin
+    Result := Dir + ' turned out to be a link rather than the directory Setup created. Nothing was written to it.';
+    Exit;
+  end;
+
+  if not Exec(IcaclsExe(), StagingAclArgs(Dir), '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    ResultCode := -1;
+  if ResultCode <> 0 then
+  begin
+    DelTree(Dir, True, True, True);
+    Result := 'icacls could not restrict ' + Dir + ' to Administrators and SYSTEM (exit code ' +
+      IntToStr(ResultCode) + '), so the directory was removed and no secret or setting was written.';
+    Exit;
+  end;
+  StagingDir := Dir;
+end;
+
+// Writes Content to a new file called Leaf in the restricted directory and returns its path.
+// Raises on any failure, having removed what it wrote. Something already at that path is only
+// ever this installer's own earlier file, since nobody else can write in the directory; a plain
+// file is replaced, and anything else, a link above all, is refused rather than written through.
+function WriteStagedFile(const Leaf, Content: String): String;
+var
+  Problem, Path: String;
+begin
+  Problem := EnsureStagingDir();
+  if Problem <> '' then RaiseException(Problem);
+  if (Leaf = '') or (Pos('\', Leaf) > 0) or (Pos('/', Leaf) > 0) or (Pos(':', Leaf) > 0) or (Pos('..', Leaf) > 0) then
+    RaiseException('Internal error: ' + Leaf + ' is not a plain file name.');
+  Path := StagingDir + '\' + Leaf;
+  if CompareText(ExtractFileDir(Path), StagingDir) <> 0 then
+    RaiseException('Internal error: ' + Path + ' is not inside ' + StagingDir + '.');
+  if PathExists(Path) then
+  begin
+    if IsReparsePoint(Path) or DirExists(Path) then
+      RaiseException(Path + ' already exists and is not a plain file. Setup stopped rather than write through it.');
+    if not DeleteFile(Path) then
+      RaiseException('Could not replace ' + Path + '.');
+  end;
+  if not SaveStringToFile(Path, Content, False) then
+  begin
+    DeleteFile(Path);
+    RaiseException('Could not write ' + Path + '.');
+  end;
+  if IsReparsePoint(Path) then
+  begin
+    DeleteFile(Path);
+    RaiseException(Path + ' turned out to be a link after it was written. It was removed.');
+  end;
+  Result := Path;
+end;
+
+// Overwrite, then delete. The same promise Remove-SecretFile makes in the scripts, and the same
+// limits: it keeps the secret out of a trivially undeleted file, and no more than that.
+procedure ShredFile(const Path: String);
+var
+  Size: Integer;
+begin
+  if FileSize(Path, Size) then
+  begin
+    if Size > 0 then SaveStringToFile(Path, StringOfChar('0', Size), False);
+  end;
+  DeleteFile(Path);
+end;
+
+procedure DeinitializeSetup();
+begin
+  if StagingDir <> '' then
+  begin
+    if SecretIsOurs and (SecretFilePath <> '') then
+    begin
+      if FileExists(SecretFilePath) then ShredFile(SecretFilePath);
+    end;
+    DelTree(StagingDir, True, True, True);
+    StagingDir := '';
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// The mesh secret
 // ---------------------------------------------------------------------------
 
 // argv is readable by every process on the machine and lands in a shell history, so the secret
-// goes to a file with inheritance broken and one account on it, and the installer scripts
-// consume and overwrite that file. A file the operator named with /MESHSECRETFILE is used as it
-// is and never deleted: it is not ours.
+// goes to a file in the restricted directory, and the installer scripts consume and overwrite
+// it. A file the operator named with /MESHSECRETFILE is used as it is and never deleted: it is
+// not ours.
 // The file the operator named on the command line, if they named one. Kept apart from
 // SecretFilePath, which is empty until StageMeshSecret has run at ssInstall: PrepareToInstall
 // runs before that, and a preflight that read SecretFilePath would decide "no secret" for every
@@ -400,10 +730,12 @@ begin
             (Trim(PageSecret.Values[0]) <> '');
 end;
 
+// Runs at ssInstall, before the first file is copied, which is also one of the moments an
+// exception ends Setup from. A secret that cannot be written into the restricted directory
+// stops the install there, with nothing installed and nothing left behind.
 procedure StageMeshSecret();
 var
-  Secret, Target, Dir, AclArgs: String;
-  ResultCode: Integer;
+  Secret, Problem: String;
 begin
   SecretFilePath := NamedSecretFile();
   if SecretFilePath <> '' then Exit;
@@ -413,34 +745,23 @@ begin
   Secret := Trim(PageSecret.Values[0]);
   if Secret = '' then Exit;
 
-  if IsAdminInstallMode then
-  begin
-    // Setup deletes {tmp} when it finishes; Install-MachineNode.ps1 overwrites this file the
-    // moment it has copied the secret into the node's own state directory.
-    Target := ExpandConstant('{tmp}\mesh-secret');
-    AclArgs := '"' + Target + '" /inheritance:r /grant:r "*S-1-5-32-544:(F)" "*S-1-5-18:(F)"';
-  end
-  else
-  begin
-    // Exactly where Install-Sukarfleet.ps1 stages its own: its Test-StagedSecretPath recognises
-    // this path as the installer's, which is what makes it shred the file rather than leave it.
-    Dir := ExpandConstant('{%USERPROFILE}') + '\.local\state\sukarfleet';
-    ForceDirectories(Dir);
-    Target := Dir + '\pending-easytier-secret';
-    AclArgs := '"' + Target + '" /inheritance:r /grant:r "' + ExpandConstant('{username}') +
-      ':(F)" "*S-1-5-32-544:(F)" "*S-1-5-18:(F)"';
+  Problem := '';
+  try
+    SecretFilePath := WriteStagedFile('mesh-secret', Secret + #10);
+  except
+    Problem := GetExceptionMessage;
   end;
-
-  if not SaveStringToFile(Target, Secret + #10, False) then
+  Secret := '';
+  if Problem <> '' then
   begin
-    RaiseException('Could not write the mesh secret to ' + Target + '. Nothing was installed.');
+    SecretFilePath := '';
+    if StagingDir <> '' then
+    begin
+      DelTree(StagingDir, True, True, True);
+      StagingDir := '';
+    end;
+    RaiseException('The mesh secret could not be written to a file only Administrators and SYSTEM can read, so nothing was installed: ' + Problem);
   end;
-  if not Exec('icacls.exe', AclArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-    ResultCode := -1;
-  if ResultCode <> 0 then
-    Log('icacls on the staged mesh secret returned ' + IntToStr(ResultCode) + '; the file keeps the inherited ACL of its directory.');
-
-  SecretFilePath := Target;
   SecretIsOurs := True;
 end;
 
@@ -453,40 +774,17 @@ end;
 // What the two scopes are asked to run
 // ---------------------------------------------------------------------------
 
-function CommonNodeArgs(): String;
-var
-  s: String;
+// The answers both scopes take, by the scripts' own parameter names. The peer field goes as it
+// was typed; both scripts split it on commas.
+procedure AddNodeAnswers(var Members: String);
 begin
-  s := ' -MachineName "' + GetMachineName() + '"';
-  s := s + ' -Role ' + GetRole();
-  if GetMeshIp() <> '' then s := s + ' -MeshIp "' + GetMeshIp() + '"';
-  if GetPeers() <> '' then s := s + ' -PeerUri "' + GetPeers() + '"';
-  if SecretFilePath <> '' then s := s + ' -MeshSecretFile "' + SecretFilePath + '"';
-  if SkipMeshWanted() then s := s + ' -SkipMesh';
-  if SkipTrayWanted() then s := s + ' -SkipTray';
-  if NoOpenWanted() then s := s + ' -NoOpen';
-  Result := s;
-end;
-
-function UserNodeParams(): String;
-var
-  App: String;
-begin
-  App := ExpandConstant('{app}');
-  Result := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + App + '\install\windows\Install-Sukarfleet.ps1"' +
-    ' -Source "' + App + '"' + CommonNodeArgs();
-end;
-
-function MachineNodeParams(): String;
-var
-  App: String;
-begin
-  App := ExpandConstant('{app}');
-  Result := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + App + '\install\windows\Install-MachineNode.ps1"' +
-    ' -AppDir "' + App + '"' +
-    ' -SharedRoot "' + GetSharedRoot('') + '"' + CommonNodeArgs();
-  if AdoptWanted() then Result := Result + ' -Adopt';
-  if SecretIsOurs then Result := Result + ' -ShredSecretSource';
+  AddJsonString(Members, 'MachineName', GetMachineName());
+  AddJsonString(Members, 'Role', GetRole());
+  if GetMeshIp() <> '' then AddJsonString(Members, 'MeshIp', GetMeshIp());
+  if GetPeers() <> '' then AddJsonString(Members, 'PeerUri', GetPeers());
+  AddJsonBool(Members, 'SkipMesh', SkipMeshWanted());
+  AddJsonBool(Members, 'SkipTray', SkipTrayWanted());
+  AddJsonBool(Members, 'NoOpen', NoOpenWanted());
 end;
 
 function UserNodeLog(): String;
@@ -499,32 +797,96 @@ begin
   Result := ExpandConstant('{commonappdata}\sukarfleet\install-machine.log');
 end;
 
-// cmd.exe /C "powershell.exe <args> > <log> 2>&1". The outer quotes are cmd's; -NonInteractive
-// makes a prompt fail instead of wait, which is the only honest answer with no keyboard. cmd
-// hands back whatever powershell.exe exited with, which is what makes the exit code below real.
-function UserNodeCmd(): String;
+function UserSettings(): String;
+var
+  M: String;
 begin
-  Result := '/C "powershell.exe ' + UserNodeParams() + ' > "' + UserNodeLog() + '" 2>&1"';
+  M := '';
+  AddJsonString(M, 'Source', ExpandConstant('{app}'));
+  AddNodeAnswers(M);
+  if SecretFilePath <> '' then AddJsonString(M, 'MeshSecretFile', SecretFilePath);
+  AddJsonString(M, 'LogFile', UserNodeLog());
+  Result := JsonObject(M);
 end;
 
-function MachineNodeCmd(): String;
+// The secret, and only the secret, differs between the preflight and the real run: the file the
+// wizard stages does not exist yet at preflight time. A path the operator named is passed as it
+// is; a secret the wizard collected is announced with SecretWillBeStaged, which the script
+// honours for the "is there one" question and nothing else.
+//
+// Every other answer comes from the same functions for both passes, so the two cannot disagree
+// about what is being installed. AppDir is the {app} that does not exist yet at preflight time,
+// which is deliberate: it is the directory the real run will be given.
+function MachineSettings(const IsPreflight: Boolean; const LogPath: String): String;
+var
+  M: String;
 begin
-  Result := '/C "powershell.exe ' + MachineNodeParams() + ' > "' + MachineNodeLog() + '" 2>&1"';
+  M := '';
+  AddJsonBool(M, 'Preflight', IsPreflight);
+  AddJsonString(M, 'AppDir', ExpandConstant('{app}'));
+  AddJsonString(M, 'SharedRoot', GetSharedRoot(''));
+  AddNodeAnswers(M);
+  if IsPreflight then
+  begin
+    if NamedSecretFile() <> '' then
+      AddJsonString(M, 'MeshSecretFile', NamedSecretFile())
+    else if SecretWillBeStaged() then
+      AddJsonBool(M, 'SecretWillBeStaged', True);
+  end
+  else
+  begin
+    if SecretFilePath <> '' then AddJsonString(M, 'MeshSecretFile', SecretFilePath);
+    AddJsonBool(M, 'ShredSecretSource', SecretIsOurs);
+  end;
+  AddJsonBool(M, 'Adopt', AdoptWanted());
+  AddJsonString(M, 'LogFile', LogPath);
+  Result := JsonObject(M);
 end;
 
 // ---------------------------------------------------------------------------
 // The launch, and the refusal
 //
 // Called as the BeforeInstall of the matching [Run] entry; see the comment on that section for
-// why it is there and nowhere else. Exec waits for cmd, cmd waits for powershell, and powershell
-// exits 1 on every Write-Die in the install scripts, so a refusal arrives here as a number.
+// why it is there and nowhere else. The script keeps its own log at the path in its settings,
+// which is where the exception below points.
 // ---------------------------------------------------------------------------
-procedure RunScopeInstaller(Scope, Params, LogPath: String);
+procedure RunScopeInstaller(const IsMachine: Boolean);
 var
+  Scope, LogPath, Settings, SettingsPath, Problem: String;
   ResultCode: Integer;
+  Started: Boolean;
 begin
+  if IsMachine then
+  begin
+    Scope := 'machine-wide';
+    LogPath := MachineNodeLog();
+    Settings := MachineSettings(False, LogPath);
+  end
+  else
+  begin
+    Scope := 'per-account';
+    LogPath := UserNodeLog();
+    Settings := UserSettings();
+  end;
   ForceDirectories(ExtractFileDir(LogPath));
-  if not Exec(ExpandConstant('{cmd}'), Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+
+  Problem := '';
+  SettingsPath := '';
+  try
+    SettingsPath := WriteStagedFile('install.json', Settings);
+  except
+    Problem := GetExceptionMessage;
+  end;
+  if Problem <> '' then
+    RaiseException('The ' + Scope + ' install script could not be started: ' + Problem);
+  // The settings hold no secret, only the path of the file that does, so they are safe to log.
+  Log('sukarfleet: ' + Scope + ' install settings in ' + SettingsPath + ':' + #13#10 + Settings);
+
+  if IsMachine then
+    Started := RunPowerShell(MachineScript(), SettingsPath, ResultCode)
+  else
+    Started := RunPowerShell(UserScript(), SettingsPath, ResultCode);
+  if not Started then
   begin
     RaiseException('The ' + Scope + ' install script could not be started at all. Nothing was installed.');
   end;
@@ -539,12 +901,12 @@ end;
 
 procedure InstallMachineNode();
 begin
-  RunScopeInstaller('machine-wide', MachineNodeCmd(), MachineNodeLog());
+  RunScopeInstaller(True);
 end;
 
 procedure InstallUserNode();
 begin
-  RunScopeInstaller('per-account', UserNodeCmd(), UserNodeLog());
+  RunScopeInstaller(False);
 end;
 
 // ---------------------------------------------------------------------------
@@ -566,14 +928,24 @@ end;
 // evidence underneath: the dirty-repository refusal follows its sentence with up to ten
 // indented porcelain lines. Reading the last few lines of the log therefore came back holding
 // the file paths and none of the reason. The block is cut at the LAST "ERROR:" line instead and
-// runs to the end of the file, capped so a long one cannot fill the box. A log with no such
-// line at all fell over some other way, and its last few lines are the only thing left that
-// says anything. {tmp}\preflight.log goes when Setup does, so what is not taken out of here is
-// not anywhere.
+// runs to the end of what the script printed, capped so a long one cannot fill the box. A log
+// with no such line at all fell over some other way, and its last few lines are the only thing
+// left that says anything.
+//
+// The log is a PowerShell transcript, which closes with a banner of its own (a row of
+// asterisks, "Windows PowerShell transcript end", the time, another row) and records the exit
+// that follows a refusal as a "PS>TerminatingError" or ">> TerminatingError" line. Neither is
+// the reason, so everything from the closing banner on is left out, and so is any row of
+// asterisks and any line the transcript itself starts with "PS>" or ">> ".
+function IsTranscriptNoise(const S: String): Boolean;
+begin
+  Result := (S = '') or (Copy(S, 1, 10) = '**********') or (Copy(S, 1, 3) = 'PS>') or (Copy(S, 1, 3) = '>> ');
+end;
+
 function RefusalFrom(const Path: String; Fallback, Cap: Integer): String;
 var
   Lines: TArrayOfString;
-  I, Count, First, Taken: Integer;
+  I, Count, Stop, First, Taken: Integer;
   S: String;
 begin
   Result := '';
@@ -582,20 +954,25 @@ begin
   // Every line is looked at rather than the walk being broken out of: a few dozen lines cost
   // nothing, and Break and Continue are two more things to be sure of in a language this file
   // only speaks here. The last match wins because nothing guards the assignment.
-  First := -1;
+  Stop := Count;
   for I := 0 to Count - 1 do
+  begin
+    if Pos('transcript end', Lowercase(Lines[I])) > 0 then Stop := I;
+  end;
+  First := -1;
+  for I := 0 to Stop - 1 do
   begin
     if Pos('ERROR:', Lines[I]) > 0 then First := I;
   end;
   Taken := 0;
   if First < 0 then
   begin
-    for I := Count - 1 downto 0 do
+    for I := Stop - 1 downto 0 do
     begin
       if Taken < Fallback then
       begin
         S := Trim(Lines[I]);
-        if S <> '' then
+        if not IsTranscriptNoise(S) then
         begin
           if Result = '' then
             Result := S
@@ -607,12 +984,12 @@ begin
     end;
     Exit;
   end;
-  for I := First to Count - 1 do
+  for I := First to Stop - 1 do
   begin
     if Taken < Cap then
     begin
       S := Trim(Lines[I]);
-      if S <> '' then
+      if not IsTranscriptNoise(S) then
       begin
         if Result = '' then
           Result := S
@@ -624,43 +1001,18 @@ begin
   end;
 end;
 
-// The secret, and only the secret, differs between the preflight and the real run: the file the
-// wizard stages does not exist yet at preflight time. A path the operator named is passed as it
-// is; a secret the wizard collected is announced with -SecretWillBeStaged, which the script
-// honours for the "is there one" question and nothing else.
-function PreflightSecretArgs(): String;
-begin
-  if NamedSecretFile() <> '' then
-    Result := ' -MeshSecretFile "' + NamedSecretFile() + '"'
-  else if SecretWillBeStaged() then
-    Result := ' -SecretWillBeStaged'
-  else
-    Result := '';
-end;
-
-// Every other switch comes from the same two functions the real run uses, so the two passes
-// cannot disagree about what is being installed. -AppDir points at the {app} that does not exist
-// yet, which is deliberate: it is the directory the real run will be given.
-function PreflightParams(): String;
-begin
-  Result := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
-    ExpandConstant('{tmp}\Install-MachineNode.ps1') + '" -Preflight' +
-    ' -AppDir "' + ExpandConstant('{app}') + '"' +
-    ' -SharedRoot "' + GetSharedRoot('') + '"' + CommonNodeArgs() + PreflightSecretArgs();
-  if AdoptWanted() then Result := Result + ' -Adopt';
-end;
-
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  LogPath, Params, Reason: String;
+  LogPath, Settings, SettingsPath, Problem, Reason: String;
   ResultCode: Integer;
+  Started: Boolean;
 begin
   Result := '';
   if not IsAdminInstallMode then Exit;
 
-  // The script alone, and nothing it would otherwise need beside it. A -Preflight pass answers
+  // The script alone, and nothing it would otherwise need beside it. A preflight pass answers
   // and exits before the line that dot-sources Pins.ps1 out of {app}, and before anything else
-  // reads the tree it is asked about, so the copy in {tmp} is the only file this stage opens.
+  // reads the tree it is asked about, so the copy in {tmp} is the only script this stage opens.
   try
     ExtractTemporaryFile('Install-MachineNode.ps1');
   except
@@ -674,13 +1026,38 @@ begin
     Exit;
   end;
 
-  LogPath := ExpandConstant('{tmp}\preflight.log');
-  // Same cmd wrapper as the real run: cmd owns the redirection and hands back whatever
-  // powershell.exe exited with. The secret is never an argument, so this line is safe to log.
-  Params := '/C "powershell.exe ' + PreflightParams() + ' > "' + LogPath + '" 2>&1"';
-  Log('sukarfleet: machine-wide preflight: ' + Params);
+  // The restricted directory is made here, because the preflight's settings are the first
+  // thing written into it. One that cannot be restricted is a refusal like any other.
+  Problem := EnsureStagingDir();
+  if Problem <> '' then
+  begin
+    Result := 'This machine-wide install would be refused:' + #13#10 + Problem + #13#10 +
+      'Nothing was installed.';
+    Log(Result);
+    Exit;
+  end;
 
-  if not Exec(ExpandConstant('{cmd}'), Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  LogPath := StagingDir + '\preflight.log';
+  Settings := MachineSettings(True, LogPath);
+  Problem := '';
+  SettingsPath := '';
+  Started := False;
+  try
+    SettingsPath := WriteStagedFile('preflight.json', Settings);
+    // The settings hold no secret, only the path of a file that does, so they are safe to log.
+    Log('sukarfleet: machine-wide preflight settings in ' + SettingsPath + ':' + #13#10 + Settings);
+    Started := RunPowerShell(PreflightScript(), SettingsPath, ResultCode);
+  except
+    Problem := GetExceptionMessage;
+  end;
+  if Problem <> '' then
+  begin
+    Result := 'This machine-wide install would be refused:' + #13#10 +
+      'the preflight could not be prepared: ' + Problem + #13#10 + 'Nothing was installed.';
+    Log(Result);
+    Exit;
+  end;
+  if not Started then
   begin
     Result := 'This machine-wide install would be refused:' + #13#10 +
       'the preflight could not be started at all.' + #13#10 + 'Nothing was installed.';

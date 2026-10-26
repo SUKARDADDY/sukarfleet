@@ -123,6 +123,74 @@ jobs:
             exit 1
           }
 
+      # The settings file the installer hands the scripts, read where it is really read: by
+      # Windows PowerShell 5.1, whose ConvertFrom-Json and transcript are not pwsh's. Answers full
+      # of shell syntax must be refused in the script's own log and run nothing. Answers that are
+      # legal but look like code, a path with an ampersand, a percent sign and a $(...) in it,
+      # must be taken literally and pass. Only preflights and refusals run here, and neither
+      # writes anything, so this goes before the build, on a machine nothing is installed on.
+      - name: settings files are data under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $machine = (Resolve-Path 'install\windows\Install-MachineNode.ps1').Path
+          $user = (Resolve-Path 'install\windows\Install-Sukarfleet.ps1').Path
+          $work = Join-Path $env:RUNNER_TEMP 'settings-probe'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $marker = Join-Path $work 'MARKER'
+          $utf8 = New-Object Text.UTF8Encoding($false)
+          $hostile = @(
+            "x`" & echo pwned > `"$marker`" & rem `"",
+            "x' ; New-Item -ItemType File -Path '$marker' ; '",
+            "`$(New-Item -ItemType File -Path '$marker')",
+            "x | Out-File '$marker'",
+            "%COMSPEC% /c echo > $marker"
+          )
+          $failures = @()
+          $state = @{ n = 0 }
+          function Invoke-Probe {
+            param([string] $Script, $Body)
+            $state.n++
+            $settings = Join-Path $work "probe-$($state.n).json"
+            $log = Join-Path $work "probe-$($state.n).log"
+            $Body['LogFile'] = $log
+            [IO.File]::WriteAllText($settings, (ConvertTo-Json -InputObject $Body), $utf8)
+            & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Script -SettingsFile $settings | Out-Null
+            $code = $LASTEXITCODE
+            $text = ''
+            if (Test-Path -LiteralPath $log) { $text = Get-Content -Raw -LiteralPath $log }
+            return [pscustomobject]@{ Code = $code; Log = $text; Path = $log }
+          }
+          foreach ($value in $hostile) {
+            foreach ($field in @('MachineName', 'MeshIp', 'PeerUri')) {
+              $body = [ordered]@{ Preflight = $true; AppDir = 'C:\Program Files\sukarfleet\app'; SharedRoot = 'C:\AI_Agent'; MachineName = 'ci-runner'; Role = 'roamer'; MeshIp = '192.0.2.3'; SkipMesh = $false; SkipTray = $true; NoOpen = $true; Adopt = $false }
+              $body[$field] = $value
+              $r = Invoke-Probe -Script $machine -Body $body
+              if ($r.Code -ne 1) { $failures += "machine-wide $field=$value exited $($r.Code), not 1" }
+              if ($r.Log -notmatch 'ERROR:') { $failures += "machine-wide $field=$value left no refusal in $($r.Path)" }
+            }
+            $r = Invoke-Probe -Script $user -Body ([ordered]@{ MachineName = $value; SkipMesh = $true; SkipTray = $true; NoOpen = $true })
+            if ($r.Code -ne 1) { $failures += "per-user MachineName=$value exited $($r.Code), not 1" }
+            if ($r.Log -notmatch 'ERROR:') { $failures += "per-user MachineName=$value left no refusal in $($r.Path)" }
+            if (Test-Path -LiteralPath $marker) {
+              $failures += "a hostile value ran: $marker exists"
+              Remove-Item -LiteralPath $marker -Force
+            }
+          }
+          # Legal, and read as written: the preflight passes and names nothing it ran.
+          $legal = Join-Path $work 'Tom & Jerry 100% $(whoami) `x'
+          $r = Invoke-Probe -Script $machine -Body ([ordered]@{ Preflight = $true; AppDir = 'C:\Program Files\sukarfleet\app'; SharedRoot = $legal; MachineName = 'ci-runner'; Role = 'roamer'; SkipMesh = $true; SkipTray = $true; NoOpen = $true; Adopt = $false })
+          if ($r.Code -ne 0 -or $r.Log -notmatch 'preflight ok') {
+            $failures += "a preflight with the legal shared root '$legal' did not pass (exit $($r.Code)):"
+            $failures += $r.Log
+          }
+          if (Test-Path -LiteralPath $legal) { $failures += "a preflight created $legal" }
+          if ($failures.Count -gt 0) {
+            foreach ($f in $failures) { Write-Host $f }
+            exit 1
+          }
+          Write-Host "$($state.n) settings files read under 5.1: every hostile answer refused in its own log, nothing run, the legal one taken as written"
+
       # /O overrides whatever OutputDir the script sets, so the path below is the
       # one this workflow depends on rather than one that can move underneath it.
       - name: build the installer
@@ -767,6 +835,58 @@ jobs:
             exit 1
           }
           Write-Host 'a refused machine-wide install exits 7, says why in the setup log, and installs nothing'
+
+      # The same refusal, reached through Setup's own command line with a machine name full of
+      # cmd.exe syntax. Setup used to splice the name into a cmd.exe command line. It now writes
+      # it into the preflight's settings file, so the name has to arrive in the script exactly as
+      # typed and be refused there by name: exit code 7, the name quoted back in the setup log,
+      # and nothing installed. Runs on the clean machine the step above leaves.
+      - name: smoke - a machine name full of shell syntax is refused as data
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
+          $log = Join-Path $env:RUNNER_TEMP 'setup-hostile.log'
+          $nodeDir = Join-Path $env:ProgramData 'sukarfleet\node'
+          $appDir = (Join-Path $env:ProgramW6432 'sukarfleet\app')
+          $name = 'ci&echo-x%PATH%|more'
+          $p = Start-Process -FilePath $exe -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/ALLUSERS',
+            "/MACHINE=$name", '/SKIPMESH', '/SKIPTRAY', '/NOOPEN',
+            "/LOG=$log"
+          )
+          $deadline = (Get-Date).AddMinutes(10)
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 5 }
+          if (-not $p.HasExited) {
+            Write-Host 'the refused install did not return within 10 minutes; killing it'
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          $p.WaitForExit()
+          Write-Host "installer exit code: $($p.ExitCode)"
+          $setupLog = ''
+          if (Test-Path -LiteralPath $log) {
+            $setupLog = Get-Content -Raw -LiteralPath $log
+            Write-Host "--- $log ---"
+            Get-Content -LiteralPath $log | ForEach-Object { Write-Host "  $_" }
+            Write-Host '--- end of setup log ---'
+          }
+          $failures = @()
+          if ($p.ExitCode -ne 7) { $failures += "Setup exited $($p.ExitCode); 7 is the refusal" }
+          if ($setupLog -notmatch [regex]::Escape("""MachineName"": ""$name""")) {
+            $failures += 'the settings file in the setup log does not hold the machine name as typed'
+          }
+          if ($setupLog -notmatch [regex]::Escape("'$name' is not a machine name the fleet accepts")) {
+            $failures += 'the refusal in the setup log does not name the machine name as typed'
+          }
+          if ($setupLog -match 'cmd\.exe') { $failures += 'the setup log shows cmd.exe being started' }
+          if (Get-Service -Name sukarfleet-node -ErrorAction SilentlyContinue) { $failures += 'the refused install registered the service' }
+          if (Test-Path -LiteralPath $nodeDir) { $failures += "the refused install created $nodeDir" }
+          if (Test-Path -LiteralPath $appDir) { $failures += "the refused install created $appDir" }
+          if ($failures.Count -gt 0) {
+            foreach ($f in $failures) { Write-Host $f }
+            exit 1
+          }
+          Write-Host 'a machine name full of shell syntax reached the script as data, was refused by name, and nothing was installed'
 
       # Adoption, which is the one path in this installer that acts on a machine that already
       # has a node rather than on an empty one, and the one nothing else in this workflow runs:
