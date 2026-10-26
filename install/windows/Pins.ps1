@@ -4,9 +4,9 @@
   Reads install/easytier-pins.txt and fetches a binary against the line it finds.
 
 .DESCRIPTION
-  Dot-sourced by Install-MachineNode.ps1 and Uninstall-MachineNode.ps1. Install-Sukarfleet.ps1
-  keeps its own copy of Get-Pin, because this PR does not edit that script; the semantics here
-  are the same semantics, and a change to one is a change owed to the other.
+  Dot-sourced by Install-MachineNode.ps1, Uninstall-MachineNode.ps1 and Install-Sukarfleet.ps1
+  (the last from Install-Tray, out of the source tree that holds the pin file). Get-Pin is
+  defined here and nowhere else.
 
   Two functions:
 

@@ -42,8 +42,9 @@ other. Anything else has to be read here first.
   fleet identity for the PC in `C:\ProgramData\sukarfleet\node` and one shared checkout at
   `C:\AI_Agent`, and it can adopt an existing per-user install in place rather than pairing again.
   New: `install/windows/sukarfleet.iss`, `Install-MachineNode.ps1`, `Uninstall-MachineNode.ps1`,
-  `Pins.ps1` and `sukarfleet-node.xml`. `Add-To-Fleet.cmd` and `Install-Sukarfleet.ps1` are
-  unchanged, and one-click enrollment still generates the `.cmd`.
+  `Pins.ps1` and `sukarfleet-node.xml`. `Add-To-Fleet.cmd` is unchanged, and one-click
+  enrollment still generates the `.cmd`. `Install-Sukarfleet.ps1` now reads the tray pin through
+  the shared `Pins.ps1` instead of its own copy of the parser.
   - The EXE is **not signed**. SmartScreen warns, and the SHA256 the build prints is the check that
     is available until a certificate exists.
   - Uninstall removes the service, the program and the registry entries and keeps the node
