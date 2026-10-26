@@ -263,12 +263,12 @@ describe('clock sync probe', () => {
   test('macos measures clock offset without changing the clock and rejects uncertainty', async () => {
     const calls: string[][] = [];
     const probe = clockSyncProbeFor('macos');
-    expect(await probe.probe(async (argv) => { calls.push(argv); return { code: 0, stdout: '+0.003308 +/- 0.062059 time.apple.com 17.253.14.37\n', stderr: '' }; })).toBe('synced');
+    expect(await probe.probe(async (argv) => { calls.push(argv); return { code: 0, stdout: '+0.003308 +/- 0.062059 time.apple.com 192.0.2.37\n', stderr: '' }; })).toBe('synced');
     expect(calls).toEqual([['/usr/bin/sntp', '-t', '3', 'time.apple.com']]);
-    expect(parseMacSntp('+2.0 +/- 0.01 time.apple.com 17.0.0.1')).toBe('unsynced');
-    expect(parseMacSntp('-0.5 +/- 0.6 time.apple.com 17.0.0.1')).toBe('unsynced');
+    expect(parseMacSntp('+2.0 +/- 0.01 time.apple.com 192.0.2.1')).toBe('unsynced');
+    expect(parseMacSntp('-0.5 +/- 0.6 time.apple.com 192.0.2.1')).toBe('unsynced');
     expect(parseMacSntp('timed enabled')).toBe('unknown');
-    expect(await probe.probe(async () => ({ code: 1, stdout: '+0.0 +/- 0.1 time.apple.com 17.0.0.1', stderr: '' }))).toBe('unknown');
+    expect(await probe.probe(async () => ({ code: 1, stdout: '+0.0 +/- 0.1 time.apple.com 192.0.2.1', stderr: '' }))).toBe('unknown');
   });
 
   test('an unknown platform is unknown, not optimistically synced', async () => {

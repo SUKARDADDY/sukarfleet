@@ -12,6 +12,21 @@ other. Anything else has to be read here first.
 
 ## [Unreleased]
 
+### Changed
+
+- **The macOS bootstrap uses the project's own names.** `install/macos.ts` creates the node's
+  LaunchAgent as `org.sukarfleet.node`. `fleet.node_init` takes optional `easytierCliPath` and
+  `easytierServiceName` for the EasyTier install it runs over, defaulting to
+  `/usr/local/bin/easytier-cli` and `org.sukarfleet.easytier`. A node set up before this keeps its
+  existing labels: the bootstrap only runs where no configuration exists.
+- **Release tray binaries carry no build-machine paths.** The Windows tray workflow and the new
+  `clients/tray/tools/build-release.sh` rewrite the cargo registry and checkout paths with
+  `--remap-path-prefix`, and the workflow fails if a `C:\Users\` path survives.
+- **The privacy guard reads its maintainers' own names from outside the repository.**
+  `tests/no-personal-data.test.ts` keeps its shape checks and loads literal names from
+  `$SUKARFLEET_PRIVATE_DENYLIST` or `~/.config/sukarfleet/private-denylist.txt`, skipping that part
+  when the file is absent, so the check no longer publishes the names it guards.
+
 ## [0.2.0] - 2026-10-26
 
 Every machine in a fleet can now be driven from one agent through MCP: full nodes, machines reached
@@ -186,7 +201,7 @@ is unchanged, so 0.1 and 0.2 machines pair and sync with each other.
 - **A Windows machine with a capitalised account name could not pair at all.** The installer wrote
   `admin.sshUser` straight from `%USERNAME%`, and `sanitizeBundle` validates every bundle's
   `sshUser` against `^[a-z_][a-z0-9_-]{0,31}$` — including the machine's own. So a box whose user
-  was `Ariel` failed its own local validation and pairing died with "This machine has no usable SSH
+  was `Alex` failed its own local validation and pairing died with "This machine has no usable SSH
   identity yet", which named the symptom and not the cause. The installer now folds the account name
   into a name that validator accepts. The value is inert on Windows anyway: the admin lane is off and
   nothing dials it.

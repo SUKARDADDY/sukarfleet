@@ -395,7 +395,7 @@ describe('buildAdminLaneView (Class G: uiAssets exposed on UiState)', () => {
     const cfg = defaultConfig('alpha');
     cfg.admin.enabled = true;
     cfg.admin.acceptIncoming = false;
-    cfg.admin.sshUser = 'ariel';
+    cfg.admin.sshUser = 'alex';
     const view = buildAdminLaneView({
       cfg,
       configured: false,
@@ -411,7 +411,7 @@ describe('buildAdminLaneView (Class G: uiAssets exposed on UiState)', () => {
       credentialStale: true,
       credentialSealed: 'tpm2',
       credentialSetAtMs: 12345,
-      sshUser: 'ariel',
+      sshUser: 'alex',
       sshKeyFingerprint: 'SHA256:abc',
       runTimeoutSec: cfg.admin.runTimeoutSec,
       maxRunTimeoutSec: cfg.admin.maxRunTimeoutSec,

@@ -348,7 +348,7 @@ function Remove-SecretFile {
 # A Windows account name is not an SSH account name. src/pairing.ts validates every bundle's
 # sshUser against /^[a-z_][a-z0-9_-]{0,31}$/ -- the names sshd will accept, and never one that could
 # start with '-' and be read as an option by `ssh -l` -- and it applies that rule to the LOCAL
-# bundle too. So a machine whose Windows user is 'Ariel' fails its own validation and pairing dies
+# bundle too. So a machine whose Windows user is 'Alex' fails its own validation and pairing dies
 # with "This machine has no usable SSH identity yet", which names the symptom and not the cause.
 #
 # The value is inert on this platform anyway: the admin lane is off here and no peer dials a Windows

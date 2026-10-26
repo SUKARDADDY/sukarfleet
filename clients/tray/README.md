@@ -32,6 +32,18 @@ The tray icon IS the fleet health signal; the menu is the primary readout
   console window that nothing captures either. Naming a log file that does not
   exist would send someone looking for it.
 
+## Building a release for Linux
+
+```
+clients/tray/tools/build-release.sh
+```
+
+It runs `cargo build --release --locked` from the crate directory and rewrites the cargo registry
+and checkout paths in the binary, which a plain build embeds hundreds of times. Tauri also embeds
+the crate's own directory, which no remap reaches, so the script refuses to run from a checkout
+under your home directory: clone the release tag to a neutral path such as
+`/tmp/sukarfleet-release` and build there.
+
 ## Building for Windows
 
 `.github/workflows/tray.yml` builds it on a Windows runner and uploads
