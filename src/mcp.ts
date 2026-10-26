@@ -186,14 +186,14 @@ const TOOLS: McpToolDef[] = [
       port: { type: 'integer', default: 22 }, user: { type: 'string' },
       identityFile: { type: 'string', description: 'Existing private key path on this origin. The key is never returned.' },
       knownHostsFile: { type: 'string', description: 'Existing known_hosts file containing a pin for this address and port.' },
-      platform: { type: 'string', enum: ['macos', 'linux'] },
+      platform: { type: 'string', enum: ['macos', 'linux', 'windows'] },
       screenshotCommand: { type: 'array', items: { type: 'string' }, description: 'Optional GUI broker argv that writes PNG to an {output} argument. Otherwise uses macOS screencapture.' },
       reason: { type: 'string' }, replace: { type: 'boolean', default: false },
     }, required: ['machine', 'host', 'user', 'identityFile', 'knownHostsFile', 'platform', 'reason'], additionalProperties: false },
   },
   {
     name: 'fleet.run',
-    description: 'Run argv on a registered access-only machine as its SSH user. Requires /usr/bin/perl on the target for process-group deadlines. Strict host-key pinning, bounded output and signed auditing apply. asRoot uses sudo -n and requires existing target-local sudo authorization; no password is requested or transmitted. SSH failure leaves completion unknown; never automatically retry.',
+    description: 'Run argv on a registered SSH machine as its SSH user. macOS/Linux use /usr/bin/perl process-group deadlines; Windows uses PowerShell and a kill-on-close Job Object. Strict host-key pinning, bounded output and signed auditing apply. asRoot uses sudo -n on macOS/Linux and is refused on Windows. No password is requested or transmitted. SSH failure leaves completion unknown; never automatically retry.',
     inputSchema: { type: 'object', properties: {
       machine: { type: 'string' }, argv: { type: 'array', items: { type: 'string' } },
       reason: { type: 'string' }, timeoutSec: { type: 'integer' }, asRoot: { type: 'boolean', default: false },

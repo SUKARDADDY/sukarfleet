@@ -256,7 +256,7 @@ export function validateAccessTarget(value: unknown): asserts value is AccessTar
       fail(`access target ${field} must be an absolute or home-relative path`);
     }
   }
-  if (value.platform !== 'macos' && value.platform !== 'linux') fail('invalid access target platform');
+  if (value.platform !== 'macos' && value.platform !== 'linux' && value.platform !== 'windows') fail('invalid access target platform');
   if (value.screenshotCommand !== undefined && (!Array.isArray(value.screenshotCommand) ||
       !value.screenshotCommand.length || value.screenshotCommand.length > 64 ||
       value.screenshotCommand.some((s) => typeof s !== 'string' || s.includes('\0')) ||

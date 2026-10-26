@@ -6,6 +6,7 @@ import { stat } from 'node:fs/promises';
 import { expandHome, patchConfig, validateAccessTarget } from './config';
 import type { AccessTargetConfig, AuditEntry, FleetConfig } from './types';
 import { canonicalJson, runBytes } from './util';
+import { WINDOWS_BOOTSTRAP, windowsRunPayload, windowsExitCode, stripWindowsCompletion } from './windows-access';
 
 export type AccessContent = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string };
 export interface AccessResult { content: AccessContent[]; isError?: boolean }
@@ -35,7 +36,8 @@ alarm $seconds; waitpid($pid,0); my $status=$?; alarm 0; stop();
 exit (($status & 127) ? 128+($status & 127) : $status >> 8);`;
 
 export function accessSshArgv(target: AccessTargetConfig, timeoutSec: number, argv: string[], connectSec: number): string[] {
-  const remoteCommand = ['exec', '/usr/bin/perl', '-e', REMOTE_RUNNER, '--', String(timeoutSec), ...argv].map(shellQuote).join(' ');
+  const remoteCommand = target.platform === 'windows' ? WINDOWS_BOOTSTRAP :
+    ['exec', '/usr/bin/perl', '-e', REMOTE_RUNNER, '--', String(timeoutSec), ...argv].map(shellQuote).join(' ');
   if (Buffer.byteLength(remoteCommand, 'utf8') > 65536) throw new Error('encoded SSH command exceeds 64 KiB after shell quoting');
   const optionPath = (path: string): string => `"${sshPath(path).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
   return [
@@ -145,7 +147,8 @@ export class AccessOnly {
         });
         this.deps.cfg.accessTargets = saved.accessTargets;
         await this.deps.auditAppend('access-register-completed', { runId, machine: target.name });
-        return text({ runId, machine: target.name, registered: true, mode: 'access-only', sync: false });
+        const sync = this.deps.cfg.peers.some((p) => p.name === target.name);
+        return text({ runId, machine: target.name, registered: true, mode: sync ? 'ssh-access' : 'access-only', sync });
       }
       const target = this.target(args.machine);
       const screenshot = name === 'fleet.screenshot';
@@ -156,6 +159,7 @@ export class AccessOnly {
           argv.some((a) => typeof a !== 'string' || a.includes('\0')) ||
           !argv[0] || Buffer.byteLength(JSON.stringify(argv)) > 65536) throw new Error('argv must contain 1-128 strings, at most 64 KiB, without NUL');
       if (args.asRoot !== undefined && typeof args.asRoot !== 'boolean') throw new Error('asRoot must be a boolean');
+      if (target.platform === 'windows' && args.asRoot === true) throw new Error('Windows access runs as the registered SSH account; asRoot is unsupported');
       const timeoutSec = args.timeoutSec ?? this.deps.cfg.admin.runTimeoutSec;
       if (!Number.isInteger(timeoutSec) || (timeoutSec as number) < 1 || (timeoutSec as number) > this.deps.cfg.admin.maxRunTimeoutSec) {
         throw new Error('timeoutSec must be a positive integer within admin.maxRunTimeoutSec');
@@ -170,13 +174,19 @@ export class AccessOnly {
       requested = true;
       const started = Date.now();
       const result = await this.runner(transportArgv, {
-        timeoutMs: ((timeoutSec as number) + this.deps.cfg.admin.connectTimeoutSec + 5) * 1000,
+        timeoutMs: ((timeoutSec as number) + this.deps.cfg.admin.connectTimeoutSec + (target.platform === 'windows' ? 15 : 5)) * 1000,
         maxCaptureBytes: screenshot ? 8 * 1024 * 1024 : this.deps.cfg.admin.maxOutputBytes,
+        ...(target.platform === 'windows' ? { stdin: windowsRunPayload(command, timeoutSec as number, runId), stderrTailBytes: 256 } : {}),
       });
-      const exitCode = result.code === 255 || result.timedOut || result.signalCode ? null : result.code;
+      const windows = target.platform === 'windows';
+      const exitCode = result.timedOut || result.signalCode ? null : windows ?
+        (result.code === 0 ? windowsExitCode(result.stderrTail ?? '', runId) : null) :
+        (result.code === 255 ? null : result.code);
       const meta = { runId, machine: target.name, exitCode, durationMs: Date.now() - started,
-        truncated: result.truncated ?? false, stderr: result.stderr,
-        ...(exitCode === null ? { message: 'SSH failed; remote completion is unknown. Do not automatically retry.' } : {}),
+        truncated: result.truncated ?? false, stderr: windows ? stripWindowsCompletion(result.stderr, runId) : result.stderr,
+        ...(exitCode === null ? { message: windows && result.code === 0 ?
+          'Windows runner returned no completion record; remote completion is unknown. Do not automatically retry.' :
+          'SSH failed; remote completion is unknown. Do not automatically retry.' } : {}),
       };
       let auditRecorded = true;
       try {

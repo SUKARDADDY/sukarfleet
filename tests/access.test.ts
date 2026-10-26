@@ -8,6 +8,7 @@ import { defaultConfig, loadConfig, patchConfig } from '../src/config';
 import type { AccessTargetConfig, AuditEntry } from '../src/types';
 import { runBytes } from '../src/util';
 import { createMcpFetchHandler } from '../src/mcp';
+import { WINDOWS_BOOTSTRAP, windowsExitCode, windowsRunPayload } from '../src/windows-access';
 
 const dirs: string[] = [];
 afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
@@ -27,6 +28,7 @@ async function harness() {
   const calls: { argv: string[]; opts: any }[] = [];
   const audit: { kind: string; detail: any }[] = [];
   let pinCode = 0, runCode = 0, failAudit = '', bytes: Uint8Array = Buffer.from('ok'), truncated = false;
+  let windowsCode = 0, noFooter = false;
   const auditAppend = async (kind: string, detail: any): Promise<AuditEntry> => {
     if (kind === failAudit) throw new Error('audit unavailable');
     audit.push({ kind, detail }); return {} as AuditEntry;
@@ -35,11 +37,15 @@ async function harness() {
     persist: (mutate) => patchConfig(mutate, configPath),
     runner: async (argv, opts) => {
       calls.push({ argv, opts });
-      return { code: argv[0] === 'ssh-keygen' ? pinCode : runCode, stdout: bytes, stderr: '', truncated };
+      const encoded = typeof opts?.stdin === 'string' ? opts.stdin.match(/FromBase64String\('([^']+)'\)/)?.[1] : null;
+      const payload = encoded ? JSON.parse(Buffer.from(encoded, 'base64').toString()) : null;
+      return { code: argv[0] === 'ssh-keygen' ? pinCode : runCode, stdout: bytes, stderr: '', truncated,
+        ...(payload && !noFooter ? { stderrTail: `\r\nFLEET-WINDOWS-${payload.runId}:${windowsCode}\r\n` } : {}) };
     },
   });
   return { cfg, target, access, calls, audit, configPath, dir, auditAppend,
     pinFailure: () => { pinCode = 1; }, code: (n: number) => { runCode = n; },
+    windowsCode: (n: number) => { windowsCode = n; }, noFooter: () => { noFooter = true; },
     bytes: (b: Buffer, cut = false) => { bytes = b; truncated = cut; }, failAudit: (s: string) => { failAudit = s; } };
 }
 const request = { machine: 'beta', argv: ['/usr/bin/printf', '%s', `spaces 'quotes' $HOME ; touch /bad`], reason: 'verify native access' };
@@ -211,4 +217,90 @@ test('remote deadline kills descendants and preserves ordinary exit codes', asyn
   await Bun.sleep(1200); expect(await Bun.file(marker).exists()).toBe(false);
   const failure = await runBytes(['/usr/bin/perl', '-e', REMOTE_RUNNER, '--', '2', '/bin/sh', '-c', 'exit 7']);
   expect(failure.code).toBe(7);
+});
+
+test('Windows registration persists through the MCP handler without modifying a matching full node', async () => {
+  const h = await harness();
+  h.cfg.peers = [{ name: 'beta', meshIp: h.target.host, nodePort: 7710, publicKeyJwk: null }];
+  const handler = createMcpFetchHandler({ cfg: h.cfg, listPeers: () => [], tailAudit: async () => [],
+    adminRun: async () => { throw new Error('unexpected admin call'); }, adminStatus: async () => [], access: h.access });
+  const response = await handler(new Request('http://127.0.0.1:7719/mcp', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {
+      name: 'fleet.access_register', arguments: { machine: 'beta', ...h.target, platform: 'windows', replace: true, reason: 'native Windows access' } } }) }));
+  const registered = (await response.json() as any).result;
+  expect(registered.isError).toBeUndefined();
+  expect(decode(registered)).toMatchObject({ registered: true, mode: 'ssh-access', sync: true });
+  expect((await loadConfig(h.configPath)).accessTargets?.[0]?.platform).toBe('windows');
+  expect(decode(await h.access.call('fleet.access_list', {})).machines[0]).toMatchObject({ mode: 'ssh-access', sync: true, platform: 'windows' });
+  expect(h.cfg.peers).toHaveLength(1);
+});
+
+test('Windows transport keeps adversarial and Unicode argv out of the remote shell command', async () => {
+  const h = await harness(); h.target.platform = 'windows';
+  const argv = ['powershell.exe', '-NoProfile', '-Command', `Write-Output 'literal & | %PATH% $HOME ; "quotes" עברית'`, '', 'C:\\space path\\'];
+  const result = await h.access.call('fleet.run', { ...request, argv });
+  expect(decode(result).exitCode).toBe(0);
+  const call = h.calls.find((c) => c.argv[0] === 'ssh')!;
+  expect(call.argv.at(-1)).toBe(WINDOWS_BOOTSTRAP);
+  expect(WINDOWS_BOOTSTRAP.length).toBeLessThan(8191);
+  expect(call.argv.join(' ')).not.toContain('Write-Output');
+  const base64 = call.opts.stdin.match(/FromBase64String\('([^']+)'\)/)[1];
+  expect(JSON.parse(Buffer.from(base64, 'base64').toString('utf8'))).toEqual({ argv, timeoutSec: h.cfg.admin.runTimeoutSec, runId: expect.any(String) });
+  expect(call.argv).toContain('StrictHostKeyChecking=yes');
+  expect(h.audit.map((a) => a.kind)).toEqual(['access-run-requested', 'access-run-completed']);
+});
+
+test('Windows refuses elevation before dispatch and preserves unknown completion without retry', async () => {
+  const h = await harness(); h.target.platform = 'windows';
+  const refused = await h.access.call('fleet.run', { ...request, asRoot: true });
+  expect(refused.isError).toBe(true); expect(decode(refused).error).toContain('asRoot is unsupported');
+  expect(h.calls).toHaveLength(0);
+  h.code(255);
+  const failed = await h.access.call('fleet.run', request);
+  expect(failed.isError).toBe(true); expect(decode(failed).exitCode).toBeNull();
+  expect(h.calls.filter((c) => c.argv[0] === 'ssh')).toHaveLength(1);
+});
+
+test('Windows reports native exit codes from the matching completion record, including deadline and exit 255', async () => {
+  const h = await harness(); h.target.platform = 'windows';
+  for (const code of [0, 7, 124, 255, -1073741510]) {
+    h.windowsCode(code);
+    expect(decode(await h.access.call('fleet.run', request)).exitCode).toBe(code);
+  }
+  h.noFooter();
+  const unknown = await h.access.call('fleet.run', request);
+  expect(unknown.isError).toBe(true); expect(decode(unknown).exitCode).toBeNull();
+  expect(decode(unknown).message).toContain('no completion record');
+  const id = '9ccff279-11ab-4c47-8f02-7b32d544e07c';
+  expect(windowsExitCode(`\nFLEET-WINDOWS-${id}:7\nextra`, id)).toBeNull();
+  expect(windowsExitCode(`\nFLEET-WINDOWS-${id}:2147483648\n`, id)).toBeNull();
+  expect(windowsExitCode(`\nFLEET-WINDOWS-${id}:7\n`, 'other-id')).toBeNull();
+});
+
+test('bounded stderr suffix preserves a completion record after truncated output without changing prefix capture', async () => {
+  const r = await runBytes(['bun', '-e', `process.stderr.write('x'.repeat(100000)+'\\ncompletion:124\\n')`],
+    { maxCaptureBytes: 8, stderrTailBytes: 64 });
+  expect(r.code).toBe(0); expect(r.stderr).toBe('xxxxxxxx'); expect(r.truncated).toBe(true);
+  expect(r.stderrTail?.length).toBe(64); expect(r.stderrTail?.endsWith('\ncompletion:124\n')).toBe(true);
+});
+
+test('a process that does not consume a large stdin payload still has a working deadline', async () => {
+  const began = Date.now();
+  const r = await runBytes(['/bin/sh', '-c', 'exec sleep 10'],
+    { stdin: 'x'.repeat(1024 * 1024), timeoutMs: 20, killGraceMs: 20 });
+  expect(r.timedOut).toBe(true); expect(Date.now() - began).toBeLessThan(2000);
+});
+
+test('a Windows executable given as a path is resolved literally; a bare name is looked up on PATH', () => {
+  const ps = windowsRunPayload(['C:\\Tools\\[v1]\\tool.exe'], 30, 'r');
+  // A path goes to Get-Item -LiteralPath: wildcard escaping would insert backticks into
+  // C:\Tools\[v1]\tool.exe and look for a file by that altered name.
+  expect(ps).toContain("if($a.IndexOfAny([char[]]'\\/:') -ge 0){$src=(Get-Item -LiteralPath $a");
+  // A bare name with no wildcard character goes to Get-Command as it is. One with [ ] * or ? is
+  // found by walking PATH literally: Get-Command keeps an escaped name's backticks.
+  expect(ps).toContain("elseif($a.IndexOfAny([char[]]'[]*?') -lt 0){$src=(Get-Command -Name $a ");
+  expect(ps).toContain('[IO.File]::Exists($c)');
+  expect(ps).not.toContain('WildcardPattern');
+  expect(ps).toContain('[FleetJob]::Run($src,');
+  expect(ps).not.toContain('$exe.Source');
 });
