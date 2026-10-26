@@ -2038,6 +2038,79 @@ test('an untracked unportable file left on disk is not re-staged, re-untracked a
   expect(await exists(join(dirA, 'gen:out.log'))).toBe(true);
 });
 
+// --- review round on #15 -----------------------------------------------------------------
+test('an older peer that keeps changing an unportable file does not block later merges', async () => {
+  const { dirA, dirB, syncA, recA, repoA } = await setupPair({ 'ok.txt': 'v0' });
+  // Cycle 1: an older peer commits an unportable log; alpha merges it and untracks it.
+  await writeFile(join(dirB, 'bad:name.log'), 'one');
+  await writeFile(join(dirB, 'ok.txt'), 'v1');
+  await git(dirB, ['add', '-A']);
+  await git(dirB, ['commit', '-q', '-m', 'older peer 1']);
+  await syncA.syncOnce(repoA);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect(await readFile(join(dirA, 'bad:name.log'), 'utf8')).toBe('one');
+
+  // Cycles 2 and 3: the peer changes the same log and a portable file again.
+  for (const v of ['two', 'three']) {
+    await writeFile(join(dirB, 'bad:name.log'), v);
+    await writeFile(join(dirB, 'ok.txt'), `ok-${v}`);
+    await git(dirB, ['add', '-A']);
+    await git(dirB, ['commit', '-q', '-m', `older peer ${v}`]);
+    await syncA.syncOnce(repoA);
+    expect(recA.stats.at(-1)!.syncError).toBeNull();
+    expect(await readFile(join(dirA, 'ok.txt'), 'utf8')).toBe(`ok-${v}`);
+  }
+  // The tip stays portable, and every version that was on disk is kept, locally, in the git dir.
+  const tree = (await git(dirA, ['ls-tree', '-r', '--name-only', 'HEAD'])).stdout;
+  expect(tree).not.toContain('bad:name.log');
+  const asideRoot = join(dirA, '.git', 'sukarfleet-unportable');
+  const kept: string[] = [];
+  for (const stamp of await readdir(asideRoot)) {
+    for (const f of await readdir(join(asideRoot, stamp))) kept.push(await readFile(join(asideRoot, stamp, f), 'utf8'));
+  }
+  expect(kept.sort()).toEqual(['one', 'two']);
+});
+
+test('an unportable file no incoming commit touches stays where it is', async () => {
+  const { dirA, dirB, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, 'mine:local.log'), 'local');
+  await writeFile(join(dirB, 'b.txt'), 'two');
+  await git(dirB, ['add', '-A']);
+  await git(dirB, ['commit', '-q', '-m', 'peer']);
+  await syncA.syncOnce(repoA);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect(await readFile(join(dirA, 'mine:local.log'), 'utf8')).toBe('local');
+  expect(await exists(join(dirA, '.git', 'sukarfleet-unportable'))).toBe(false);
+});
+
+test('a staged deletion of an unportable path is committed', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'a.txt': 'one' });
+  // An older version of this machine committed the path; a person removes it by hand.
+  await writeFile(join(dirA, 'bad:name.txt'), 'x');
+  await git(dirA, ['add', '-A']);
+  await git(dirA, ['commit', '-q', '-m', 'older version']);
+  await git(dirA, ['rm', '-q', '--', 'bad:name.txt']);
+  await syncA.syncOnce(repoA);
+  await syncA.syncOnce(repoA);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect((await git(dirA, ['ls-tree', '-r', '--name-only', 'HEAD'])).stdout).not.toContain('bad:name.txt');
+  expect((await run(['git', 'diff', '--cached', '--quiet'], { cwd: dirA })).code).toBe(0);
+});
+
+test('an untrack commit a hook refused is retried once the hook allows it', async () => {
+  const { dirA, syncA, repoA } = await setupPair({ 'a.txt': 'one' });
+  await writeFile(join(dirA, 'bad:name.txt'), 'x');
+  await git(dirA, ['add', '-A']);
+  await git(dirA, ['commit', '-q', '-m', 'older version']);
+  await installHook(dirA, 'pre-commit', 'exit 1');
+  await syncA.syncOnce(repoA);
+  expect((await git(dirA, ['ls-tree', '-r', '--name-only', 'HEAD'])).stdout).toContain('bad:name.txt');
+  await rm(join(dirA, '.git', 'hooks', 'pre-commit'));
+  await syncA.syncOnce(repoA);
+  expect((await git(dirA, ['ls-tree', '-r', '--name-only', 'HEAD'])).stdout).not.toContain('bad:name.txt');
+  expect(await exists(join(dirA, 'bad:name.txt'))).toBe(true);
+});
+
 async function installHook(repoDir: string, name: string, body: string): Promise<void> {
   const p = join(repoDir, '.git', 'hooks', name);
   await writeFile(p, `#!/bin/sh\n${body}\n`);

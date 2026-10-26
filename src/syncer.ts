@@ -732,7 +732,7 @@ export class Syncer {
   // cherry-pick or stash pop) is waited on.
   private async autoCommit(repo: RepoConfig): Promise<boolean> {
     const repoPath = repo.path;
-    const untracked = await this.untrackUnportable(repo);
+    await this.untrackUnportable(repo);
     const st = await this.gitOk(repoPath, ['status', '--porcelain', '-z', '--untracked-files=all']);
     if (hasUnmergedZ(st.stdout)) {
       throw new SyncDeferred('unmerged paths in the index are waiting to be resolved by hand');
@@ -746,7 +746,9 @@ export class Syncer {
         paths: all.filter((p) => !isPortablePath(p)).slice(0, 10),
       });
     }
-    if (paths.length === 0 && untracked === 0) return false;
+    // No early return when nothing is left to add: a deletion can already be staged with nothing
+    // left to show for it in `paths` -- an unportable name removed by hand, or the commit of an
+    // earlier untrack that a hook refused. The staged check below commits it either way.
 
     let addable: string[] = [];
     if (paths.length > 0) {
@@ -819,6 +821,51 @@ export class Syncer {
       log('error', 'auto-commit: recording the untracked paths failed', { repo: repo.name, error: String(err) });
     }
     return bad.length;
+  }
+
+  // An unportable file that an earlier merge brought in is untracked and left on disk. If the peer
+  // (an older version, during an upgrade) changes it again, `git merge` refuses outright -- the
+  // untracked file would be overwritten -- and every later merge from that peer fails with it,
+  // portable changes included. So right before a merge, each unportable path the incoming side
+  // writes (added, modified, renamed or copied since the merge base) that sits on disk untracked is
+  // moved into the git dir: local to this machine, never committed or synced, bytes kept. A file no
+  // incoming commit touches stays where it is.
+  private async setAsideObstructingUnportable(repo: RepoConfig, theirsTip: string): Promise<void> {
+    const mb = await this.git(repo.path, ['merge-base', 'HEAD', theirsTip]);
+    if (mb.code !== 0) return;
+    const changed = await this.git(repo.path, ['diff', '--name-only', '-z', '--no-renames', '--diff-filter=AMCT', mb.stdout.trim(), theirsTip]);
+    if (changed.code !== 0) return;
+    const bad = changed.stdout.split('\0').filter((p) => p && !isPortablePath(p));
+    if (bad.length === 0) return;
+    const tracked = await this.gitOk(repo.path, ['--literal-pathspecs', 'ls-files', '-z', '--', ...bad]);
+    const inIndex = new Set(tracked.stdout.split('\0').filter(Boolean));
+    const dirs = await resolveGitDirs(repo.path);
+    if (dirs === null) return;
+    const destDir = join(dirs.gitDir, 'sukarfleet-unportable', this.fsIso());
+    const moved: string[] = [];
+    for (const p of bad) {
+      if (inIndex.has(p)) continue;
+      const src = join(repo.path, p);
+      try {
+        if (!(await lstat(src)).isFile()) continue;
+      } catch {
+        continue;
+      }
+      try {
+        await mkdir(destDir, { recursive: true });
+        await rename(src, join(destDir, encodeURIComponent(p)));
+        moved.push(p);
+      } catch (err) {
+        log('error', 'merge: could not move an unportable file out of the way', { repo: repo.name, path: p, error: String(err) });
+      }
+    }
+    if (moved.length > 0) {
+      log('warn', 'merge: moved unportable files the incoming commit rewrites into the git dir', {
+        repo: repo.name,
+        dir: destDir,
+        paths: moved.slice(0, 10),
+      });
+    }
   }
 
   // `git add -A`, minus every path a Windows checkout cannot hold. The broad add that commitAll and a
@@ -1047,6 +1094,7 @@ export class Syncer {
   ): Promise<MergeTipResult> {
     const { theirsTip, peer: peerName } = m;
     let unionRegenNeeded = false;
+    await this.setAsideObstructingUnportable(repo, theirsTip);
     // A plain `git merge`, so hooks run exactly as they always have: pre-merge-commit and
     // commit-msg, then post-merge -- not pre-commit, which a `--no-commit` + `commit` pair would run
     // instead. A peer on an older version may have committed a path Windows cannot hold; the merge
