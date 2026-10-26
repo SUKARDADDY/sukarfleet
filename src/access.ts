@@ -115,7 +115,8 @@ export class AccessOnly {
     if (name === 'fleet.access_list') {
       return text({ origin: this.deps.cfg.machine, machines: (this.deps.cfg.accessTargets ?? []).map((t) => ({
         name: t.name, host: t.host, port: t.port, user: t.user, platform: t.platform,
-        mode: 'access-only', sync: false,
+        mode: this.deps.cfg.peers.some((p) => p.name === t.name) ? 'ssh-access' : 'access-only',
+        sync: this.deps.cfg.peers.some((p) => p.name === t.name),
       })) });
     }
     const runId = randomUUID();
@@ -127,7 +128,7 @@ export class AccessOnly {
           identityFile: args.identityFile, knownHostsFile: args.knownHostsFile, platform: args.platform,
           screenshotCommand: args.screenshotCommand };
         validateAccessTarget(target);
-        if (target.name === this.deps.cfg.machine || this.deps.cfg.peers.some((p) => p.name === target.name)) {
+        if (target.name === this.deps.cfg.machine || this.deps.cfg.peers.some((p) => p.name === target.name && p.meshIp !== target.host)) {
           throw new Error('access-only name conflicts with a full node');
         }
         await this.checkFiles(target);

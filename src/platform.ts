@@ -686,17 +686,23 @@ const windowsClockSyncProbe: ClockSyncProbe = {
   },
 };
 
+// A read-only SNTP query measures the actual clock offset; no -s/-S flag changes time.
+export function parseMacSntp(stdout: string): ClockSyncState {
+  const line = stdout.trim();
+  const match = /^([+-]\d+(?:\.\d+)?)\s+\+\/-\s+(\d+(?:\.\d+)?)\s+\S+\s+\S+$/m.exec(line);
+  if (!match) return 'unknown';
+  const offset = Number(match[1]);
+  const uncertainty = Number(match[2]);
+  if (!Number.isFinite(offset) || !Number.isFinite(uncertainty)) return 'unknown';
+  return Math.abs(offset) + uncertainty <= 1 ? 'synced' : 'unsynced';
+}
+
 const macosClockSyncProbe: ClockSyncProbe = {
   platform: 'macos',
-  support: 'unsupported',
-  async probe() {
-    // There is no honest macOS probe here yet, so this says so rather than inventing one. `sntp`
-    // queries a server over the network instead of reporting what timed(8) believes, so it answers
-    // a different question and fails on any machine without egress to that server; and
-    // `systemsetup -getusingnetworktime` reports whether the feature is switched ON, which is a
-    // capability question -- precisely the confidently-wrong answer this module exists to avoid.
-    // Unvetted on macOS means auto-commit holds and the log says why.
-    return 'unknown';
+  support: 'experimental',
+  async probe(runner = defaultRunner) {
+    const result = await runSeam(runner, ['/usr/bin/sntp', '-t', '3', 'time.apple.com'], { timeoutMs: 5000 });
+    return result.code === 0 ? parseMacSntp(result.stdout) : 'unknown';
   },
 };
 

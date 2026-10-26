@@ -358,7 +358,7 @@ describe('ClockSentinel.vet across platforms', () => {
     }
   });
 
-  test('macos reports unknown without spawning anything', async () => {
+  test('macos reports unknown when the clock measurement cannot be parsed', async () => {
     const cfg = defaultConfig('alpha');
     let spawned = 0;
     const sentinel = new ClockSentinel(cfg, {
@@ -369,7 +369,7 @@ describe('ClockSentinel.vet across platforms', () => {
       }),
     });
     expect(await sentinel.vet()).toBe(false);
-    expect(spawned).toBe(0);
+    expect(spawned).toBe(1);
   });
 
   test('the startup vet+resume path completes on a machine with no time client', async () => {

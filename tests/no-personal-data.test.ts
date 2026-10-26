@@ -82,7 +82,7 @@ const FORBIDDEN: { pattern: RegExp; what: string }[] = [
   // it is deliberately short, so a new real domain has to be argued for rather than absorbed.
   {
     pattern:
-      /['"`](?:https?:\/\/)?(?![^'"`]*(?:example\.(?:com|org|net)|ipify\.org|icanhazip\.com)['"`])(?:[a-z0-9][a-z0-9-]*\.)+(?:com|org|net|io|dev|app|cloud|me|info|biz|il|uk|de|us)['"`]/i,
+      /['"`](?:https?:\/\/)?(?![^'"`]*(?:example\.(?:com|org|net)|ipify\.org|icanhazip\.com|time\.apple\.com)['"`])(?:[a-z0-9][a-z0-9-]*\.)+(?:com|org|net|io|dev|app|cloud|me|info|biz|il|uk|de|us)['"`]/i,
     what: 'a real hostname on a registrable domain',
   },
 ];
