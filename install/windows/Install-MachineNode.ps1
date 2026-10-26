@@ -514,6 +514,40 @@ function Copy-AdoptedSshKey {
 # anything. The caller hands in the directory the config is staged into: the real run stages it
 # under the node directory, and a -Preflight pass stages it under TEMP and deletes it again,
 # because at preflight time the node directory must not come into existence at all.
+# The state of a repository this script is about to adopt, as a list of changed paths, read
+# without letting the repository run anything. This runs elevated, against a tree the adopted
+# account controls: `git status` would run that tree's core.fsmonitor program, and on a stat-dirty
+# file its clean filter, as an administrator. So no porcelain command is used. Three plumbing
+# reads cover what status would have said:
+#   diff-index --cached   staged changes: the index against HEAD, no work tree read at all
+#   diff-files            unstaged changes: by stat alone, never re-hashing, so no filter runs.
+#                         A file that was only touched reads as changed; the refusal says to run
+#                         `git status` as that account, which refreshes the index, and re-run.
+#   ls-files --others     untracked files, through the ignore rules only
+# Every call pins core.fsmonitor off and points core.hooksPath at nothing, from the command line,
+# above anything the repository's own config says. -c safe.directory=* because the repository is
+# owned by the account being adopted, and --no-optional-locks so the -Preflight pass never writes
+# inside it. Returns the changed paths, or a one-element array holding $AdoptGitFailed.
+$AdoptGitFailed = '<git failed>'
+function Get-AdoptedRepoChanges {
+  param([Parameter(Mandatory)] [string] $RepoPath)
+  $inert = @('-c', 'safe.directory=*', '-c', 'core.fsmonitor=false', '-c', "core.hooksPath=$NoHooksDir",
+    '--no-optional-locks', '-C', $RepoPath)
+  $out = @()
+  foreach ($cmd in @(
+      @('diff-index', '--cached', '--name-only', '--no-ext-diff', '--no-textconv', 'HEAD', '--'),
+      @('diff-files', '--name-only', '--no-ext-diff', '--no-textconv', '--'),
+      @('ls-files', '--others', '--exclude-standard'))) {
+    $r = Invoke-Native -Exe 'git' -Arguments ($inert + $cmd)
+    if ($r.ExitCode -ne 0) {
+      Write-Host ($r.Output | Out-String)
+      return ,@($AdoptGitFailed)
+    }
+    $out += @($r.Output | ForEach-Object { ([string] $_).Trim() } | Where-Object { $_ })
+  }
+  return ,@($out | Select-Object -Unique)
+}
+
 function Get-AdoptionPlan {
   param([Parameter(Mandatory)] $Task, [Parameter(Mandatory)] [string] $StageDir)
 
@@ -556,30 +590,18 @@ function Get-AdoptionPlan {
     if (-not (Test-Path -LiteralPath (Join-Path $path '.git'))) {
       Write-Die "repo '$name' is listed at $path, which is not a git repository. Fix the config or remove the entry, then re-run. Nothing was stopped and nothing was moved."
     }
-    # -c safe.directory=* for this one read-only command. The repo is owned by the account whose
-    # node is being adopted and this script runs as an administrator, so git's dubious-ownership
-    # check would refuse to answer and the refusal would look like a broken repo. An
-    # administrator reading a tree it is about to move is exactly the case that check is not
-    # about, and nothing is written to the repo here.
-    #
-    # --no-optional-locks because `git status` refreshes the stat cache and rewrites .git/index
-    # on its way out, and this call happens on the -Preflight pass too: a pass that is only
-    # being asked "would this be refused?" must not write inside a repository it has not been
-    # given yet. It also keeps the answer out of the way of whatever that account has open.
-    $status = Invoke-Native -Exe 'git' -Arguments @('-c', 'safe.directory=*', '--no-optional-locks', '-C', $path, 'status', '--porcelain')
-    if ($status.ExitCode -ne 0) {
-      Write-Host ($status.Output | Out-String)
+    $dirty = @(Get-AdoptedRepoChanges -RepoPath $path)
+    if ($null -eq $dirty -or ($dirty.Count -eq 1 -and $dirty[0] -eq $AdoptGitFailed)) {
       Write-Die "git could not read the state of '$name' at $path. Nothing was stopped and nothing was moved."
     }
     $plan = Get-RepoAdoptionPlan -RepoPath $path -ProfileDir $profileDir
-    $dirty = @($status.Output | ForEach-Object { ([string] $_).Trim() } | Where-Object { $_ })
     if ($dirty.Count -gt 0) {
       $show = ($dirty | Select-Object -First 10) -join "`n    "
       # The refusal covers both outcomes. A repo that stays where it is is not moved, but it is
       # handed to a daemon that will start syncing it, which is no kinder to uncommitted work.
       $what = 'this install is about to hand that directory to a daemon that syncs it'
       if ($plan.Move) { $what = 'this install would move that directory' }
-      Write-Die "repo '$name' at $path has $($dirty.Count) uncommitted change(s), and $what. Commit or discard them first, then re-run. Nothing was stopped and nothing was moved.`n    $show"
+      Write-Die "repo '$name' at $path has $($dirty.Count) uncommitted change(s), and $what. Commit or discard them first, then re-run. A file that was only touched also counts here: running ``git status`` in that repository as its own account clears those. Nothing was stopped and nothing was moved.`n    $show"
     }
     $dest = ''
     if ($plan.Move) {
