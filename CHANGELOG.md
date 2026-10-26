@@ -12,6 +12,25 @@ other. Anything else has to be read here first.
 
 ## [Unreleased]
 
+### Security
+
+- **The Windows installer no longer passes wizard answers through a command shell.** Setup used to
+  start its PowerShell scripts through `cmd.exe`, with each answer spliced between double quotes.
+  A peer address, machine name or other field holding a double quote and an ampersand ran the rest
+  of the field as a command, under the installer's elevated token, before any script checked it.
+  Setup now writes every answer to a JSON settings file and starts `powershell.exe` directly with
+  fixed switches, the script path and the settings file path. The scripts read the file with
+  `-SettingsFile`, check the machine name, mesh address, peer URIs and paths, and keep their own
+  log. A value that fails a check is refused like any other refusal: a machine-wide install exits
+  7 with nothing installed. The per-user script's elevated stage and the machine-wide uninstaller
+  no longer take answers on their command lines either.
+- **The typed mesh secret is never written under a wider access list.** Setup used to write the
+  secret first, then run `icacls`, and carry on with the inherited access list if `icacls`
+  failed. It now creates a fresh directory, restricts it to Administrators and SYSTEM (and the
+  installing account on a per-user install) before writing anything, and refuses links. If the
+  restriction cannot be applied, Setup removes the directory and stops the install without
+  writing the secret.
+
 ## [0.2.0] - 2026-10-26
 
 Every machine in a fleet can now be driven from one agent through MCP: full nodes, machines reached

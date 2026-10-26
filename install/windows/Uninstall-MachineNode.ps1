@@ -31,11 +31,20 @@
 param(
   # Only used to name the tree in the closing message; nothing under it is touched.
   [string] $AppDir = '',
-  [string] $SharedRoot = 'C:\AI_Agent'
+  # Only used to name the shared root in the closing message. Read from the value the installer
+  # wrote under HKLM\Software\sukarfleet when it is not given, which is how the uninstaller runs
+  # this: a path somebody typed into the wizard does not belong on an elevated command line.
+  [string] $SharedRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+
+if (-not $SharedRoot) {
+  $recorded = Get-ItemProperty -LiteralPath 'HKLM:\Software\sukarfleet' -Name 'SharedRoot' -ErrorAction SilentlyContinue
+  if ($recorded -and $recorded.PSObject.Properties['SharedRoot'] -and $recorded.SharedRoot) { $SharedRoot = [string] $recorded.SharedRoot }
+  else { $SharedRoot = 'C:\AI_Agent' }
+}
 
 $script:Started = Get-Date
 function Get-Elapsed { return [int] ((Get-Date) - $script:Started).TotalSeconds }

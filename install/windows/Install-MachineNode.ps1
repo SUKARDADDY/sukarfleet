@@ -91,7 +91,14 @@ param(
   # Preflight only, and only for the "is there a secret at all" question. The installer writes
   # its secret file at the start of the install, minutes after the preflight runs, so at
   # preflight time the file the real run will be handed does not exist yet.
-  [switch] $SecretWillBeStaged
+  [switch] $SecretWillBeStaged,
+
+  # --- answers from a file ---
+  # A JSON file holding the answers above by parameter name, plus LogFile, the transcript this
+  # run writes. install\windows\sukarfleet.iss starts this script with -SettingsFile and nothing
+  # else, so no answer it collected is ever on a command line. Passed alone; see
+  # Import-InstallerSettings.
+  [string] $SettingsFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -235,6 +242,179 @@ function Remove-SecretFile {
     if ($len -gt 0) { [IO.File]::WriteAllBytes($Path, (New-Object byte[] $len)) }
   } catch { }
   Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# Answers read from a settings file
+#
+# install\windows\sukarfleet.iss writes every answer it collected to a JSON file, in a directory
+# it has just created and restricted, and starts this script with -SettingsFile <that file> and
+# nothing else. It used to put the answers on a cmd.exe command line, where a value holding a
+# double quote and an ampersand ran as a second command, elevated. A value read from the file is
+# a string, a number or a boolean. Nothing evaluates it, expands it or puts it on a command line,
+# and it gets the same checks afterwards as a value passed as a parameter.
+#
+# Everything from here to the end of this section is kept identical in Install-Sukarfleet.ps1
+# and Install-MachineNode.ps1, and tests/installer-settings.test.ts fails when the two differ.
+# Each script has its own $SettingsSchema, because each takes different answers.
+# ---------------------------------------------------------------------------
+
+# A control character is never part of a name, an address or a path. A newline in one is how a
+# value pretends to be two lines of a log or a config file.
+function Test-InstallerText {
+  param([AllowEmptyString()] [string] $Text)
+  return ($Text -notmatch '[\x00-\x1f\x7f]')
+}
+
+# The characters Windows refuses in a path, plus control characters. Everything else, an
+# ampersand or a percent sign included, is a legal path character and is used as it is, because
+# no shell ever reads it.
+function Test-InstallerPath {
+  param([AllowEmptyString()] [string] $Path)
+  if (-not $Path) { return $true }
+  return ($Path -notmatch '[\x00-\x1f\x7f"*?<>|]')
+}
+
+# Reads the settings file against a schema of name -> kind, where kind is 'string', 'string[]',
+# 'bool' or 'port'. A name the schema does not list is refused, not ignored: a typo in a setting
+# should not quietly install with the default. Returns @{ Answers; Problems } rather than stopping
+# at the first problem, so the caller can open the log the file names before it reports anything.
+function Read-InstallerSettings {
+  param([Parameter(Mandatory)] [string] $Path, [Parameter(Mandatory)] [hashtable] $Schema)
+  $values = @{}
+  $problems = New-Object System.Collections.Generic.List[string]
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  if (-not $item -or $item.PSIsContainer) {
+    $problems.Add("there is no settings file at $Path")
+    return @{ Answers = $values; Problems = $problems.ToArray() }
+  }
+  if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    $problems.Add("$Path is a link, and a settings file is only read from a plain file")
+    return @{ Answers = $values; Problems = $problems.ToArray() }
+  }
+  if ($item.Length -gt 65536) {
+    $problems.Add("$Path is larger than any settings file the installer writes")
+    return @{ Answers = $values; Problems = $problems.ToArray() }
+  }
+  $parsed = $null
+  try {
+    $parsed = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($item.FullName))
+  } catch {
+    $problems.Add("$Path is not JSON: $($_.Exception.Message)")
+    return @{ Answers = $values; Problems = $problems.ToArray() }
+  }
+  if (-not ($parsed -is [Management.Automation.PSCustomObject])) {
+    $problems.Add("$Path must hold one JSON object")
+    return @{ Answers = $values; Problems = $problems.ToArray() }
+  }
+  foreach ($prop in @($parsed.PSObject.Properties)) {
+    $name = [string] $prop.Name
+    $value = $prop.Value
+    if (-not (Test-InstallerText $name) -or -not $Schema.ContainsKey($name)) {
+      $problems.Add("'$name' is not a setting this script takes")
+      continue
+    }
+    $kind = [string] $Schema[$name]
+    if ($kind -eq 'bool') {
+      if ($value -is [bool]) { $values[$name] = $value }
+      else { $problems.Add("'$name' must be true or false") }
+    } elseif ($kind -eq 'port') {
+      if (($value -is [int] -or $value -is [long]) -and $value -ge 1 -and $value -le 65535) { $values[$name] = [int] $value }
+      else { $problems.Add("'$name' must be a whole number from 1 to 65535") }
+    } elseif ($kind -eq 'string') {
+      if ($value -isnot [string]) { $problems.Add("'$name' must be a string") }
+      elseif (-not (Test-InstallerText $value)) { $problems.Add("'$name' holds a control character") }
+      else { $values[$name] = $value }
+    } elseif ($kind -eq 'string[]') {
+      $list = @()
+      $ok = $true
+      if ($value -is [string]) { $list = @($value) }
+      elseif ($value -is [Array]) { $list = @($value) }
+      else { $ok = $false }
+      foreach ($entry in $list) {
+        if ($entry -isnot [string] -or -not (Test-InstallerText $entry)) { $ok = $false }
+      }
+      if ($ok) { $values[$name] = [string[]] $list }
+      else { $problems.Add("'$name' must be a string or a list of strings, with no control characters") }
+    } else {
+      $problems.Add("'$name' has a kind this script does not know")
+    }
+  }
+  return @{ Answers = $values; Problems = $problems.ToArray() }
+}
+
+# Where the output of a run started from a settings file goes. Setup used to redirect it through
+# cmd.exe. It is a transcript now, which records everything this script prints, a refusal
+# included, and the installer reads it back to show why a run was refused. A log that cannot be
+# opened costs the record, not the install, so it is a warning.
+function Start-InstallerLog {
+  param([Parameter(Mandatory)] [string] $Path)
+  if (-not (Test-InstallerPath $Path) -or -not [IO.Path]::IsPathRooted($Path)) {
+    Write-Warn 'the log path in the settings file is not a usable full path, so this run is only on screen.'
+    return
+  }
+  try {
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void] (New-Item -ItemType Directory -Force -Path $dir) }
+    $existing = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($existing -and (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+      Write-Warn "$Path is a link. This run is not logged through it, so it is only on screen."
+      return
+    }
+    [void] (Start-Transcript -LiteralPath $Path -Force)
+  } catch {
+    Write-Warn "could not open the log at $Path : $($_.Exception.Message). The run carries on; its output is only on screen."
+  }
+}
+
+# Applies a settings file to this script's parameters. -SettingsFile is passed alone: a run that
+# mixed it with other parameters would have two sources for one answer and no rule for which wins.
+# Assigning through Set-Variable keeps each parameter's own type and ValidateSet, so a value the
+# parameter would have refused on the command line is refused here too.
+function Import-InstallerSettings {
+  param([Parameter(Mandatory)] [string] $Path, [Parameter(Mandatory)] [hashtable] $Schema,
+        [Parameter(Mandatory)] [int] $BoundCount)
+  if ($BoundCount -gt 1) {
+    Write-Die '-SettingsFile carries every answer, so it is passed alone. Put the other values in the file, or leave -SettingsFile out. Nothing was installed.'
+  }
+  $read = Read-InstallerSettings -Path $Path -Schema $Schema
+  if ($read.Answers.ContainsKey('LogFile')) { Start-InstallerLog -Path ([string] $read.Answers['LogFile']) }
+  if (@($read.Problems).Count -gt 0) {
+    Write-Die ("the settings file $Path was refused: " + (@($read.Problems) -join '; ') + '. Nothing was installed.')
+  }
+  foreach ($name in @($read.Answers.Keys)) {
+    if ($name -eq 'LogFile') { continue }
+    try { Set-Variable -Scope Script -Name $name -Value $read.Answers[$name] }
+    catch { Write-Die "the setting '$name' in $Path was refused: $($_.Exception.Message) Nothing was installed." }
+  }
+}
+
+# ---------------------------------------------------------------------------
+# End of the section kept identical in both install scripts.
+# ---------------------------------------------------------------------------
+
+# The answers sukarfleet.iss writes for this script. AppDir to Adopt are the parameters of the
+# same name; LogFile is where Start-InstallerLog keeps the transcript.
+$SettingsSchema = @{
+  AppDir             = 'string'
+  MachineName        = 'string'
+  Role               = 'string'
+  MeshIp             = 'string'
+  PeerUri            = 'string'
+  MeshSecretFile     = 'string'
+  ShredSecretSource  = 'bool'
+  SkipMesh           = 'bool'
+  SharedRoot         = 'string'
+  Adopt              = 'bool'
+  SkipTray           = 'bool'
+  NoOpen             = 'bool'
+  Preflight          = 'bool'
+  SecretWillBeStaged = 'bool'
+  LogFile            = 'string'
+}
+
+if ($SettingsFile) {
+  Import-InstallerSettings -Path $SettingsFile -Schema $SettingsSchema -BoundCount $PSBoundParameters.Count
 }
 
 # ---------------------------------------------------------------------------
@@ -657,8 +837,32 @@ function Get-AdoptionPlan {
 # below, on the real run, where the answer means something.
 # ---------------------------------------------------------------------------
 
+# The answers that become a name, an address, a URI or a path, checked here whether they arrived
+# as parameters or from a settings file. The first thing Test-InstallRefusals does, so a value
+# refused here is refused by the preflight: Setup exits 7 and nothing is installed.
+function Assert-InstallInput {
+  if ($MachineName -notmatch '^[A-Za-z0-9._-]{1,64}\z') {
+    Write-Die "'$MachineName' is not a machine name the fleet accepts. Use 1 to 64 letters, digits, dots, underscores or hyphens; pairing refuses anything else. Nothing was installed."
+  }
+  if ($MeshIp -and $MeshIp -notmatch '^\d{1,3}(\.\d{1,3}){3}\z') {
+    Write-Die "'$MeshIp' is not an IPv4 address. Pass this machine's mesh address, e.g. 192.0.2.3. Nothing was installed."
+  }
+  foreach ($peer in $PeerList) {
+    if ($peer -notmatch '^[A-Za-z][A-Za-z0-9+.-]{0,15}://[A-Za-z0-9._~:/\[\]-]{1,255}\z') {
+      Write-Die "'$peer' is not a peer address. Use the form tcp://198.51.100.7:11010, comma separated for more than one. Nothing was installed."
+    }
+  }
+  foreach ($pair in @(@('-AppDir', $AppDir), @('-SharedRoot', $SharedRoot), @('-MeshSecretFile', $MeshSecretFile), @('-UserProfileDir', $UserProfileDir))) {
+    if (-not (Test-InstallerPath $pair[1])) {
+      Write-Die "$($pair[0]) '$($pair[1])' holds a character Windows does not allow in a path. Nothing was installed."
+    }
+  }
+}
+
 function Test-InstallRefusals {
   param([Parameter(Mandatory)] [string] $StageDir)
+
+  Assert-InstallInput
 
   # -SecretWillBeStaged answers "is there a secret at all" for a file that does not exist yet,
   # which is only true of a preflight. A real run that took it would install a mesh stage with

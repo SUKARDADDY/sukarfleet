@@ -73,9 +73,42 @@ The machine name (defaults to this computer's name), the role, this machine's me
 machine already in the fleet to dial, and the fleet's network secret. Machine-wide also asks for
 the shared root, and, when this machine already runs a per-user node, whether to adopt it.
 
-The secret is never an argument. You type it, it goes to a file with inheritance broken and one
-account on it, and the installer scripts consume that file and overwrite it. Same reason the
-Linux GUI stages a secret for `install-elevated.sh`.
+The secret is never an argument. You type it, and Setup writes it to a file in a directory it
+has just created for the purpose. That directory's access list is set before anything is written
+into it: inheritance is removed, and only Administrators and SYSTEM can open it, plus your own
+account on a per-user install, because the per-user scripts run as you. If Setup cannot set that
+access list, it removes the directory and stops the install, and the secret is never written. A
+directory or file that turns out to be a link is refused rather than written through. The
+installer scripts consume the file and overwrite it, and Setup removes the directory when it
+exits. Same reason the Linux GUI stages a secret for `install-elevated.sh`.
+
+### How the answers reach the scripts
+
+No answer from the wizard or from Setup's command line is ever put on a command line. Setup
+writes them all to a JSON settings file in the same restricted directory, and starts
+`powershell.exe` directly, with no shell in between, as:
+
+```
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <script> -SettingsFile <file>
+```
+
+Both paths are ones Setup built itself. The script reads its answers from the file and checks
+them before it does anything:
+
+- the machine name is 1 to 64 letters, digits, dots, underscores or hyphens, the same rule
+  pairing applies;
+- the mesh address is an IPv4 address;
+- each peer is a URI such as `tcp://198.51.100.7:11010`;
+- a path holds no character Windows refuses in a path, and no control character.
+
+A value that fails is refused like any other: a machine-wide install exits 7 with nothing
+installed, and the reason names the value. A value that passes is used exactly as written. A
+path with an ampersand or a percent sign in it is a legal path, and nothing ever reads it as a
+command.
+
+Older builds started the scripts through `cmd.exe` and spliced each answer between double
+quotes. A field holding a double quote and an ampersand ran the rest of the field as a command,
+under the installer's elevated token. That is what this design removes.
 
 ### Silent switches
 
@@ -193,15 +226,17 @@ adopt rather than after:
 
 ### Watching it
 
-Both scopes print a step-by-step log with elapsed seconds. The machine-wide install also keeps
-a transcript at `C:\ProgramData\sukarfleet\node\logs\install.log`, which is what to read after a
-silent install. `/LOG=<path>` captures Setup's own log, which records the exit code of the
-script it ran.
+Both scopes print a step-by-step log with elapsed seconds, and the script keeps it as a
+PowerShell transcript: `%LOCALAPPDATA%\sukarfleet\install-user.log` for a per-user install,
+`C:\ProgramData\sukarfleet\install-machine.log` for a machine-wide one. The machine-wide install
+also keeps a transcript at `C:\ProgramData\sukarfleet\node\logs\install.log` once its node
+directory exists. `/LOG=<path>` captures Setup's own log, which records the settings each script
+was given (the secret's file path, never the secret) and the exit code it returned.
 
 ### When it refuses
 
-A machine-wide install refused before anything is written, whether for a missing mesh address, a
-missing git or a git older than 2.31 (the service pins its git settings with `GIT_CONFIG_COUNT`),
+A machine-wide install refused before anything is written, whether for an answer that fails the
+checks in "How the answers reach the scripts", a missing mesh address, a missing git or a git older than 2.31 (the service pins its git settings with `GIT_CONFIG_COUNT`),
 a per-user node nobody asked to adopt, an adopted config whose `admin.keyPath` names a key that
 cannot be read, or an adoption whose repositories have uncommitted work in them, ends Setup with exit code 7 and nothing at all was installed. The
 `/LOG` file and the message box both carry the refusal from its `ERROR:` line to the end of what
@@ -474,6 +509,11 @@ plus:
 
 Never pass the secret as an argument. There is no flag for it, on purpose: argv is readable by
 every process on the machine and lands in your shell history.
+
+Both scripts also take `-SettingsFile <path>`, a file holding one JSON object. Its keys are
+parameter names from the lists above, the ones each script's `$SettingsSchema` names, plus
+`LogFile`, the transcript to write. It is how Setup runs them. When you pass it, pass
+nothing else: the script refuses a run that mixes the two, and refuses a key it does not know.
 
 ## Removing a per-user install by hand
 
