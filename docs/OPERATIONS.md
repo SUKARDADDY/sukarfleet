@@ -205,3 +205,32 @@ encoding".
 So before concluding a peer is down, check that it is reachable on the mesh at all. If it is
 reachable and still silent, and one of the machines recently changed version, suspect the protocol
 rather than the network and read `CHANGELOG.md` for that version's entry.
+
+## A peer is on the mesh but has no route here
+
+The `peer-route-missing` alarm means the EasyTier peer center lists a peer, often with a live
+connection to this node, but this node's `peer list` and `route` have no row for it. The peer is
+fine: other nodes reach it. Traffic from this node to it is dropped, so it reads as offline here and
+SSH to its mesh address times out.
+
+The cause is an EasyTier 2.6.4 route-sync bug, upstream
+[#2597](https://github.com/EasyTier/EasyTier/issues/2597), fixed in 2.7.0. After a short outage,
+this node deletes the peer's route metadata. Its route-sync partner still records it as holding that
+version, and its incremental cursor has moved past the record, so the record never travels again.
+It travels only when the peer publishes a new version of its own route info. EasyTier does that
+once an hour, so the fault can last up to an hour.
+
+What happens next:
+
+- The peer notices on its side. It routes to this node and sees it alive in the peer center, yet
+  gets no gossip back. After three polls it re-announces itself, and the alarm here clears within a
+  minute. The re-announce creates and revokes a throwaway credential, the one runtime change
+  EasyTier 2.6.4 accepts that bumps a node's route info. It drops no connection.
+- If the alarm stays, run `sukarfleet-cli mesh reannounce` on the peer the alarm names.
+- Restarting EasyTier on this node also clears it, but it drops every peer for about 15 seconds,
+  so do not do that. Restarting it on the named peer works too, and drops only that peer's links.
+  Re-announcing on this node, or on the sync partner, does nothing: only the peer that lost its
+  route can republish it.
+
+The lasting fix is EasyTier 2.7.0 on both ends of every route-sync session.
+

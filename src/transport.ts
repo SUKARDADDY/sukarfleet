@@ -4,7 +4,7 @@
 
 import type { FleetConfig } from './types';
 import type { RunResult } from './util';
-import { clockDriftMs, log, run } from './util';
+import { clockDriftMs, log, run, sleep } from './util';
 import { clockSyncProbeFor, currentPlatform, serviceManagerFor } from './platform';
 import type { ClockSyncState, PlatformId } from './platform';
 
@@ -69,6 +69,8 @@ export function generateEasytierToml(cfg: FleetConfig, opts: EasytierTomlOpts): 
 
 export interface TransportDeps {
   runner?: typeof run;
+  // Injected by tests so reannounceSelf()'s settle gap does not cost real time.
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface PeerSample {
@@ -181,6 +183,156 @@ export function diagnoseTransport(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Route audit: a peer that is on the mesh but has no route here
+//
+// diagnoseTransport only speaks when the peer table is empty. EasyTier 2.6.4
+// can also lose ONE peer while every other peer stays up (upstream #2597,
+// fixed in 2.7.0 by #2599): a node deletes a peer's route metadata after a
+// short outage, and its route-sync partner never resends it, because the
+// partner still records the deleting node as holding that version and its
+// incremental cursor has moved past the record. The peer's own connection to
+// this node can be live the whole time. The tell is in `peer-center`, which
+// keeps listing the peer id (with no hostname or IPv4, since those come from
+// the missing route) while `peer list` has no row for it.
+//
+// The record only travels again when its owner publishes a NEW version of its
+// route info. That is what reannounceSelf() forces on the owner's side, and
+// why a restart of the node that lost the route is never required.
+// ---------------------------------------------------------------------------
+
+export interface PeerCenterRow {
+  nodeId: string;
+  hostname: string;
+  directPeerIds: string[];
+}
+
+function idString(v: unknown): string | null {
+  if (typeof v === 'string' && v.length > 0) return v;
+  if (typeof v === 'number' && Number.isInteger(v) && v >= 0) return String(v);
+  return null;
+}
+
+// Parses `easytier-cli -o json peer-center`. Returns null on any shape it
+// cannot trust; rows or direct-peer entries without an id are skipped.
+export function parsePeerCenterJson(stdout: string): PeerCenterRow[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  const rows: PeerCenterRow[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
+    const rec = entry as Record<string, unknown>;
+    const nodeId = idString(rec.node_id);
+    if (nodeId === null) continue;
+    const directPeerIds: string[] = [];
+    if (Array.isArray(rec.direct_peers)) {
+      for (const d of rec.direct_peers) {
+        if (typeof d !== 'object' || d === null) continue;
+        const id = idString((d as Record<string, unknown>).node_id);
+        if (id !== null) directPeerIds.push(id);
+      }
+    }
+    rows.push({ nodeId, hostname: typeof rec.hostname === 'string' ? rec.hostname : '', directPeerIds });
+  }
+  return rows;
+}
+
+export interface UnroutedPeer {
+  peerId: string;
+  // Last hostname this node saw on a routed row for the id, when it saw one.
+  hostname: string | null;
+  // 'direct-connection': this node's own peer-center row says it holds a live
+  // connection to the peer. 'peer-center': another node reports the peer.
+  evidence: 'direct-connection' | 'peer-center';
+}
+
+// Peer ids the peer center reports that have no row in this node's peer list.
+// Pure. myPeerId null means the peer list carried no local row, which leaves
+// this node unable to tell its own id from a lost one, so it reports nothing.
+export function findUnroutedPeers(
+  myPeerId: string | null,
+  routedIds: ReadonlySet<string>,
+  center: readonly PeerCenterRow[],
+  knownNames: ReadonlyMap<string, string> = new Map(),
+): UnroutedPeer[] {
+  if (myPeerId === null) return [];
+  const mine = new Set(center.find((r) => r.nodeId === myPeerId)?.directPeerIds ?? []);
+  const seen = new Set<string>();
+  for (const row of center) {
+    seen.add(row.nodeId);
+    for (const id of row.directPeerIds) seen.add(id);
+  }
+  const out: UnroutedPeer[] = [];
+  for (const id of [...seen].sort()) {
+    if (id === myPeerId || routedIds.has(id)) continue;
+    out.push({
+      peerId: id,
+      hostname: knownNames.get(id) ?? null,
+      evidence: mine.has(id) ? 'direct-connection' : 'peer-center',
+    });
+  }
+  return out;
+}
+
+// Consecutive polls a peer must stay unrouted before it is reported (~90s at
+// the default 30s poll). A peer that really left lingers in the peer center
+// for up to 180s after its route is gone, and in the routing table for up to
+// 90s after its connections drop; three polls ride out the ordinary churn of
+// a reconnect without hiding a route that never comes back.
+export const ROUTE_MISS_POLLS = 3;
+
+// Configured peers whose silence points at a one-way route: this node routes
+// to the peer, the peer center shows it alive on the mesh, and yet no signed
+// gossip has arrived from it. If the peer cannot route back to this node,
+// that is exactly how it looks from this side. Pure.
+export function oneWayRouteSuspects(
+  silentPeers: readonly string[],
+  routedHostnames: ReadonlySet<string>,
+  center: readonly PeerCenterRow[] | null,
+): string[] {
+  if (center === null) return [];
+  const alive = new Set(center.filter((r) => r.directPeerIds.length > 0).map((r) => r.hostname));
+  return silentPeers.filter((name) => routedHostnames.has(name) && alive.has(name)).sort();
+}
+
+// Polls a one-way suspicion must persist before this node re-announces itself,
+// and the least time between two re-announcements. A re-announce is cheap and
+// harmless, but a peer whose daemon is simply stopped also looks silent, and
+// that must cost one re-announce per interval, not one per poll.
+export const REANNOUNCE_SUSPECT_POLLS = 3;
+export const REANNOUNCE_MIN_INTERVAL_MS = 15 * 60 * 1000;
+
+// Streak and rate-limit bookkeeping for reannounceSelf(). Pure state machine:
+// observe() is fed each poll's suspects and answers which of them, if any,
+// warrant a re-announce now.
+export class ReannounceGate {
+  private readonly streaks = new Map<string, number>();
+  private lastFiredMs: number | null = null;
+
+  observe(nowMs: number, suspects: readonly string[]): string[] {
+    const current = new Set(suspects);
+    for (const name of [...this.streaks.keys()]) if (!current.has(name)) this.streaks.delete(name);
+    for (const name of current) this.streaks.set(name, (this.streaks.get(name) ?? 0) + 1);
+    const ripe = [...this.streaks].filter(([, n]) => n >= REANNOUNCE_SUSPECT_POLLS).map(([name]) => name).sort();
+    if (ripe.length === 0) return [];
+    if (this.lastFiredMs !== null && nowMs - this.lastFiredMs < REANNOUNCE_MIN_INTERVAL_MS) return [];
+    this.lastFiredMs = nowMs;
+    return ripe;
+  }
+}
+
+// Gap between creating and revoking the throwaway credential. EasyTier folds
+// its own state into its published route info once a second, so the two
+// changes must land on different ticks or the second undoes the first unseen.
+const REANNOUNCE_SETTLE_MS = 3000;
+// Lifetime of the throwaway credential if the revoke never lands.
+const REANNOUNCE_CREDENTIAL_TTL_SEC = 60;
+
 interface PollRecord {
   atMs: number;
   hadNonLocalPeer: boolean;
@@ -208,12 +360,23 @@ export class Transport {
   private anchorMissStreak = 0;
   private anchorSeen: boolean | null = null;
   private lastDiagnosis: TransportDiagnosis | null = null;
+  private readonly sleep: (ms: number) => Promise<void>;
+  // Route audit state. knownNames remembers the hostname of every id this node
+  // has seen on a routed row, so an alarm about a lost route can still name the
+  // machine: the peer center cannot, because it reads names from the very route
+  // that is missing.
+  private readonly knownNames = new Map<string, string>();
+  private readonly routeMissStreak = new Map<string, number>();
+  private confirmedUnrouted: UnroutedPeer[] = [];
+  private lastCenter: PeerCenterRow[] | null = null;
+  private lastRoutedHostnames = new Set<string>();
 
   constructor(
     private readonly cfg: FleetConfig,
     deps: TransportDeps = {},
   ) {
     this.runner = deps.runner ?? run;
+    this.sleep = deps.sleep ?? sleep;
   }
 
   // easytier-cli may simply not be there -- a fresh Windows machine that has not installed the
@@ -259,14 +422,24 @@ export class Transport {
     }
 
     const samples: PeerSample[] = [];
+    const routedIds = new Set<string>();
+    let myPeerId: string | null = null;
     for (const entry of parsed) {
       if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
       const rec = entry as Record<string, unknown>;
       const hostname = typeof rec.hostname === 'string' && rec.hostname.length > 0 ? rec.hostname : null;
+      const id = idString(rec.id);
+      if (id !== null) {
+        routedIds.add(id);
+        if (rec.cost === 'Local') myPeerId = id;
+        if (hostname) this.knownNames.set(id, hostname);
+      }
       if (!hostname) continue;
       samples.push({ hostname, rxBytes: toFiniteNumber(rec.rx_bytes), txBytes: toFiniteNumber(rec.tx_bytes) });
     }
     const nonLocal = samples.filter((s) => s.hostname !== this.cfg.machine);
+    this.lastRoutedHostnames = new Set(nonLocal.map((s) => s.hostname));
+    await this.refreshRouteAudit(base, myPeerId, routedIds);
 
     // A third CLI round-trip is only worth taking when something is already
     // wrong: with a non-local peer present the verdict is 'ok' by definition,
@@ -337,6 +510,90 @@ export class Transport {
       });
     }
     this.lastDiagnosis = next;
+  }
+
+  // Reads `peer-center` and compares it with the routed ids from this poll's
+  // peer list. Never throws. An unreadable peer center clears the snapshot the
+  // re-announce check reads, but keeps the streaks: one failed read must not
+  // reset a count that is about to confirm a real loss, and must not confirm it
+  // either.
+  private async refreshRouteAudit(base: string[], myPeerId: string | null, routedIds: Set<string>): Promise<void> {
+    const res = await this.runCli([...base, 'peer-center'], 30000);
+    const center = res.code === 0 ? parsePeerCenterJson(res.stdout) : null;
+    if (center === null) {
+      if (res.code !== 0) {
+        log('warn', 'transport: easytier-cli peer-center poll failed', { code: res.code, stderr: res.stderr.slice(0, 500) });
+      } else {
+        log('warn', 'transport: easytier-cli peer-center output not usable JSON', {});
+      }
+      this.lastCenter = null;
+      return;
+    }
+    this.lastCenter = center;
+    const unrouted = findUnroutedPeers(myPeerId, routedIds, center, this.knownNames);
+    const current = new Set(unrouted.map((u) => u.peerId));
+    for (const id of [...this.routeMissStreak.keys()]) if (!current.has(id)) this.routeMissStreak.delete(id);
+    for (const id of current) this.routeMissStreak.set(id, (this.routeMissStreak.get(id) ?? 0) + 1);
+    const next = unrouted.filter((u) => (this.routeMissStreak.get(u.peerId) ?? 0) >= ROUTE_MISS_POLLS);
+    // One line per change of the confirmed set, not one per poll.
+    const key = (list: UnroutedPeer[]) => list.map((u) => u.peerId).join(',');
+    if (key(next) !== key(this.confirmedUnrouted)) {
+      if (next.length > 0) {
+        log('warn', 'transport: peer on the mesh has no route here', {
+          peers: next.map((u) => ({ peerId: u.peerId, hostname: u.hostname, evidence: u.evidence })),
+        });
+      } else {
+        log('info', 'transport: every peer on the mesh has a route again', {});
+      }
+    }
+    this.confirmedUnrouted = next;
+  }
+
+  // Peers the peer center reports that have had no route here for at least
+  // ROUTE_MISS_POLLS consecutive polls.
+  unroutedPeers(): UnroutedPeer[] {
+    return this.confirmedUnrouted;
+  }
+
+  // Configured peers from `silentPeers` (no recent signed gossip) that look
+  // like they cannot route back to this node. See oneWayRouteSuspects.
+  oneWaySuspects(silentPeers: readonly string[]): string[] {
+    return oneWayRouteSuspects(silentPeers, this.lastRoutedHostnames, this.lastCenter);
+  }
+
+  // Makes this node publish a new version of its EasyTier route info, which
+  // every peer accepts and passes on, including one whose sync partner stopped
+  // resending the old version (upstream #2597). 2.6.4 has no direct command
+  // for that. The only runtime field its CLI can change is the list of trusted
+  // credential keys, so this creates a throwaway credential and revokes it.
+  // Nothing else changes: no connection drops and no route moves.
+  //
+  // The credential is never usable. Its secret goes to the CLI's stdout, which
+  // this method never reads or logs; it carries no groups and no relay right,
+  // cannot be reused, is revoked after REANNOUNCE_SETTLE_MS, and expires after
+  // REANNOUNCE_CREDENTIAL_TTL_SEC if the revoke fails. Never throws.
+  async reannounceSelf(nowMs: number): Promise<boolean> {
+    const base = [this.cfg.easytier.cliPath, '-p', this.cfg.easytier.rpcAddr];
+    const credentialId = `sukarfleet-reannounce-${nowMs}`;
+    const gen = await this.runCli(
+      [...base, 'credential', 'generate', '--ttl', String(REANNOUNCE_CREDENTIAL_TTL_SEC), '--credential-id', credentialId, '--reusable', 'false'],
+      30000,
+    );
+    if (gen.code !== 0) {
+      log('warn', 'transport: route re-announce failed at generate', { code: gen.code, stderr: gen.stderr.slice(0, 500) });
+      return false;
+    }
+    await this.sleep(REANNOUNCE_SETTLE_MS);
+    const rev = await this.runCli([...base, 'credential', 'revoke', credentialId], 30000);
+    if (rev.code !== 0) {
+      log('warn', 'transport: route re-announce could not revoke its credential; it expires on its own', {
+        credentialId,
+        ttlSec: REANNOUNCE_CREDENTIAL_TTL_SEC,
+        code: rev.code,
+        stderr: rev.stderr.slice(0, 500),
+      });
+    }
+    return true;
   }
 
   // Latest connector-level verdict, or null when it could not be established.

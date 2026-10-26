@@ -26,7 +26,7 @@ import { buildAuthHeader, loadOrCreateMachineKey, writeSecretFile } from './keys
 import { Gossip } from './gossip';
 import { Syncer } from './syncer';
 import { Health, type HealthSelf, type LocalLogDamage } from './health';
-import { Transport, ClockSentinel, SUSPEND_JUMP_MS } from './transport';
+import { Transport, ClockSentinel, ReannounceGate, SUSPEND_JUMP_MS } from './transport';
 import * as endpoints from './endpoints';
 import * as derive from './derive';
 import * as gitserve from './gitserve';
@@ -530,6 +530,8 @@ async function main(): Promise<void> {
   let syncLoopOkMs = nowMs();
   let lastTransportSummary: unknown = null;
   let lastTransportRestartOk: boolean | null = null;
+  const reannounceGate = new ReannounceGate();
+  let lastReannounce: { atMs: number; silentPeers: string[]; ok: boolean } | null = null;
   // P3 single-pusher takeover debounce (nextAnchorDownStreak); consulted for the roamer role only,
   // stays 0 and unused on the anchor.
   let anchorDownStreak = 0;
@@ -1319,6 +1321,7 @@ async function main(): Promise<void> {
           role: cfg.role,
           clockVetted: clockSentinel.isClockVetted(),
           transport: lastTransportSummary,
+          meshRoutes: { unrouted: transport.unroutedPeers(), lastReannounce },
           repos: presence.repos,
           githubPushOkMs: presence.githubPushOkMs,
           flags: presence.flags,
@@ -1665,6 +1668,25 @@ async function main(): Promise<void> {
     }
     const poll = await transport.pollOnce(now);
     lastTransportSummary = poll;
+    // The other side of the route audit. When a peer this node routes to has gone silent while the
+    // peer center shows it alive, the likeliest cause is that the PEER lost this node's route
+    // (upstream EasyTier #2597), and only this node can repair that, by publishing a new version
+    // of its own route info. Gated on a streak and a rate limit; see ReannounceGate.
+    if (poll !== null) {
+      const silent = gossip
+        .getPeerViews(now)
+        .filter((p) => enrolledPeers.has(p.name) && !p.online)
+        .map((p) => p.name);
+      const fire = reannounceGate.observe(now, transport.oneWaySuspects(silent));
+      if (fire.length > 0) {
+        const ok = await transport.reannounceSelf(now);
+        lastReannounce = { atMs: now, silentPeers: fire, ok };
+        log(ok ? 'warn' : 'error', 'transport: re-announced this node on the mesh (one-way route suspected)', {
+          silentPeers: fire,
+          ok,
+        });
+      }
+    }
     if (transport.wedged(now)) {
       lastTransportRestartOk = await transport.restartTransport();
       log(lastTransportRestartOk ? 'warn' : 'error', 'transport wedged', {
@@ -1716,6 +1738,7 @@ async function main(): Promise<void> {
         transportWedged: transport.wedged(now),
         anchorReachable: transport.anchorReachable(),
         transportFault: transport.diagnosis()?.fault ?? null,
+        unroutedPeers: transport.unroutedPeers(),
         admin: adminSelf,
         auditIntegrity,
       },

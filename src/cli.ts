@@ -16,7 +16,7 @@ import { AuditLog } from './audit';
 import { defaultConfig, loadConfig, stateDir } from './config';
 import { loadOrCreateMachineKey } from './keys';
 import { SshAdmin } from './sshadmin';
-import { generateEasytierToml } from './transport';
+import { generateEasytierToml, Transport } from './transport';
 import type {
   AdminRunView,
   AdminStatusEntry,
@@ -331,6 +331,21 @@ async function cmdSelf(): Promise<number> {
     return 2;
   }
   for (const line of buildSelfReport(buildSelfView(raw), nowMs())) console.log(line);
+  return 0;
+}
+
+// Manual form of the daemon's one-way-route heal (transport.ts reannounceSelf): makes this node
+// publish a new version of its EasyTier route info so a peer that lost it (upstream EasyTier
+// #2597) learns it again. Run it on the machine the `peer-route-missing` alarm names. Drops no
+// connection; the daemon does the same on its own once it sees the one-way silence.
+async function cmdMeshReannounce(): Promise<number> {
+  const cfg = await loadConfig();
+  const ok = await new Transport(cfg).reannounceSelf(nowMs());
+  if (!ok) {
+    console.error('mesh reannounce: easytier-cli refused the credential change; see the warning above');
+    return 1;
+  }
+  console.log('mesh reannounce: route info re-published');
   return 0;
 }
 
@@ -966,6 +981,7 @@ export async function cmdEasytierToml(args: string[]): Promise<number> {
 function printUsage(): void {
   console.log('usage: sukarfleet-cli [status|peers|self|version]');
   console.log('       sukarfleet-cli audit tail [n]');
+  console.log('       sukarfleet-cli mesh reannounce');
   console.log(`       ${ADMIN_RUN_USAGE.replace('usage: ', '')}`);
   console.log('       sukarfleet-cli admin status');
   console.log('       sukarfleet-cli admin trust');
@@ -990,6 +1006,11 @@ async function main(): Promise<number> {
     case 'audit':
       if (args[1] === 'tail') return cmdAuditTail(args.slice(2));
       console.error(`unknown audit subcommand: ${args[1] ?? '(none)'}`);
+      printUsage();
+      return 2;
+    case 'mesh':
+      if (args[1] === 'reannounce') return cmdMeshReannounce();
+      console.error(`unknown mesh subcommand: ${args[1] ?? '(none)'}`);
       printUsage();
       return 2;
     case 'admin':
