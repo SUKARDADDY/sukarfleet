@@ -266,26 +266,34 @@ function yesNo(v) {
 //
 // A machine-wide node is reachable by every account on the PC, so it answers the console API with
 // 401 console-token-required until the caller presents its token. The token is kept in
-// sessionStorage and nowhere else: it dies with the tab, it is never written to disk by this page,
+// sessionStorage and in this page's memory, nothing else: it dies with the tab, it is never written to disk by this page,
 // and a forwarded tab keeps its own copy per port, which is the same rule every other path here
-// follows. sessionStorage throws in a few hardened configurations, so every touch is guarded.
+// follows. sessionStorage throws in a few hardened configurations, so every touch is guarded, and
+// the page keeps the submitted token in a variable too: when storage throws, that variable is what
+// lets a correct token unlock the console. It lives only as long as the page, like the storage copy.
 
 const CONSOLE_TOKEN_KEY = 'sukarfleetConsoleToken';
 
+let memoryConsoleToken = '';
+
 function readConsoleToken() {
   try {
-    return sessionStorage.getItem(CONSOLE_TOKEN_KEY) || '';
+    const stored = sessionStorage.getItem(CONSOLE_TOKEN_KEY);
+    if (stored) return stored;
   } catch {
-    return '';
+    // Storage is unavailable: use the copy held in memory.
   }
+  return memoryConsoleToken;
 }
 
+// An empty token clears both copies.
 function writeConsoleToken(token) {
+  memoryConsoleToken = token || '';
   try {
     if (token) sessionStorage.setItem(CONSOLE_TOKEN_KEY, token);
     else sessionStorage.removeItem(CONSOLE_TOKEN_KEY);
   } catch {
-    // Nothing to do: the request below still carries the token, the next one prompts again.
+    // The in-memory copy above still carries the token, so the next request is authorised.
   }
 }
 
