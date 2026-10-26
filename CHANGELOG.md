@@ -12,6 +12,12 @@ other. Anything else has to be read here first.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-26
+
+The first published release of the 0.2 line. `v0.2.0` was tagged but never released: an
+open-source safety review before publishing found the installer and release-asset problems below,
+so 0.2.1 is 0.2.0 plus those fixes. Everything listed under 0.2.0 ships here.
+
 ### Security
 
 - **The Windows installer no longer passes wizard answers through a command shell.** Setup used to
@@ -284,6 +290,7 @@ First public release. It has run the maintainers' own two-machine fleet daily si
   [`docs/PLATFORMS.md`](docs/PLATFORMS.md) is specific about which seam is which.
 - There is no aarch64 tray build, and the installer says so and prints the web console URL instead.
 
-[Unreleased]: https://github.com/SUKARDADDY/sukarfleet/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/SUKARDADDY/sukarfleet/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/SUKARDADDY/sukarfleet/releases/tag/v0.2.1
 [0.2.0]: https://github.com/SUKARDADDY/sukarfleet/releases/tag/v0.2.0
 [0.1.0]: https://github.com/SUKARDADDY/sukarfleet/releases/tag/v0.1.0

@@ -66,14 +66,14 @@
 # aarch64 reads TODO-S9 because there is no aarch64 tray build at all. That is a
 # different sentence from "not hashed yet", and it is why the two tokens are not
 # the same token.
-0.2.0  x86_64   4f0fb3312733c39eab2b5885b5ae3dbb968bfecc0b9f9778d87fcd5adaf2c3ba  sukarfleet-tray-linux-x86_64
-0.2.0  aarch64  TODO-S9                   sukarfleet-tray-linux-aarch64
+0.2.1  x86_64   SHA256-FILLED-AT-RELEASE  sukarfleet-tray-linux-x86_64
+0.2.1  aarch64  TODO-S9                   sukarfleet-tray-linux-aarch64
 
 # The Windows tray, built by .github/workflows/tray.yml on a Windows runner and
 # read by Install-Sukarfleet.ps1. Same two tokens, same meanings: x86_64 is built
 # and waiting for the tag that hashes it, and there is no arm64 build at all.
-0.2.0  x86_64   66694b9efd54d41d3d803555075d27c41544f4d3ca42168267919700dcc4f099  sukarfleet-tray-windows-x86_64.exe
-0.2.0  arm64    TODO-S9                   sukarfleet-tray-windows-arm64.exe
+0.2.1  x86_64   SHA256-FILLED-AT-RELEASE  sukarfleet-tray-windows-x86_64.exe
+0.2.1  arm64    TODO-S9                   sukarfleet-tray-windows-arm64.exe
 
 # Bun on Windows, fetched by install/windows/Install-MachineNode.ps1 into
 #   C:\Program Files\sukarfleet\bun
@@ -102,4 +102,4 @@
 # it would become. SHA256-FILLED-AT-RELEASE for the same reason the tray lines
 # carry it -- the binary is built from this tree, so its hash cannot exist until
 # the tag does.
-0.2.0  x86_64   SHA256-FILLED-AT-RELEASE  sukarfleet-setup-windows-x86_64.exe
+0.2.1  x86_64   SHA256-FILLED-AT-RELEASE  sukarfleet-setup-windows-x86_64.exe

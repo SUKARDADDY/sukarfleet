@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # sukarfleet stage 0: the `curl | sh` entry point.
 #
-#   curl -fsSL https://raw.githubusercontent.com/SUKARDADDY/sukarfleet/v0.2.0/install/get.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/SUKARDADDY/sukarfleet/v0.2.1/install/get.sh | sh
 #
 # This file has NO install logic, on purpose. It clones the repository at a
 # release tag, prints the commit it checked out, and hands over to
 # install/quickstart.sh from that checkout. The thing that installs you is a
 # repository at a tag, which you can read first:
 #
-#   git clone --branch v0.2.0 <repo-url> && less sukarfleet/install/quickstart.sh
+#   git clone --branch v0.2.1 <repo-url> && less sukarfleet/install/quickstart.sh
 #
 # Nothing here needs root, and neither does the stage it hands to. There is
 # exactly one root step in the whole install and quickstart.sh prints it for you
@@ -40,7 +40,7 @@ set -eu
 #   SUKARFLEET_DRY_RUN=1     walk the whole control flow, print every write,
 #                            download and exec as `[dry-run] ...`, change
 #                            nothing on disk.
-REF="${SUKARFLEET_REF:-v0.2.0}"
+REF="${SUKARFLEET_REF:-v0.2.1}"
 GIT_URL="${SUKARFLEET_GIT_URL:-https://github.com/SUKARDADDY/sukarfleet.git}"
 RELEASE_BASE="${SUKARFLEET_RELEASE_BASE:-https://github.com/SUKARDADDY/sukarfleet/releases/download/$REF}"
 DRY_RUN="${SUKARFLEET_DRY_RUN:-0}"

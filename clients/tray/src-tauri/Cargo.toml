@@ -1,6 +1,6 @@
 [package]
 name = "sukarfleet-tray"
-version = "0.2.0"
+version = "0.2.1"
 description = "Tray-first fleet health companion for the sukarfleet daemon"
 edition = "2021"
 license = "MIT"
