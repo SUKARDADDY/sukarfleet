@@ -83,6 +83,9 @@ The daemon exposes a loopback MCP server. Point your agent at it and it gets:
 
 | Tool | Does |
 |---|---|
+| `fleet.sync_status` | Read the local sync repositories and clock readiness |
+| `fleet.pair_code` / `fleet.pair_redeem` | Pair nodes through MCP using the existing pairing protocol |
+| `fleet.repo_add` | Adopt an existing checkout for peer-only Git sync without restarting |
 | `fleet.peers` | Live peer table — who is online, what is stale |
 | `fleet.tail` | Recent signed audit entries |
 | `fleet.admin_status` | Whether the admin lane is usable, and why not if it isn't |

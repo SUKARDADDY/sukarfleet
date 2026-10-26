@@ -13,6 +13,7 @@ import {
   nextWatchdogGrace,
   pushAllowedForRepo,
   shouldPushThisTick,
+  schedulePeerSync,
   TAKEOVER_STREAK,
   watchdogShouldPing,
 } from '../src/node';
@@ -20,6 +21,34 @@ import { clockDriftMs } from '../src/util';
 import { SUSPEND_JUMP_MS } from '../src/transport';
 import { defaultConfig } from '../src/config';
 import { networkInterfaces } from 'node:os';
+
+test('peer-only repositories sync independently, never overlap themselves, and never derive a push', async () => {
+  let unblock!: () => void;
+  const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+  let slowCalls = 0, fastCalls = 0, fastDerives = 0;
+  const slow = schedulePeerSync({ name: 'slow', path: '/fixture/slow', peerOnly: true }, 10, {
+    isAdopted: () => true, sync: async () => { slowCalls++; await blocked; }, derive: async () => {},
+  });
+  const fast = schedulePeerSync({ name: 'fast', path: '/fixture/fast', peerOnly: true }, 10, {
+    isAdopted: () => true, sync: async () => { fastCalls++; },
+    derive: async (_path, opts) => { expect(opts.push).toBe(false); fastDerives++; },
+  });
+  try {
+    const deadline = Date.now() + 1000;
+    while (fastCalls < 3 && Date.now() < deadline) await Bun.sleep(10);
+    expect(fastCalls).toBeGreaterThanOrEqual(3);
+    expect(fastDerives).toBe(fastCalls);
+    expect(slowCalls).toBe(1);
+  } finally { slow.stop(); fast.stop(); unblock(); }
+});
+
+test('a peer-only loop never operates on an unadopted repository', async () => {
+  let calls = 0;
+  const loop = schedulePeerSync({ name: 'r', path: '/fixture/r', peerOnly: true }, 5, {
+    isAdopted: () => false, sync: async () => { calls++; }, derive: async () => { calls++; },
+  });
+  try { await Bun.sleep(30); expect(calls).toBe(0); } finally { loop.stop(); }
+});
 
 describe('shouldPushThisTick (P3 single-pusher policy, Class A: gossip-keyed takeover)', () => {
   test('anchor always pushes, regardless of anchorDaemonOnline or streak', () => {
