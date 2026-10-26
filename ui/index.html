@@ -41,6 +41,19 @@
 
 <p class="flash" id="flash" role="status" aria-live="polite" hidden></p>
 
+<!-- Shown only when the daemon answers a console call with console-token-required, which happens
+     on a machine-wide install: several accounts can reach this port, so holding the token is what
+     makes a caller an operator of this node. The token is kept for this tab only. -->
+<form class="banner" id="console-token-form" hidden>
+  <label for="console-token-input" id="console-token-label">This node is installed machine-wide. Paste its console token.</label>
+  <span class="actions">
+    <input id="console-token-input" type="password" autocomplete="off" spellcheck="false" aria-describedby="console-token-hint">
+    <button type="submit" class="primary">Unlock</button>
+    <span class="result" id="console-token-result"></span>
+  </span>
+  <span class="hint" id="console-token-hint">An administrator can read the token file on this machine. It is remembered until this tab is closed.</span>
+</form>
+
 <noscript><p class="flash flash-bad">This console needs JavaScript. It runs entirely from this machine — nothing is fetched from the internet.</p></noscript>
 
 <main id="main" tabindex="-1">

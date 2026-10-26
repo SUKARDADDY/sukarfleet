@@ -1259,50 +1259,12 @@ function Register-NodeTask {
 # mirroring hashes into a table here means a release fills one line and both platforms
 # follow it. (The EasyTier hashes above are the exception, and say so.)
 #
-# Returns $null when there is no line for this arch, and throws for a file that
-# contradicts itself: two lines for one (version, arch) mean nobody knows which SHA256 to
-# trust, and taking the first is how a stale pin outlives the line meant to replace it.
-# A pin that is not a pin is returned with Unfilled = $true rather than swallowed, so the
-# caller can tell "no such build" from "not hashed yet" when it explains itself.
-$script:PinUnfilled = @('TODO-S9', 'SHA256-FILLED-AT-RELEASE')
-
-function Get-Pin {
-  param(
-    [Parameter(Mandatory)] [string] $PinsFile,
-    [Parameter(Mandatory)] [string] $AssetPrefix,
-    [Parameter(Mandatory)] [string] $Arch
-  )
-  if (-not (Test-Path -LiteralPath $PinsFile)) { return $null }
-  $seen = @{}
-  $filled = $null
-  $unfilled = $null
-  foreach ($line in (Get-Content -LiteralPath $PinsFile)) {
-    $t = $line.Trim()
-    if (-not $t -or $t.StartsWith('#')) { continue }
-    $c = @($t -split '\s+')
-    if ($c.Count -lt 4) { continue }
-    if ($c[1] -ne $Arch) { continue }
-    if (-not $c[3].StartsWith($AssetPrefix)) { continue }
-    $key = "$($c[0]) $($c[1])"
-    if ($seen.ContainsKey($key)) {
-      throw "install\easytier-pins.txt has more than one $AssetPrefix pin for $key, so there is no single SHA256 to trust."
-    }
-    $seen[$key] = $true
-    $pin = @{
-      Version  = $c[0]
-      Arch     = $c[1]
-      Sha      = $c[2]
-      Asset    = $c[3]
-      Unfilled = ($script:PinUnfilled -contains $c[2])
-    }
-    # The first VALID pin wins whatever order the lines sit in, so an unfilled line never
-    # shadows a real one.
-    if ($pin.Unfilled) { if (-not $unfilled) { $unfilled = $pin } }
-    elseif (-not $filled) { $filled = $pin }
-  }
-  if ($filled) { return $filled }
-  return $unfilled
-}
+# The parser, Get-Pin, is not defined in this file. It lives in install\windows\Pins.ps1, the
+# one implementation both installers share, and Install-Tray dot-sources it from the source
+# tree it is already reading the pin file out of. Pins.ps1 sits in the same tree as
+# install\easytier-pins.txt, so a tree that has the pin file has the parser: this script has
+# no new requirement. The tray is optional, so a tree without Pins.ps1 (a -Source from before
+# it existed) costs the tray and nothing else.
 
 # The console WINDOW is a WebView2 host. Windows 11 ships the Evergreen runtime and
 # Windows 10 may not, and the failure mode without it is invisible: the icon appears, the
@@ -1343,6 +1305,10 @@ function Install-Tray {
   }
 
   $pinsFile = Join-Path $RepoRoot 'install\easytier-pins.txt'
+  $pinsLib = Join-Path $RepoRoot 'install\windows\Pins.ps1'
+  # Dot-sourced here, inside the function: Get-Pin is only called from here.
+  try { . $pinsLib }
+  catch { $result.Reason = "could not load $pinsLib : $($_.Exception.Message)"; return $result }
   $pin = $null
   try { $pin = Get-Pin -PinsFile $pinsFile -AssetPrefix 'sukarfleet-tray-windows-' -Arch $arch }
   catch { $result.Reason = $_.Exception.Message; return $result }

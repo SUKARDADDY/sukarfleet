@@ -199,9 +199,116 @@ Two content rules are enforced by convention and by review:
   stamps a future date wins every non-union conflict. The losing side is preserved under
   `.sync-conflicts/`, so this demotes content rather than destroying it.
 
+## The machine-wide Windows node
+
+The Windows installer offers two scopes, and they do not share a trust model. A per-user install is
+what the rest of this document describes: a daemon running as you, under your account, while you are
+signed in. A machine-wide install is a Windows service that runs whether or not anybody is signed in,
+with one fleet identity for the whole PC. This section is the second one.
+
+**Who may drive it.** Loopback is not a caller identity, and on a machine-wide node every local
+account shares that loopback. So the node requires a bearer token on `/api/ui/*`, on `POST /mcp` and
+on `GET /exec/audit/tail`. The token is 32 random bytes, base64url, generated at install and written
+to `C:\ProgramData\sukarfleet\node\console-token`. A request without it is refused with 401 and a body
+naming `console-token-required`; the browser console asks for the token on that refusal and the tray
+and `sukarfleet-cli` read the file.
+
+Three loopback routes stay ungated on a machine-wide node, and that is the whole list:
+
+| Route | Why it is not gated |
+| --- | --- |
+| `GET /health` | `{ ok: true }` and nothing else. It is what a service manager polls, and it says nothing a local account could not learn from `Get-Service`. |
+| `GET /status` | Loopback-only, as before: this machine's own presence, peers and faults, which is the read every local account already gets from the console after pasting the token. It carries no secret and no admin verb. |
+| `POST /pair/hello` | A frozen mesh route, authenticated by the MAC on its own payload. A machine that is pairing does not have this node's console token and never will, so a gate here would make pairing with a machine-wide node impossible by construction. |
+
+`GET /exec/audit/tail` is **gated**, and was not before this scope existed. It returns this
+machine's whole signed audit log: every admin call, every peer it has talked to. On a per-user node
+that is the owner's own record; on a machine-wide node, reachable by every account on the PC, it is
+the node's operating history, and it is behind the same token as the console.
+
+**The token file is readable by every local account, and that is a decision rather than an
+oversight.** Its ACL grants `BUILTIN\Users` read. The reasoning: on a personal machine every account
+is an operator, and an install-time page asking which accounts may drive the node would be answered
+wrong more often than it would be answered well. Stated plainly: **any account that can sign in to
+that PC can operate the node**, which means reading the peer table, the audit log and the config, and
+changing the config.
+
+Narrowing it is one line, run after the install:
+
+```powershell
+icacls C:\ProgramData\sukarfleet\node\console-token /remove:g "BUILTIN\Users" /grant "sukarfleet-operators:(R)"
+```
+
+Create the group first and put the accounts you trust in it. The installer grants `Users` read only
+when it creates the token, so a later upgrade keeps your narrowed list. The daemon reads the file on
+every request, so leave the service account's own read entry alone. Nothing else in the install depends on
+`Users` being able to read that file.
+
+**The token ACL alone is not a boundary against an account that can write the checkout.** An account
+that can write a repository's `.git` can make git run its code as the service account: a filter
+driver, a merge driver, `diff.external` and similar settings live in that repository's own config
+and run during `git add`, `git status` and `git merge`, and the service account can read the token
+and the machine identity. The service pins `core.hooksPath` and `core.fsmonitor` above repository
+config (see "git hooks" below), and git has no switch that covers the rest. So when you narrow the token to a group,
+take write access to the shared root away from the accounts you exclude in the same step:
+
+```powershell
+icacls C:\AI_Agent /T /remove:g "BUILTIN\Users"
+icacls C:\AI_Agent /T /grant:r "sukarfleet-operators:(OI)(CI)(M)"
+```
+
+Use the same group as for the token. An account outside it loses both read and write access to that
+tree. Repositories the installer left outside the
+shared root, because they sit under a dot-directory of an adopted profile, carry their own access
+list: apply the same two commands to each of them. The installer lays down the shared root's
+access list once, on the first machine-wide install, and records that in
+`C:\ProgramData\sukarfleet\node\shared-root-acl.applied`. Later upgrades leave your list as it is
+and only check the service account's own access, so narrow it once, after the first install.
+
+With the default, every local account is trusted, as stated above, and none of this applies.
+
+**The service is not SYSTEM.** It runs as the virtual account `NT SERVICE\sukarfleet-node`, which has
+no password, cannot sign in interactively, and is granted only what the install gives it: modify on
+`C:\ProgramData\sukarfleet\node`, modify on the shared root, and read, execute and write-attributes on the
+program files (Bun opens the file it runs with more than read access; write-data is not granted).
+Code execution inside the daemon is code execution as that account, not as the machine. Where the
+virtual account cannot be granted the service logon right, the installer falls back to `LocalService`
+and says so in its log, and `sc qc sukarfleet-node` is how you check which one you got.
+
+**git hooks do not run under the service account.** The service is handed a `GIT_CONFIG_GLOBAL` of its
+own, and that file points `core.hooksPath` at an empty directory. A peer that commits a `post-merge`
+script into a synced repository gets nothing on a machine-wide Windows node. A repository's own
+`.git/config` ranks above the global file, so the service also sets `GIT_CONFIG_COUNT` with
+`GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` (the ranking of `git -c`, above every config file)
+to pin `core.hooksPath`, `core.fsmonitor=false` and `commit.gpgsign=false`. Those entries need git
+2.31 or newer; the installer refuses an older git. Filter, merge and diff drivers are not covered
+by any switch, which is why the access list on the shared root matters (see above). **This does not disable
+the `postMerge` hook in this project's own config**, which is argv you wrote in your config file: the
+amplification described under "The sync lane" is unchanged, and so is the advice to keep hook targets
+outside the directories you sync.
+
+**The shared root is writable by every local account.** A machine-wide install keeps the synced
+repositories in one tree, `C:\AI_Agent`, and grants `BUILTIN\Users` modify on it, because two accounts
+working in one tree is the whole point of the scope. Whatever any local account writes there is
+committed by the daemon and reaches every paired machine. Read write access to that directory as
+write access to the fleet's synced content.
+
+**"Same-user processes are trusted" reads differently in each scope.** Per-user, it is the sentence at
+the top of "Known limitations": code running as you has what you have. Machine-wide, the daemon's user
+is a service account nobody signs in as, so the equivalent sentence is about the token and the tree:
+code running as any local account can read the token, drive the node, and write into the synced
+content the whole fleet receives.
+
 ## Known limitations
 
 - **Same-user processes are trusted.** This is the big one; see above.
+- **A machine-wide Windows node is operated by every local account on that PC.** The console
+  token is readable by `BUILTIN\Users` by default and one `icacls` line narrows it to a group;
+  the shared root is writable by them too. See "The machine-wide Windows node" above.
+- **The Windows installer is not signed yet.** SmartScreen warns on a downloaded EXE and there
+  is nothing in the file itself that says where it came from. The SHA256 the build prints, and
+  the pin recorded in `install/easytier-pins.txt`, are the whole of the check until a signing
+  certificate exists.
 - **No FDE detection.** See above.
 - **`confirm` mode does not exist yet.** See above.
 - **Non-Linux platforms are experimental.** Every platform-specific seam is gated by a live

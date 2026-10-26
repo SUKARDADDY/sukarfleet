@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SPDX-License-Identifier: AGPL-3.0-or-later
+
+  WinSW service definition for the machine-wide sukarfleet node.
+
+  This file is a TEMPLATE. Install-MachineNode.ps1 copies it next to the renamed WinSW binary
+  (C:\Program Files\sukarfleet\sukarfleet-node.exe) and replaces every __PLACEHOLDER__ before
+  the service is registered. WinSW finds its configuration by filename, so the copy must be
+  called sukarfleet-node.xml and must sit in the same directory as the exe.
+
+  Placeholders:
+    __BUN_EXE__          full path to bun.exe
+    __APP_DIR__          the sukarfleet tree the node runs from
+    __SERVICE_ACCOUNT__  named in the comment below only; the account itself is set with
+                         sc config, see there
+    __NODE_DIR__         C:\ProgramData\sukarfleet\node
+    __LOG_DIR__          where WinSW writes stdout, stderr and its own log
+    __DEPEND_BLOCK__     <depend>easytier-fleet</depend>, or nothing at all when the mesh
+                         transport is not installed on this machine: a dependency on a service
+                         that does not exist stops this one from ever starting.
+
+  There is no port placeholder. The node reads nodePort from its config.json, which the
+  installer writes; a second copy of the port in here could disagree with it.
+-->
+<service>
+  <id>sukarfleet-node</id>
+  <name>sukarfleet node</name>
+  <description>Runs the sukarfleet daemon for this machine, with nobody logged in.</description>
+
+  <executable>__BUN_EXE__</executable>
+  <arguments>run src\node.ts</arguments>
+  <workingdirectory>__APP_DIR__</workingdirectory>
+
+  <!-- The account is not set here. WinSW 2.12 ignored a <serviceaccount> block and registered
+       the service as LocalSystem; Install-MachineNode.ps1 sets __SERVICE_ACCOUNT__ with
+       "sc config obj=" after the install and reads it back with "sc qc". A virtual account,
+       not SYSTEM: it gets exactly the rights the installer grants it on the node directory and
+       the shared root, and nothing else on the machine. -->
+
+  <!-- The daemon's own paths. SUKARFLEET_CONFIG is a file, SUKARFLEET_CONFIG_DIR and
+       SUKARFLEET_STATE are directories. GIT_CONFIG_GLOBAL points git at a config written for
+       this service alone: hooks off, autocrlf off, the shared root marked safe. TEMP and TMP
+       are set because a service account has no profile to fall back on and Bun needs a
+       writable temp directory. -->
+  <env name="SUKARFLEET_CONFIG" value="__NODE_DIR__\config.json"/>
+  <env name="SUKARFLEET_CONFIG_DIR" value="__NODE_DIR__"/>
+  <env name="SUKARFLEET_STATE" value="__NODE_DIR__\state"/>
+  <env name="GIT_CONFIG_GLOBAL" value="__NODE_DIR__\gitconfig"/>
+  <!-- Git settings that repository config cannot override. GIT_CONFIG_GLOBAL is the LOWEST
+       layer the service sets: a repo's own .git/config beats it. The shared root is writable
+       by every local account, .git included, so anyone who can write a checkout could set
+       core.hooksPath there and have git run their program as the service account, which can
+       read the console token and the machine identity. GIT_CONFIG_COUNT with
+       GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> (git 2.31 and later) is read like
+       "git -c key=value" on the command line, which sits above every config file.
+       Hooks and fsmonitor are the two routes git takes to an arbitrary program in the commands
+       the daemon runs (status, add, commit, merge, fetch, push). commit.gpgsign is the third:
+       a repo that sets it also picks gpg.program. The list is kept short on purpose. Filter
+       drivers, merge drivers and diff drivers have no such switch; SECURITY.md closes them
+       with the access list on the shared root instead. Keep the indexes consecutive from 0 and
+       GIT_CONFIG_COUNT equal to how many there are: git ignores entries past the count.
+       The no-hooks path is the same directory the global gitconfig names. -->
+  <env name="GIT_CONFIG_COUNT" value="3"/>
+  <env name="GIT_CONFIG_KEY_0" value="core.hooksPath"/>
+  <env name="GIT_CONFIG_VALUE_0" value="__NODE_DIR__\no-hooks"/>
+  <env name="GIT_CONFIG_KEY_1" value="core.fsmonitor"/>
+  <env name="GIT_CONFIG_VALUE_1" value="false"/>
+  <env name="GIT_CONFIG_KEY_2" value="commit.gpgsign"/>
+  <env name="GIT_CONFIG_VALUE_2" value="false"/>
+  <env name="TEMP" value="__NODE_DIR__\tmp"/>
+  <env name="TMP" value="__NODE_DIR__\tmp"/>
+
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>5</keepFiles>
+  </log>
+  <logpath>__LOG_DIR__</logpath>
+
+  <onfailure action="restart" delay="3 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  __DEPEND_BLOCK__
+  <startmode>Automatic</startmode>
+  <stoptimeout>20 sec</stoptimeout>
+</service>

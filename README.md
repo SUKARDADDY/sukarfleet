@@ -51,7 +51,9 @@ sudo ~/.local/share/sukarfleet/app/install/install-elevated.sh \
 ```
 
 Copy it from the console rather than from here: both paths are printed there already resolved, and
-the daemon honours `SUKARFLEET_STATE`, so the second one is not always under `$HOME`.
+the daemon honours `SUKARFLEET_STATE`, so the second one is not always under `$HOME`. It honours
+`SUKARFLEET_CONFIG_DIR` the same way, which is the directory holding `config.json`, the machine key
+and the default secrets directory.
 
 That step adopts the staged mesh secret, installs a SHA256-pinned EasyTier, writes
 `/etc/easytier/fleet.toml`, starts the mesh transport, opens the listener ports if a firewall is
@@ -67,9 +69,18 @@ The whole flow, including every failure message and its exit code, is
 [`docs/INSTALL-FLOW.md`](docs/INSTALL-FLOW.md). Other distros are refused by name with the manual
 steps in its appendix.
 
-On Windows, double-click [`install/windows/Add-To-Fleet.cmd`](install/windows/README.md) instead. It
-does the same two stages in one file, behind one UAC prompt, and is specific about the two things a
-Windows node cannot do.
+On Windows, run `sukarfleet-setup-windows-x86_64.exe` from the
+[latest release](https://github.com/SUKARDADDY/sukarfleet/releases) instead. It asks which scope you
+want. **Per-user** runs the daemon as you, from a scheduled task, while you are signed in.
+**Machine-wide** runs it as a Windows service under its own account, from boot, with nobody signed
+in, keeping one fleet identity for the PC and one shared checkout that two accounts can both work
+in. The EXE is not signed yet, so SmartScreen warns; the SHA256 the build prints is the check that
+is available. What each scope costs you is in [`docs/PLATFORMS.md`](docs/PLATFORMS.md), and who may
+drive a machine-wide node is in [`SECURITY.md`](SECURITY.md).
+
+[`install/windows/Add-To-Fleet.cmd`](install/windows/README.md) is still there: it is the per-user
+install as one double-clickable file, behind one UAC prompt, and it is what the console's one-click
+enrollment generates for a machine that is not in the fleet yet.
 
 ## Pair two machines
 

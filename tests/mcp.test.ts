@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { describe, test, expect } from 'bun:test';
+import { afterEach, describe, test, expect } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { loadOrCreateMachineKey } from '../src/keys';
+import { makeConsoleTokenCheck } from '../src/uiserve';
 import { defaultConfig } from '../src/config';
 import type {
   AdminRunRequest,
@@ -572,5 +576,85 @@ describe('fleet.admin_status', () => {
     const { isError, text } = await callAdmin(h.deps, 'fleet.admin_status', {});
     expect(isError).toBe(true);
     expect(text).toContain('admin lane is not available');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The console token gate
+//
+// Same gate and the same refusal bytes as the console (src/uiserve.ts). It matters more here than
+// on the GUI: this surface drives the admin lane, and on a machine-wide node every local account
+// can reach the port.
+// ---------------------------------------------------------------------------
+
+describe('console token gate on POST /mcp', () => {
+  const TOKEN = 'Fq2n8s-rL4kWZ0mJ7pX1dT6yB3vHcA9e';
+  const REFUSAL = '{"error":"console-token-required","message":"This node is installed machine-wide. Paste its console token."}';
+
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  function tokenFile(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'sukarfleet-mcp-token-'));
+    dirs.push(dir);
+    const p = join(dir, 'console-token');
+    writeFileSync(p, `${contents}\n`);
+    return p;
+  }
+
+  function listRequest(headers: Record<string, string> = {}): Request {
+    return new Request(`http://127.0.0.1${MCP_PATH}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+  }
+
+  test('with no tokenCheck dep the surface answers exactly as before', async () => {
+    const { deps } = await makeHarness();
+    const res = await createMcpFetchHandler(deps)(listRequest());
+    expect(res.status).toBe(200);
+    expect(res.headers.get('www-authenticate')).toBeNull();
+  });
+
+  test('configured, a call with no Authorization header is refused with the contract bytes', async () => {
+    const { deps } = await makeHarness();
+    deps.tokenCheck = makeConsoleTokenCheck(tokenFile(TOKEN));
+    const res = await createMcpFetchHandler(deps)(listRequest());
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toBe('Bearer realm="sukarfleet"');
+    expect(await res.text()).toBe(REFUSAL);
+  });
+
+  test('configured, the correct token is let through', async () => {
+    const { deps } = await makeHarness();
+    deps.tokenCheck = makeConsoleTokenCheck(tokenFile(TOKEN));
+    const res = await createMcpFetchHandler(deps)(listRequest({ authorization: `Bearer ${TOKEN}` }));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { result: { tools: unknown[] } };
+    expect(body.result.tools.length).toBeGreaterThan(0);
+  });
+
+  test('configured, a wrong token is refused and no tool runs', async () => {
+    const h = await makeHarness();
+    h.deps.tokenCheck = makeConsoleTokenCheck(tokenFile(TOKEN));
+    const res = await createMcpFetchHandler(h.deps)(
+      new Request(`http://127.0.0.1${MCP_PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer not-the-token' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: { name: 'fleet.admin_run', arguments: { machine: 'beta', command: 'id', reason: 'smoke' } },
+        }),
+      }),
+    );
+    expect(res.status).toBe(401);
+    expect(await res.text()).toBe(REFUSAL);
+    expect(h.adminRequests).toEqual([]);
   });
 });

@@ -13,7 +13,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { isatty, ReadStream as TtyReadStream } from 'node:tty';
 import { AuditLog } from './audit';
-import { defaultConfig, loadConfig, stateDir } from './config';
+import { defaultConfig, expandHome, loadConfig, stateDir } from './config';
 import { loadOrCreateMachineKey } from './keys';
 import { SshAdmin } from './sshadmin';
 import { generateEasytierToml, Transport } from './transport';
@@ -163,15 +163,42 @@ async function fetchStatus(nodePort: number): Promise<RawStatusResponse | null> 
 interface CliDefaults {
   nodePort: number;
   syncStaleMin: number;
+  // admin.consoleTokenFile as configured, or undefined on a node that gates nothing.
+  consoleTokenFile?: string;
 }
 
 async function loadCliConfig(): Promise<CliDefaults> {
   try {
     const cfg = await loadConfig();
-    return { nodePort: cfg.nodePort, syncStaleMin: cfg.thresholds.syncStaleMin };
+    return {
+      nodePort: cfg.nodePort,
+      syncStaleMin: cfg.thresholds.syncStaleMin,
+      ...(cfg.admin.consoleTokenFile ? { consoleTokenFile: cfg.admin.consoleTokenFile } : {}),
+    };
   } catch {
     return { nodePort: 7710, syncStaleMin: 30 };
   }
+}
+
+// A machine-wide node refuses the operator routes (/api/ui/*, /exec/audit/tail) without
+// `Authorization: Bearer <token>`, where the token is the contents of admin.consoleTokenFile. The
+// same config tells this client where that file is, so it sends the header without being told.
+// Unset means no header, exactly as on a per-user node. Set but unreadable throws a message that
+// names the path and never the contents: sending nothing would only come back as a 401 that hides
+// the cause.
+class ConsoleTokenError extends Error {}
+
+async function consoleAuthHeaders(tokenFile: string | undefined): Promise<Record<string, string>> {
+  if (!tokenFile) return {};
+  const path = expandHome(tokenFile);
+  let token: string;
+  try {
+    token = (await Bun.file(path).text()).trim();
+  } catch {
+    throw new ConsoleTokenError(`cannot read the console token file ${path} (admin.consoleTokenFile in config.json)`);
+  }
+  if (!token) throw new ConsoleTokenError(`the console token file ${path} is empty (admin.consoleTokenFile in config.json)`);
+  return { authorization: `Bearer ${token}` };
 }
 
 // --- pure rendering ---
@@ -386,10 +413,18 @@ export async function cmdAuditTail(rawArgs: string[]): Promise<number> {
   const limitNum = limitArg !== undefined ? Number(limitArg) : NaN;
   const limit = Number.isFinite(limitNum) && limitNum > 0 ? Math.floor(limitNum) : 20;
 
-  const { nodePort } = await loadCliConfig();
+  const { nodePort, consoleTokenFile } = await loadCliConfig();
+  let headers: Record<string, string>;
+  try {
+    headers = await consoleAuthHeaders(consoleTokenFile);
+  } catch (err) {
+    if (!(err instanceof ConsoleTokenError)) throw err;
+    console.error(`audit tail: ${err.message}`);
+    return 2;
+  }
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${nodePort}/exec/audit/tail?limit=${limit}`);
+    res = await fetch(`http://127.0.0.1:${nodePort}/exec/audit/tail?limit=${limit}`, { headers });
   } catch {
     console.error(NOT_RUNNING_HINT);
     return 2;
@@ -509,14 +544,24 @@ async function loadAdminConfig(label: string): Promise<FleetConfig | null> {
 // line, so each caller is a straight-line function.
 async function adminApi(
   label: string,
-  nodePort: number,
+  cfg: Pick<FleetConfig, 'nodePort' | 'admin'>,
   path: string,
   init?: RequestInit,
   notFoundMessage?: string,
 ): Promise<unknown | null> {
+  let auth: Record<string, string>;
+  try {
+    auth = await consoleAuthHeaders(cfg.admin.consoleTokenFile);
+  } catch (err) {
+    if (!(err instanceof ConsoleTokenError)) throw err;
+    console.error(`${label}: ${err.message}`);
+    return null;
+  }
+  const headers = new Headers(init?.headers);
+  for (const [k, v] of Object.entries(auth)) headers.set(k, v);
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${nodePort}${path}`, init);
+    res = await fetch(`http://127.0.0.1:${cfg.nodePort}${path}`, { ...init, headers });
   } catch {
     console.error(NOT_RUNNING_HINT);
     return null;
@@ -559,7 +604,7 @@ export async function cmdAdminRun(rawArgs: string[]): Promise<number> {
   const cfg = await loadAdminConfig('admin run');
   if (!cfg) return 2;
 
-  const started = await adminApi('admin run', cfg.nodePort, '/api/ui/admin/run', {
+  const started = await adminApi('admin run', cfg, '/api/ui/admin/run', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ machine, argv, reason, ...(timeoutSec === undefined ? {} : { timeoutSec }) }),
@@ -582,7 +627,7 @@ export async function cmdAdminRun(rawArgs: string[]): Promise<number> {
   for (;;) {
     const polled = (await adminApi(
       'admin run',
-      cfg.nodePort,
+      cfg,
       `/api/ui/admin/run/${encodeURIComponent(runId)}`,
       undefined,
       `run ${runId} is no longer in the daemon's registry (it keeps the last 20, and clears them on restart)`,
@@ -640,7 +685,7 @@ export function renderAdminStatus(entries: AdminStatusEntry[], nowMsVal: number)
 export async function cmdAdminStatus(): Promise<number> {
   const cfg = await loadAdminConfig('admin status');
   if (!cfg) return 2;
-  const body = await adminApi('admin status', cfg.nodePort, '/api/ui/admin/status');
+  const body = await adminApi('admin status', cfg, '/api/ui/admin/status');
   if (body === null) return 2;
   const entries = Array.isArray(body) ? (body as AdminStatusEntry[]) : [];
   if (entries.length === 0) {
@@ -658,7 +703,7 @@ export async function cmdAdminStatus(): Promise<number> {
 export async function cmdAdminTrust(): Promise<number> {
   const cfg = await loadAdminConfig('admin trust');
   if (!cfg) return 2;
-  const body = await adminApi('admin trust', cfg.nodePort, '/api/ui/credentials');
+  const body = await adminApi('admin trust', cfg, '/api/ui/credentials');
   if (body === null) return 2;
 
   const raw = (body ?? {}) as {
