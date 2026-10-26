@@ -55,7 +55,9 @@ other. Anything else has to be read here first.
   that file and compares in constant time; leave it absent and nothing changes, which is what a
   per-user install does. A refused request is `401` with `error: "console-token-required"`; the
   browser console asks for the token on exactly that, holds it in `sessionStorage`, and the tray
-  takes `--token-file`. `POST /pair/hello`, `/health`, `/status` and the peer routes are untouched:
+  takes `--token-file`. `sukarfleet-cli audit tail` and `admin run|status|trust` read the same
+  `admin.consoleTokenFile` from their config and send the header themselves; a file that is set but
+  unreadable stops them with a message naming the path. `POST /pair/hello`, `/health`, `/status` and the peer routes are untouched:
   a machine that is pairing does not have the token yet. **Who may read that file on a machine-wide
   install, and how to narrow it, is in [`SECURITY.md`](SECURITY.md).**
 

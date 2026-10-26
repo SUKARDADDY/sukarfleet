@@ -211,7 +211,7 @@ account shares that loopback. So the node requires a bearer token on `/api/ui/*`
 on `GET /exec/audit/tail`. The token is 32 random bytes, base64url, generated at install and written
 to `C:\ProgramData\sukarfleet\node\console-token`. A request without it is refused with 401 and a body
 naming `console-token-required`; the browser console asks for the token on that refusal and the tray
-reads the file.
+and `sukarfleet-cli` read the file.
 
 Three loopback routes stay ungated on a machine-wide node, and that is the whole list:
 
