@@ -229,8 +229,8 @@ What happens next:
 - If the alarm stays, run `sukarfleet-cli mesh reannounce` on the peer the alarm names.
 - Restarting EasyTier on this node also clears it, but it drops every peer for about 15 seconds,
   so do not do that. Restarting it on the named peer works too, and drops only that peer's links.
-  Re-announcing on this node, or on the sync partner, does nothing: only the peer that lost its
-  route can republish it.
+  Re-announcing on this node, or on the sync partner, does nothing: only the named peer can
+  republish its own route info.
 
 The lasting fix is EasyTier 2.7.0 on both ends of every route-sync session.
 

@@ -793,6 +793,33 @@ describe('findUnroutedPeers', () => {
     expect(findUnroutedPeers('100', new Set(['100', '200', '300']), center)).toEqual([]);
   });
 
+  test("a departed peer's own lingering row is not evidence", () => {
+    // gamma left: the center still holds gamma's own row (up to 180s), but no live node lists it.
+    const c = parsePeerCenterJson(
+      centerJson([
+        { id: '100', hostname: 'alpha', direct: ['200'] },
+        { id: '200', hostname: 'beta', direct: ['100'] },
+        { id: '300', hostname: '', direct: ['100', '200'] },
+      ]),
+    )!;
+    expect(findUnroutedPeers('100', new Set(['100', '200']), c)).toEqual([]);
+  });
+
+  test('a report from a node that is not routed here is not evidence', () => {
+    const c = parsePeerCenterJson(
+      centerJson([
+        { id: '100', hostname: 'alpha', direct: ['200'] },
+        { id: '400', hostname: '', direct: ['300'] },
+      ]),
+    )!;
+    expect(findUnroutedPeers('100', new Set(['100', '200']), c)).toEqual([]);
+  });
+
+  test('with nothing non-local routed, a stale center copy flags nobody', () => {
+    // This node lost every route; its last copy of the center still lists everyone.
+    expect(findUnroutedPeers('100', new Set(['100']), center)).toEqual([]);
+  });
+
   test('without its own id this node says nothing rather than reporting itself', () => {
     expect(findUnroutedPeers(null, new Set(['200', '300']), center)).toEqual([]);
   });

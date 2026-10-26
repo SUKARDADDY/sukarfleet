@@ -251,9 +251,18 @@ export interface UnroutedPeer {
   evidence: 'direct-connection' | 'peer-center';
 }
 
-// Peer ids the peer center reports that have no row in this node's peer list.
-// Pure. myPeerId null means the peer list carried no local row, which leaves
-// this node unable to tell its own id from a lost one, so it reports nothing.
+// Peer ids that a LIVE node reports as its direct peer but that have no row in
+// this node's peer list. Pure. A live reporter is this node itself or a node
+// routed here. Two kinds of stale data are filtered out this way:
+// - The center keeps a departed peer's OWN row for up to 180s, so a peer's
+//   own row never counts as evidence. Live nodes stop listing a departed peer
+//   within about 20s.
+// - When this node has lost every route, its copy of the center stops
+//   refreshing. With nothing non-local routed, there is no live reporter
+//   besides this node's own stale row, so the function reports nothing and
+//   leaves the outage to the transport diagnosis.
+// myPeerId null means the peer list carried no local row, which leaves this
+// node unable to tell its own id from a lost one, so it reports nothing.
 export function findUnroutedPeers(
   myPeerId: string | null,
   routedIds: ReadonlySet<string>,
@@ -261,28 +270,27 @@ export function findUnroutedPeers(
   knownNames: ReadonlyMap<string, string> = new Map(),
 ): UnroutedPeer[] {
   if (myPeerId === null) return [];
-  const mine = new Set(center.find((r) => r.nodeId === myPeerId)?.directPeerIds ?? []);
-  const seen = new Set<string>();
+  if (![...routedIds].some((id) => id !== myPeerId)) return [];
+  const evidence = new Map<string, UnroutedPeer['evidence']>();
   for (const row of center) {
-    seen.add(row.nodeId);
-    for (const id of row.directPeerIds) seen.add(id);
+    const reporterIsMe = row.nodeId === myPeerId;
+    if (!reporterIsMe && !routedIds.has(row.nodeId)) continue;
+    for (const id of row.directPeerIds) {
+      if (id === myPeerId || id === row.nodeId || routedIds.has(id)) continue;
+      if (reporterIsMe || !evidence.has(id)) evidence.set(id, reporterIsMe ? 'direct-connection' : 'peer-center');
+    }
   }
-  const out: UnroutedPeer[] = [];
-  for (const id of [...seen].sort()) {
-    if (id === myPeerId || routedIds.has(id)) continue;
-    out.push({
-      peerId: id,
-      hostname: knownNames.get(id) ?? null,
-      evidence: mine.has(id) ? 'direct-connection' : 'peer-center',
-    });
-  }
-  return out;
+  return [...evidence.keys()].sort().map((id) => ({
+    peerId: id,
+    hostname: knownNames.get(id) ?? null,
+    evidence: evidence.get(id)!,
+  }));
 }
 
 // Consecutive polls a peer must stay unrouted before it is reported (~90s at
-// the default 30s poll). A peer that really left lingers in the peer center
-// for up to 180s after its route is gone, and in the routing table for up to
-// 90s after its connections drop; three polls ride out the ordinary churn of
+// the default 30s poll). Live nodes can list a departed peer for about 20s
+// after it leaves, and EasyTier can keep its route for up to 90s after its
+// connections drop. Three polls ride out the ordinary churn of
 // a reconnect without hiding a route that never comes back.
 export const ROUTE_MISS_POLLS = 3;
 
@@ -530,6 +538,11 @@ export class Transport {
       return;
     }
     this.lastCenter = center;
+    // Keep names only for ids still in view, or a peer that restarts often (a
+    // new id each time) grows this map forever.
+    const inView = new Set(routedIds);
+    for (const row of center) for (const id of [row.nodeId, ...row.directPeerIds]) inView.add(id);
+    for (const id of [...this.knownNames.keys()]) if (!inView.has(id)) this.knownNames.delete(id);
     const unrouted = findUnroutedPeers(myPeerId, routedIds, center, this.knownNames);
     const current = new Set(unrouted.map((u) => u.peerId));
     for (const id of [...this.routeMissStreak.keys()]) if (!current.has(id)) this.routeMissStreak.delete(id);
