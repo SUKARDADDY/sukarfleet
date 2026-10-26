@@ -19,6 +19,7 @@ export type FaultClass =
   | 'peer-online-sync-stale'
   | 'transport-wedged'
   | 'anchor-unreachable'
+  | 'peer-route-missing'
   | 'clock-unvetted'
   | 'admin-credential-stale'
   | 'admin-hostkey-mismatch'
@@ -38,6 +39,10 @@ export interface HealthSelf {
   // so the alarm names WHY the mesh is empty -- "anchor unreachable" alone sent
   // one operator on a forty-minute hunt for a fault the daemon already knew.
   transportFault?: string | null;
+  // Peers the EasyTier peer center reports on the mesh that have had no route
+  // here for several polls (transport.ts route audit, upstream EasyTier #2597).
+  // Optional: absent raises nothing, like an absent `admin` block.
+  unroutedPeers?: Array<{ peerId: string; hostname: string | null; evidence: 'direct-connection' | 'peer-center' }>;
   // SSH admin lane (p3-ssh-admin). Optional: absent means the caller is not reporting on the lane
   // at all (a pre-p3 caller, or a health tick that ran before the lane was constructed), which
   // raises no admin faults. Never a password, never a credential value -- booleans and machine
@@ -200,6 +205,8 @@ function titleFor(faultClass: FaultClass): string {
       return 'sukarfleet: transport wedged';
     case 'anchor-unreachable':
       return 'sukarfleet: anchor unreachable';
+    case 'peer-route-missing':
+      return 'sukarfleet: peer route missing';
     case 'clock-unvetted':
       return 'sukarfleet: clock unvetted';
     case 'admin-credential-stale':
@@ -317,6 +324,25 @@ function computeActiveFaults(cfg: FleetConfig, self: HealthSelf, peers: PeerView
         self.transportFault && self.transportFault !== 'ok'
           ? `anchor unreachable (${self.transportFault})`
           : 'anchor unreachable',
+    });
+  }
+
+  // A peer that is on the mesh but that this node cannot route to. Keyed by the
+  // EasyTier peer id, which is stable for the life of the peer's process and is
+  // all the peer center knows. Critical: traffic to that machine is dropped here
+  // while every status page elsewhere calls it healthy. The peer heals it by
+  // re-announcing itself once it notices the one-way silence, so the message
+  // says where to look if that does not happen.
+  for (const peer of self.unroutedPeers ?? []) {
+    const who = peer.hostname ? `${peer.hostname} (EasyTier peer ${peer.peerId})` : `EasyTier peer ${peer.peerId}`;
+    const how = peer.evidence === 'direct-connection' ? 'has a live connection here' : 'is on the mesh';
+    faults.push({
+      key: `peer-route-missing:${peer.peerId}`,
+      faultClass: 'peer-route-missing',
+      urgency: 'critical',
+      message:
+        `${who} ${how} but no route: EasyTier route sync went stale (upstream #2597). ` +
+        'The peer re-announces itself when it notices; if this persists, run the re-announce on that peer',
     });
   }
 

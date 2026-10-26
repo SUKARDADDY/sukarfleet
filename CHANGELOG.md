@@ -69,6 +69,19 @@ other. Anything else has to be read here first.
 - **A single sync error was 226,000 characters long.** It carried the whole `git add -A -- <every
   path>` argv into `/status`, gossip and the MCP tools. Sync errors are now capped at 2,000
   characters and keep git's `fatal:` and `error:` lines.
+- **A peer that drops off one node's routing table while staying on the mesh is now detected and
+  healed without a restart.** EasyTier 2.6.4 can delete a peer's route metadata after a short
+  outage on one node while that node's route-sync partner never sends it again (upstream
+  [EasyTier #2597](https://github.com/EasyTier/EasyTier/issues/2597), fixed in 2.7.0). The peer's
+  connection stays up and every other node still routes to it, but this node drops its traffic.
+  The daemon now compares `peer-center` with `peer list` on every transport poll and raises a
+  critical `peer-route-missing` alarm, named by hostname when it has seen one, after three
+  consecutive polls. On the other side, a node that routes to a peer, sees it alive in the peer
+  center, and still gets no gossip from it re-announces its own route info. That is the only fix
+  for this fault short of a restart. 2.6.4 has no direct command for it, so the daemon creates
+  and revokes a throwaway credential, the one runtime field its CLI can change. No connection
+  drops. It runs at most once per 15 minutes. `sukarfleet-cli mesh reannounce` does the same by
+  hand. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md#a-peer-is-on-the-mesh-but-has-no-route-here).
 
 - **A laptop that was simply asleep raised a critical alarm, then kept raising it.** `peer-offline`
   fired the moment gossip presence lapsed, at critical urgency, and repeated every
