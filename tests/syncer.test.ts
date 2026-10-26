@@ -1946,7 +1946,8 @@ test('the daemon\'s own git children do not hold off a repair', async () => {
   expect(await exists(lock)).toBe(false);
   expect(recA.lockRepairs).toHaveLength(1);
   await own;
-});
+  // The editor sleeps 3 s by design, so the default 5 s budget left a slow CI runner almost no room.
+}, 20_000);
 
 // --- unportable paths through every commit, and an abort that cannot finish ------------------
 test('an unportable path staged and then edited (AM) is untracked anyway, and the edit survives on disk', async () => {
