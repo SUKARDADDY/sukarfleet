@@ -732,6 +732,13 @@ export class Syncer {
   // cherry-pick or stash pop) is waited on.
   private async autoCommit(repo: RepoConfig): Promise<boolean> {
     const repoPath = repo.path;
+    // Unmerged entries are checked BEFORE untrackUnportable: its `git rm --cached -f` drops the
+    // conflict stages of an unportable path, and a person's cherry-pick whose only conflict is
+    // that path would then look resolved and get committed, CHERRY_PICK_HEAD and all.
+    const unmerged = await this.gitOk(repoPath, ['ls-files', '-u', '-z']);
+    if (unmerged.stdout.length > 0) {
+      throw new SyncDeferred('unmerged paths in the index are waiting to be resolved by hand');
+    }
     await this.untrackUnportable(repo);
     const st = await this.gitOk(repoPath, ['status', '--porcelain', '-z', '--untracked-files=all']);
     if (hasUnmergedZ(st.stdout)) {
@@ -759,7 +766,9 @@ export class Syncer {
       if (this.stopping) return false;
     }
     if (addable.length > 0) {
-      await this.gitOk(repoPath, ['add', '-A', '--', ...addable]);
+      // --literal-pathspecs: a portable name like `[!a].txt` is otherwise a glob that also matches
+      // the unportable `:.txt` beside it, and stages exactly what the filter above left out.
+      await this.gitOk(repoPath, ['--literal-pathspecs', 'add', '-A', '--', ...addable]);
     }
     const staged = await this.git(repoPath, ['diff', '--cached', '--quiet']);
     if (staged.code === 0) return false;
@@ -847,13 +856,19 @@ export class Syncer {
       if (inIndex.has(p)) continue;
       const src = join(repo.path, p);
       try {
-        if (!(await lstat(src)).isFile()) continue;
+        // A symlink is moved as the link itself: an older peer can commit one, and it obstructs a
+        // merge exactly like a file does.
+        const st = await lstat(src);
+        if (!st.isFile() && !st.isSymbolicLink()) continue;
       } catch {
         continue;
       }
       try {
-        await mkdir(destDir, { recursive: true });
-        await rename(src, join(destDir, encodeURIComponent(p)));
+        // The repository's own layout under the stamp directory, not one encoded name: each
+        // component already exists on this filesystem, so none can be too long for it.
+        const dest = join(destDir, p);
+        await mkdir(dirname(dest), { recursive: true });
+        await rename(src, dest);
         moved.push(p);
       } catch (err) {
         log('error', 'merge: could not move an unportable file out of the way', { repo: repo.name, path: p, error: String(err) });

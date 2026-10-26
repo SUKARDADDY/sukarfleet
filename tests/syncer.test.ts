@@ -1392,7 +1392,8 @@ test.skipIf(process.platform === 'win32')('a git step the daemon had to SIGKILL 
   let wedged = false;
   // The `git add` step, swapped for one that takes the index lock and will not die of SIGTERM.
   const gitRunner = (async (argv: string[], opts: RunOptions = {}): Promise<RunResult> => {
-    if (!wedged && argv[1] === 'add' && argv[2] === '-A' && argv[3] === '--') {
+    const a = argv.filter((x) => x !== '--literal-pathspecs');
+    if (!wedged && a[1] === 'add' && a[2] === '-A' && a[3] === '--') {
       wedged = true;
       return run(['sh', '-c', 'trap "" TERM; : > .git/index.lock; exec sleep 30'], { ...opts, timeoutMs: 300, killGraceMs: 200 });
     }
@@ -1530,7 +1531,10 @@ test('a cycle that fails on a long argv and long stderr reports a bounded syncEr
   const rec = recorder();
   const gitRunner = interceptingRunner(makeClock(), [
     {
-      match: (argv) => argv[1] === 'add' && argv[2] === '-A' && argv[3] === '--',
+      match: (argv) => {
+        const a = argv.filter((x) => x !== '--literal-pathspecs');
+        return a[1] === 'add' && a[2] === '-A' && a[3] === '--';
+      },
       result: { code: 128, stdout: '', stderr: `${'hint: noise\n'.repeat(1000)}fatal: something specific broke` },
     },
   ]);
@@ -1542,7 +1546,7 @@ test('a cycle that fails on a long argv and long stderr reports a bounded syncEr
 
   const err = rec.stats.at(-1)!.syncError!;
   expect(err.length).toBeLessThanOrEqual(SYNC_ERROR_MAX_CHARS);
-  expect(err).toContain('git add -A -- <300 paths> failed (code 128)');
+  expect(err).toContain('git --literal-pathspecs add -A -- <300 paths> failed (code 128)');
   expect(err).toContain('fatal: something specific broke');
 });
 
@@ -2109,6 +2113,80 @@ test('an untrack commit a hook refused is retried once the hook allows it', asyn
   await syncA.syncOnce(repoA);
   expect((await git(dirA, ['ls-tree', '-r', '--name-only', 'HEAD'])).stdout).not.toContain('bad:name.txt');
   expect(await exists(join(dirA, 'bad:name.txt'))).toBe(true);
+});
+
+test('a portable name that is also a glob does not stage the unportable file it matches', async () => {
+  const { dirA, syncA, recA, repoA } = await setupPair({ 'base.txt': 'b' });
+  await writeFile(join(dirA, '[!a].txt'), 'portable');
+  await writeFile(join(dirA, ':.txt'), 'unportable');
+  await syncA.syncOnce(repoA);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  const tree = (await git(dirA, ['ls-tree', '-r', '--name-only', 'HEAD'])).stdout.split('\n').filter(Boolean).sort();
+  expect(tree).toEqual(['[!a].txt', 'base.txt']);
+});
+
+test("a person's cherry-pick conflicted only on an unportable path is waited on, not committed", async () => {
+  const { dirA, syncA, repoA } = await setupPair({ 'base.txt': 'b' });
+  // An older version committed :.txt; a side branch changes it; HEAD changes it differently.
+  await writeFile(join(dirA, ':.txt'), 'base');
+  await git(dirA, ['add', '-A']);
+  await git(dirA, ['commit', '-q', '-m', 'older version']);
+  await git(dirA, ['checkout', '-q', '-b', 'side']);
+  await writeFile(join(dirA, ':.txt'), 'side');
+  await git(dirA, ['commit', '-q', '-am', 'side']);
+  const sideTip = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  await git(dirA, ['checkout', '-q', 'sync/alpha']);
+  await writeFile(join(dirA, ':.txt'), 'ours');
+  await git(dirA, ['commit', '-q', '-am', 'ours']);
+  await run(['git', 'cherry-pick', sideTip], { cwd: dirA });
+  const before = (await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim();
+  expect(await exists(join(dirA, '.git', 'CHERRY_PICK_HEAD'))).toBe(true);
+
+  await syncA.syncOnce(repoA);
+
+  expect((await git(dirA, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(before);
+  expect(await exists(join(dirA, '.git', 'CHERRY_PICK_HEAD'))).toBe(true);
+  expect((await git(dirA, ['ls-files', '-u'])).stdout).toContain(':.txt');
+});
+
+test('an unportable symlink an older peer keeps changing does not block later merges', async () => {
+  const { dirA, dirB, syncA, recA, repoA } = await setupPair({ 'ok.txt': 'zero' });
+  await symlink('target-one', join(dirB, 'bad:link'));
+  await writeFile(join(dirB, 'ok.txt'), 'one');
+  await git(dirB, ['add', '-A']);
+  await git(dirB, ['commit', '-q', '-m', 'older peer link']);
+  await syncA.syncOnce(repoA);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+
+  await rm(join(dirB, 'bad:link'));
+  await symlink('target-two', join(dirB, 'bad:link'));
+  await writeFile(join(dirB, 'ok.txt'), 'two');
+  await git(dirB, ['add', '-A']);
+  await git(dirB, ['commit', '-q', '-m', 'older peer link 2']);
+  await syncA.syncOnce(repoA);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect(await readFile(join(dirA, 'ok.txt'), 'utf8')).toBe('two');
+});
+
+test('a deeply nested unportable file is set aside without an over-long name', async () => {
+  const { dirA, dirB, syncA, recA, repoA } = await setupPair({ 'ok.txt': 'zero' });
+  const deep = ['a', 'b', 'c', 'd'].map((c) => c.repeat(70)).join('/');
+  const rel = `${deep}/bad:name.log`;
+  await mkdir(join(dirB, deep), { recursive: true });
+  await writeFile(join(dirB, rel), 'one');
+  await writeFile(join(dirB, 'ok.txt'), 'one');
+  await git(dirB, ['add', '-A']);
+  await git(dirB, ['commit', '-q', '-m', 'older peer 1']);
+  await syncA.syncOnce(repoA);
+  await writeFile(join(dirB, rel), 'two');
+  await writeFile(join(dirB, 'ok.txt'), 'two');
+  await git(dirB, ['add', '-A']);
+  await git(dirB, ['commit', '-q', '-m', 'older peer 2']);
+  await syncA.syncOnce(repoA);
+  expect(recA.stats.at(-1)!.syncError).toBeNull();
+  expect(await readFile(join(dirA, 'ok.txt'), 'utf8')).toBe('two');
+  const stamps = await readdir(join(dirA, '.git', 'sukarfleet-unportable'));
+  expect(await readFile(join(dirA, '.git', 'sukarfleet-unportable', stamps[0]!, rel), 'utf8')).toBe('one');
 });
 
 async function installHook(repoDir: string, name: string, body: string): Promise<void> {
