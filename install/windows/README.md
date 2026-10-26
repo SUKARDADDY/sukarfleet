@@ -138,6 +138,13 @@ Adoption exports the scheduled task to `C:\ProgramData\sukarfleet\node\adopted-t
 the credential store, the state directory, the fleet SSH key and the sukarfleet lines out of
 `authorized_keys`. The machine keeps its place in the fleet and nothing re-pairs.
 
+The fleet SSH key is the one the adopted config names in `admin.keyPath` (`~` and `%USERPROFILE%`
+mean the adopted profile), or `~/.ssh/id_sukarfleet_ed25519` when none is set. Both halves are
+copied to `C:\ProgramData\sukarfleet\node\id_sukarfleet_ed25519` and `.pub`, and checked, before
+the old node is stopped. If the config names a key that is missing, empty or has no `.pub`, the
+install is refused with nothing changed, because a replacement key would break the SSH trust your
+peers already hold.
+
 It also removes that user's own tray launchers, the `HKCU\...\Run\sukarfleet-tray` value and the
 `sukarfleet console.lnk` Start menu shortcut, because both start a tray with no token file, and
 that tray cannot operate a machine-wide node. The `HKLM` Run value starts the right one. The
@@ -172,7 +179,8 @@ adopt rather than after:
 
 - **Its `postMerge` hook now runs as the service account.** That hook is the argv in your own
   config, not a git hook (git hooks are off for the service: its `GIT_CONFIG_GLOBAL` points
-  `core.hooksPath` at an empty directory). The service account has no profile, no `HOME` and no
+  `core.hooksPath` at an empty directory, and `GIT_CONFIG_COUNT` pins it again above any
+  repository's own config). The service account has no profile, no `HOME` and no
   interactive session, so a hook written for a person -- `chezmoi apply` is the obvious one --
   fails. The failure is logged and nothing else happens to it: the repository still fetches and
   still merges.
@@ -193,8 +201,9 @@ script it ran.
 ### When it refuses
 
 A machine-wide install refused before anything is written, whether for a missing mesh address, a
-missing git, a per-user node nobody asked to adopt or an adoption whose repositories have
-uncommitted work in them, ends Setup with exit code 7 and nothing at all was installed. The
+missing git or a git older than 2.31 (the service pins its git settings with `GIT_CONFIG_COUNT`),
+a per-user node nobody asked to adopt, an adopted config whose `admin.keyPath` names a key that
+cannot be read, or an adoption whose repositories have uncommitted work in them, ends Setup with exit code 7 and nothing at all was installed. The
 `/LOG` file and the message box both carry the refusal from its `ERROR:` line to the end of what
 the script printed, so a refusal that lists what it found -- the file paths in a repository with
 uncommitted work, for one -- arrives with its reason at the top rather than cut off above it.

@@ -442,6 +442,74 @@ function Get-RepoAdoptionPlan {
   return @{ Move = $true; Grant = $false; Why = 'a service has no profile to reach into' }
 }
 
+# Where the adopted node's fleet SSH key really is. admin.keyPath in the adopted config wins; an
+# unset one means the per-user default, ~/.ssh/id_sukarfleet_ed25519. "~" and %USERPROFILE%
+# mean the profile being adopted, not the administrator running this script. Any other %VAR%, or
+# a relative path, is refused: the node would resolve it against an environment this script
+# cannot see, and guessing wrong here copies the wrong key or none.
+#
+# Strict is true when the config names a key somewhere other than the default. That key carries
+# the SSH trust every peer already has in this machine, so a copy that cannot be made refuses
+# the adoption. A node that never created its default key has no trust to lose, so for the
+# default path a missing key stays what it was: the node makes a new one at startup.
+function Resolve-AdoptKeyPath {
+  param([Parameter(Mandatory)] $Cfg, [Parameter(Mandatory)] [string] $ProfileDir)
+  $root = $ProfileDir.TrimEnd('\', '/')
+  $default = $root + '\.ssh\id_sukarfleet_ed25519'
+  $configured = [string] (Get-Prop -Object (Get-Prop -Object $Cfg -Name 'admin') -Name 'keyPath' -Default '')
+  $configured = $configured.Trim()
+  if (-not $configured) { return [pscustomobject]@{ Path = $default; Strict = $false } }
+  $path = $configured
+  if ($path -match '^~([\\/].*)?$') { $path = $root + $Matches[1] }
+  elseif ($path -match '^%USERPROFILE%([\\/].*)?$') { $path = $root + $Matches[1] }
+  if ($path -match '%') {
+    Write-Die "admin.keyPath in the adopted config is '$configured', which this installer cannot resolve. Set it to a full path or to a path starting with ~, then re-run. Nothing was stopped and nothing was moved."
+  }
+  if ($path -notmatch '^([A-Za-z]:[\\/]|\\\\)' -and -not $path.StartsWith($root)) {
+    Write-Die "admin.keyPath in the adopted config is '$configured', which is not a full path. Set it to one, then re-run. Nothing was stopped and nothing was moved."
+  }
+  $same = $path.Replace('/', '\').Equals($default.Replace('/', '\'), [StringComparison]::OrdinalIgnoreCase)
+  return [pscustomobject]@{ Path = $path; Strict = (-not $same) }
+}
+
+# Copies the adopted node's SSH key pair to $NodeSshKey and $NodeSshKey.pub. It lands under the
+# default name whatever the old file was called, because Set-MachineConfigPaths points
+# admin.keyPath there. Both halves are checked at the destination, the private one for
+# non-empty. A strict key (see Resolve-AdoptKeyPath) that fails any step stops the install.
+# The caller runs this before the old node is stopped, so a refusal here costs nothing.
+# -Check does the read and the checks and writes nothing outside $StageDir.
+function Copy-AdoptedSshKey {
+  param([Parameter(Mandatory)] $Key, [Parameter(Mandatory)] [string] $StageDir, [switch] $Check)
+  $staged = Join-Path $StageDir 'key'
+  $leaf = $Key.Path -replace '^.*[\\/]', ''
+  $refusal = "Nothing was stopped and nothing was moved."
+  try {
+    if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Recurse -Force -ErrorAction SilentlyContinue }
+    $privOk = Copy-FileBackup -From $Key.Path -ToDir $staged
+    if ($privOk -and ((Get-Item -LiteralPath (Join-Path $staged $leaf)).Length -le 0)) { $privOk = $false }
+    $pubOk = Copy-FileBackup -From ($Key.Path + '.pub') -ToDir $staged
+    if ($Key.Strict -and -not ($privOk -and $pubOk)) {
+      $problem = if (-not $privOk) { 'that file is missing or empty' } else { 'its .pub file is missing' }
+      Write-Die "the adopted config's admin.keyPath names $($Key.Path), but $problem. Copying the key pair is what keeps this machine's SSH trust with its peers; a new key would break that. Restore the key, or fix admin.keyPath, then re-run. $refusal"
+    }
+    if ($Check) { return ($privOk -and $pubOk) }
+    $destDir = Split-Path -Parent $NodeSshKey
+    if (-not (Test-Path -LiteralPath $destDir)) { [void] (New-Item -ItemType Directory -Force -Path $destDir) }
+    if ($privOk) { Copy-Item -LiteralPath (Join-Path $staged $leaf) -Destination $NodeSshKey -Force }
+    if ($pubOk) { Copy-Item -LiteralPath (Join-Path $staged ($leaf + '.pub')) -Destination ($NodeSshKey + '.pub') -Force }
+    $privDone = (Test-Path -LiteralPath $NodeSshKey) -and ((Get-Item -LiteralPath $NodeSshKey).Length -gt 0)
+    $pubDone = Test-Path -LiteralPath ($NodeSshKey + '.pub')
+    if ($Key.Strict -and -not ($privDone -and $pubDone)) {
+      Write-Die "copied the adopted SSH key, but $NodeSshKey or its .pub is not there afterwards. Nothing was stopped and nothing was moved."
+    }
+    if ($privDone) { Write-Step "copied the fleet SSH key from $($Key.Path)" }
+    else { Write-Warn "no fleet SSH key at $($Key.Path). The node will make a new one at startup, and peers will have to trust it again." }
+    return $privDone
+  } finally {
+    Remove-Item -LiteralPath $staged -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 # The whole question "can this per-user node be adopted?", asked and answered without changing
 # anything. The caller hands in the directory the config is staged into: the real run stages it
 # under the node directory, and a -Preflight pass stages it under TEMP and deletes it again,
@@ -473,6 +541,11 @@ function Get-AdoptionPlan {
   # loop that moves things further down executes a plan that has already passed: a refusal raised
   # halfway through that loop would land after the scheduled task was unregistered and after some
   # repositories had already been renamed, which is the worst moment on this whole path to stop.
+  # The SSH key too: a configured key that cannot be read is a refusal here, in the pass that
+  # -Preflight runs, and not a surprise after the old node is stopped.
+  $adoptKey = Resolve-AdoptKeyPath -Cfg $cfg -ProfileDir $profileDir
+  if ($adoptKey.Strict) { [void] (Copy-AdoptedSshKey -Key $adoptKey -StageDir $StageDir -Check) }
+
   $repos = @(Get-Prop -Object $cfg -Name 'repos' -Default @())
   $repoPlans = @()
   $claimedDests = @{}
@@ -536,6 +609,7 @@ function Get-AdoptionPlan {
     ConfigPath = $srcConfig
     Raw        = $raw
     Config     = $cfg
+    Key        = $adoptKey
     RepoPlans  = $repoPlans
   }
 }
@@ -580,6 +654,17 @@ function Test-InstallRefusals {
   # out to it for every repo it syncs, and the system config edited in step 5 is written with it.
   if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Write-Die 'git is not on PATH. Install Git for Windows (winget install --id Git.Git), open a new terminal, then re-run. Nothing was installed.'
+  }
+  # The service xml pins core.hooksPath and core.fsmonitor with GIT_CONFIG_COUNT, which git reads
+  # from 2.31 on. An older git ignores those variables without a word, and the service would then
+  # run whatever hook a repository's own config names. Refused rather than installed unprotected.
+  $gitVersionText = (& git --version 2>&1 | Out-String).Trim()
+  if ($gitVersionText -notmatch '(\d+)\.(\d+)\.(\d+)') {
+    Write-Die "could not read the version from 'git --version' (got: $gitVersionText). The service needs git 2.31 or newer. Nothing was installed."
+  }
+  $gitVersion = [Version] ('{0}.{1}.{2}' -f $Matches[1], $Matches[2], $Matches[3])
+  if ($gitVersion -lt [Version] '2.31.0') {
+    Write-Die "git $gitVersion is too old. The service pins its hook and fsmonitor settings with GIT_CONFIG_COUNT, which needs git 2.31 or newer. Update Git for Windows (winget upgrade --id Git.Git), open a new terminal, then re-run. Nothing was installed."
   }
 
   $arch = ''
@@ -733,7 +818,7 @@ if (Test-Path -LiteralPath $TokenFile) {
 # if an administrator has cut inheritance on the file.
 if ($TokenCreated) {
   Invoke-Icacls -Arguments @($TokenFile, '/grant', "*${SidUsers}:(R)") -What "letting local accounts read $TokenFile"
-  Write-Note '  every local account can read that file, and so operate this node. Narrow it with the line in SECURITY.md if this machine is shared with someone who should not.'
+  Write-Note '  every local account can read that file, and so operate this node. Narrow it with the lines in SECURITY.md (they cover the shared root too) if this machine is shared with someone who should not.'
 } else {
   Write-Note '  the token file access list is left as the administrator set it'
 }
@@ -745,7 +830,9 @@ if ($TokenCreated) {
 
 # The service reads this one and nothing else: GIT_CONFIG_GLOBAL in the service xml points at
 # it. Hooks off, because a repo that syncs in from another machine can carry them and the
-# service account must not run what a peer wrote. autocrlf off, because the tree is shared with
+# service account must not run what a peer wrote. This file is the lowest layer, though: a
+# repository's own .git/config beats it, so sukarfleet-node.xml also pins core.hooksPath and
+# core.fsmonitor with GIT_CONFIG_COUNT, which beats the repository. autocrlf off, because the tree is shared with
 # Linux machines. The shared root marked safe, because the tree is owned by Administrators and
 # git refuses a tree it does not think is yours.
 $serviceGit = @(
@@ -1223,6 +1310,10 @@ function Invoke-Adoption {
     Write-Die "could not export the '$TaskName' task: $($_.Exception.Message). That export is the only way back, so nothing was changed."
   }
 
+  # --- the fleet SSH key, while the old node is still running ----------------
+  # A key that cannot be copied refuses the adoption here, before anything has been stopped.
+  [void] (Copy-AdoptedSshKey -Key $adoptPlan.Key -StageDir $AdoptStage)
+
   # --- stop the old node ----------------------------------------------------
   try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch { }
   Start-Sleep -Seconds 2
@@ -1258,12 +1349,6 @@ function Invoke-Adoption {
   } else {
     Write-Warn "there is no state directory at $srcState. The node starts with a fresh host key and an empty audit log, and every peer that pinned the old host key will refuse it until they pair again."
   }
-
-  foreach ($suffix in @('', '.pub')) {
-    [void] (Copy-FileBackup -From ((Join-Path $srcSsh 'id_sukarfleet_ed25519') + $suffix) `
-      -ToDir (Split-Path -Parent $NodeSshKey))
-  }
-  if (Test-Path -LiteralPath $NodeSshKey) { Write-Step 'copied the fleet SSH key' }
 
   # Only the lines this project wrote. A real authorized_keys carries keys for unrelated
   # services, and none of those belong to a service account.

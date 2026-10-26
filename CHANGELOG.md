@@ -49,6 +49,15 @@ other. Anything else has to be read here first.
     is available until a certificate exists.
   - Uninstall removes the service, the program and the registry entries and keeps the node
     directory, the shared checkout and the mesh service, and says so.
+  - The service pins `core.hooksPath`, `core.fsmonitor=false` and `commit.gpgsign=false` with
+    `GIT_CONFIG_COUNT`, which ranks above a repository's own config. The shared root is writable
+    by every local account, so a repository's config is not trusted; the global gitconfig alone
+    lost to it. This needs git 2.31, and the installer refuses an older git. Filter and merge
+    drivers have no such switch: [`SECURITY.md`](SECURITY.md) says to remove write access to the
+    shared root for any account you exclude from the console token.
+  - Adoption copies the key named by the adopted config's `admin.keyPath` (and its `.pub`), not
+    only `~/.ssh/id_sukarfleet_ed25519`, and checks both copies before the old node is stopped. A
+    configured key that cannot be read refuses the install with nothing changed.
 
 - **A console token, for a node more than one account can reach.** A machine-wide node shares its
   loopback with every account on the PC, and loopback is not a caller identity, so `/api/ui/*` and

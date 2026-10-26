@@ -244,6 +244,28 @@ when it creates the token, so a later upgrade keeps your narrowed list. The daem
 every request, so leave the service account's own read entry alone. Nothing else in the install depends on
 `Users` being able to read that file.
 
+**The token ACL alone is not a boundary against an account that can write the checkout.** An account
+that can write a repository's `.git` can make git run its code as the service account: a filter
+driver, a merge driver, `diff.external` and similar settings live in that repository's own config
+and run during `git add`, `git status` and `git merge`, and the service account can read the token
+and the machine identity. The service pins `core.hooksPath` and `core.fsmonitor` above repository
+config (see "git hooks" below), and git has no switch that covers the rest. So when you narrow the token to a group,
+take write access to the shared root away from the accounts you exclude in the same step:
+
+```powershell
+icacls C:\AI_Agent /T /remove:g "BUILTIN\Users"
+icacls C:\AI_Agent /T /grant:r "sukarfleet-operators:(OI)(CI)(M)"
+```
+
+Use the same group as for the token. An account outside it loses both read and write access to that
+tree. Repositories the installer left outside the
+shared root, because they sit under a dot-directory of an adopted profile, carry their own access
+list: apply the same two commands to each of them. The installer rewrites the shared root's access
+list on every run and puts `Users` back with modify, so repeat both `icacls` lines after each
+upgrade.
+
+With the default, every local account is trusted, as stated above, and none of this applies.
+
 **The service is not SYSTEM.** It runs as the virtual account `NT SERVICE\sukarfleet-node`, which has
 no password, cannot sign in interactively, and is granted only what the install gives it: modify on
 `C:\ProgramData\sukarfleet\node`, modify on the shared root, and read, execute and write-attributes on the
@@ -254,7 +276,12 @@ and says so in its log, and `sc qc sukarfleet-node` is how you check which one y
 
 **git hooks do not run under the service account.** The service is handed a `GIT_CONFIG_GLOBAL` of its
 own, and that file points `core.hooksPath` at an empty directory. A peer that commits a `post-merge`
-script into a synced repository gets nothing on a machine-wide Windows node. **This does not disable
+script into a synced repository gets nothing on a machine-wide Windows node. A repository's own
+`.git/config` ranks above the global file, so the service also sets `GIT_CONFIG_COUNT` with
+`GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` (the ranking of `git -c`, above every config file)
+to pin `core.hooksPath`, `core.fsmonitor=false` and `commit.gpgsign=false`. Those entries need git
+2.31 or newer; the installer refuses an older git. Filter, merge and diff drivers are not covered
+by any switch, which is why the access list on the shared root matters (see above). **This does not disable
 the `postMerge` hook in this project's own config**, which is argv you wrote in your config file: the
 amplification described under "The sync lane" is unchanged, and so is the advice to keep hook targets
 outside the directories you sync.

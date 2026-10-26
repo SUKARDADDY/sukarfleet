@@ -47,6 +47,27 @@
   <env name="SUKARFLEET_CONFIG_DIR" value="__NODE_DIR__"/>
   <env name="SUKARFLEET_STATE" value="__NODE_DIR__\state"/>
   <env name="GIT_CONFIG_GLOBAL" value="__NODE_DIR__\gitconfig"/>
+  <!-- Git settings that repository config cannot override. GIT_CONFIG_GLOBAL is the LOWEST
+       layer the service sets: a repo's own .git/config beats it. The shared root is writable
+       by every local account, .git included, so anyone who can write a checkout could set
+       core.hooksPath there and have git run their program as the service account, which can
+       read the console token and the machine identity. GIT_CONFIG_COUNT with
+       GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> (git 2.31 and later) is read like
+       "git -c key=value" on the command line, which sits above every config file.
+       Hooks and fsmonitor are the two routes git takes to an arbitrary program in the commands
+       the daemon runs (status, add, commit, merge, fetch, push). commit.gpgsign is the third:
+       a repo that sets it also picks gpg.program. The list is kept short on purpose. Filter
+       drivers, merge drivers and diff drivers have no such switch; SECURITY.md closes them
+       with the access list on the shared root instead. Keep the indexes consecutive from 0 and
+       GIT_CONFIG_COUNT equal to how many there are: git ignores entries past the count.
+       The no-hooks path is the same directory the global gitconfig names. -->
+  <env name="GIT_CONFIG_COUNT" value="3"/>
+  <env name="GIT_CONFIG_KEY_0" value="core.hooksPath"/>
+  <env name="GIT_CONFIG_VALUE_0" value="__NODE_DIR__\no-hooks"/>
+  <env name="GIT_CONFIG_KEY_1" value="core.fsmonitor"/>
+  <env name="GIT_CONFIG_VALUE_1" value="false"/>
+  <env name="GIT_CONFIG_KEY_2" value="commit.gpgsign"/>
+  <env name="GIT_CONFIG_VALUE_2" value="false"/>
   <env name="TEMP" value="__NODE_DIR__\tmp"/>
   <env name="TMP" value="__NODE_DIR__\tmp"/>
 
