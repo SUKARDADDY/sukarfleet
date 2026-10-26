@@ -296,8 +296,11 @@ test('a Windows executable given as a path is resolved literally; a bare name is
   // A path goes to Get-Item -LiteralPath: wildcard escaping would insert backticks into
   // C:\Tools\[v1]\tool.exe and look for a file by that altered name.
   expect(ps).toContain("if($a.IndexOfAny([char[]]'\\/:') -ge 0){$src=(Get-Item -LiteralPath $a");
-  // Only a bare name is escaped, because Get-Command -Name treats it as a pattern.
-  expect(ps).toContain('Get-Command -Name ([System.Management.Automation.WildcardPattern]::Escape($a))');
+  // A bare name with no wildcard character goes to Get-Command as it is. One with [ ] * or ? is
+  // found by walking PATH literally: Get-Command keeps an escaped name's backticks.
+  expect(ps).toContain("elseif($a.IndexOfAny([char[]]'[]*?') -lt 0){$src=(Get-Command -Name $a ");
+  expect(ps).toContain('[IO.File]::Exists($c)');
+  expect(ps).not.toContain('WildcardPattern');
   expect(ps).toContain('[FleetJob]::Run($src,');
   expect(ps).not.toContain('$exe.Source');
 });

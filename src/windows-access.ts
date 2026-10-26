@@ -87,7 +87,11 @@ Add-Type -TypeDefinition @'
 ${JOB_RUNNER}
 '@
 $a=[string]$p.argv[0]
-if($a.IndexOfAny([char[]]'\\/:') -ge 0){$src=(Get-Item -LiteralPath $a -ErrorAction Stop).FullName}else{$src=(Get-Command -Name ([System.Management.Automation.WildcardPattern]::Escape($a)) -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source}
+if($a.IndexOfAny([char[]]'\\/:') -ge 0){$src=(Get-Item -LiteralPath $a -ErrorAction Stop).FullName}
+elseif($a.IndexOfAny([char[]]'[]*?') -lt 0){$src=(Get-Command -Name $a -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source}
+else{$src=$null;$exts=@('')+@(([string]$env:PATHEXT).Split(';')|Where-Object{$_})
+foreach($d in ([string]$env:PATH).Split([IO.Path]::PathSeparator)){if(-not $d){continue};foreach($x in $exts){$c=Join-Path $d ($a+$x);if([IO.File]::Exists($c)){$src=$c;break}};if($src){break}}
+if(-not $src){throw "executable not found on PATH: $a"}}
 if([IO.Path]::GetExtension($src) -notin @('.exe','.com')){throw 'Use cmd.exe explicitly for batch files'}
 $rest=New-Object 'System.Collections.Generic.List[string]'
 for($i=1;$i -lt $p.argv.Count;$i++){$rest.Add([string]$p.argv[$i])}
