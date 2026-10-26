@@ -49,6 +49,26 @@ The two halves have very different risk profiles and are documented separately b
 - **The mesh is not the security boundary.** Signature verification is. A machine that joins the
   mesh without being paired can reach the ports and gets nothing.
 
+## Access-only SSH machines
+
+Access-only registration grants agents the authority of an existing SSH account without
+installing a node or syncing repositories on that machine. These targets are separate from
+paired peers. Registration requires an existing private key and host-key pin on the origin,
+the enabled admin lane, and `admin.agentOrigin: "allow"`. Replacing a registration's settings
+requires an explicit `replace:true` request. Files remain on the origin; keys are not copied.
+
+Execution ignores ambient SSH configuration, agent keys, forwarding and multiplexed
+connections. Host-key checking is strict. Commands have bounded capture and an independent
+remote process-group deadline. Requests are signed and audited before dispatch. Completion
+records contain status and byte counts, never command output. There is no target-side node
+or second audit record. Losing SSH can leave the origin unable to tell whether a command
+finished, so it reports unknown completion and never retries automatically.
+
+The registered account's existing privileges are the boundary. `asRoot:true` invokes
+`sudo -n` and succeeds only with target-local noninteractive authorization. This transport
+does not collect, store or transmit a sudo password. macOS screen capture and desktop control
+also require the operating system's local privacy grants; SSH access alone does not grant them.
+
 ## The admin lane
 
 Off by default. Turning it on lets a paired machine run a command as root on this one.

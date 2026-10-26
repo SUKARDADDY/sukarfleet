@@ -94,14 +94,80 @@ The daemon exposes a loopback MCP server. Point your agent at it and it gets:
 
 | Tool | Does |
 |---|---|
+| `fleet.sync_status` | Read the local sync repositories and clock readiness |
+| `fleet.pair_code` / `fleet.pair_redeem` | Pair nodes through MCP using the existing pairing protocol |
+| `fleet.repo_add` | Adopt an existing checkout for peer-only Git sync without restarting |
 | `fleet.peers` | Live peer table — who is online, what is stale |
 | `fleet.tail` | Recent signed audit entries |
 | `fleet.admin_status` | Whether the admin lane is usable, and why not if it isn't |
 | `fleet.admin_run` | Run a privileged command on a paired machine |
+| `fleet.access_list` | List access-only machines registered on this origin |
+| `fleet.access_register` | Register an existing SSH account with a pinned host key |
+| `fleet.run` | Run a command on an access-only machine |
+| `fleet.screenshot` | Return a macOS access-only machine's screenshot as an inline PNG |
 
-The last one is off by default, and letting an *agent* use it is a second, separate switch. See
+Command execution and access registration require the admin lane, which is off by default,
+and letting an *agent* use it is a second, separate switch. See
 [`SECURITY.md`](SECURITY.md) — it is written to be useful rather than reassuring, and it states
 plainly what the credential sealing does and does not protect you from.
+
+### Access without repository sync
+
+An access-only machine needs SSH and `/usr/bin/perl`, which provides a command deadline.
+It does not need a sukarfleet node, Bun, Git, or any synced repositories. Register it through
+`fleet.access_register` with an existing private key and known_hosts file on the originating
+node. The tool verifies file ownership and permissions and requires an existing host-key pin.
+It never learns a host key from an unverified network connection.
+
+For example, call `fleet.access_register` with:
+
+```json
+{
+  "machine": "workstation",
+  "host": "192.0.2.10",
+  "user": "operator",
+  "identityFile": "~/.ssh/id_ed25519",
+  "knownHostsFile": "~/.ssh/known_hosts",
+  "platform": "macos",
+  "reason": "Enable agent access without repository sync"
+}
+```
+
+Registration writes only `accessTargets` in the origin's config through the server's validated
+config writer. It leaves `peers` and `repos` unchanged. Names cannot overlap full nodes, and
+changing an existing target requires `replace:true`. Registrations belong to that origin;
+agents on another node must call this origin's MCP rather than assume local registration.
+
+`fleet.run` accepts `machine`, `argv`, and `reason`, with optional `timeoutSec` and `asRoot`.
+Commands run as the registered SSH account. `asRoot:true` uses `sudo -n`, so the target must
+already authorize noninteractive sudo. No sudo password is collected or sent over SSH.
+The account's existing SSH and sudo privileges determine what agents can do there.
+
+SSH uses only the registered identity and host-key file, with strict verification and no
+ambient SSH config, agent identities, forwarding, or multiplexed sessions. Every command has
+a signed request record before dispatch and a completion record without output contents.
+Output is capped. The remote deadline terminates the command's process group, including
+background children. Exit 124 may mean the deadline expired or the command itself returned
+124. A local transport timeout, signal or SSH failure leaves remote completion unknown and
+is never automatically retried. Both JSON argv and the shell-quoted SSH command are limited
+to 64 KiB. Quote expansion can make a command exceed that bound even when its original argv fits.
+
+`fleet.screenshot` uses macOS screencapture and returns a PNG capped at 1600 pixels on its
+longest edge. macOS must grant Screen Recording to the responsible capture process, and
+desktop interaction separately needs Accessibility or Automation permission. A successful
+capture can still show only wallpaper from a background login session. Verify the returned
+pixels before treating desktop access as working. A GUI permission broker can be installed
+through `fleet.run` when remote captures need the logged-in user's desktop. Register its
+capture argv as `screenshotCommand`, with one argument exactly `{output}` for the temporary
+PNG destination. Tokens are quoted independently. Changing it requires `replace:true`.
+
+If an MCP client still has an old tool catalog after a daemon upgrade, the supported transport
+client invokes the same server tools and keeps all policy and audit checks in place:
+
+```bash
+bun run src/mcp-client.ts fleet.access_list
+bun run src/mcp-client.ts fleet.run @command.json
+```
 
 ## Configuration
 

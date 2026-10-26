@@ -69,8 +69,29 @@ credential-store locations for exactly that reason.
 
 ### macOS — experimental
 
-Everything except privilege elevation is implemented and expected to work. There is no `get.sh` path: `install/quickstart.sh` is systemd-specific, so a Mac is a manual install. **No maintainer owns a
-Mac**, so "experimental" here genuinely means untried until a stranger tries it.
+The native node can run over an existing mesh. With Bun installed and the existing
+transport CLI at `/usr/local/libexec/sukarfleet-lite/easytier-cli`, run
+`bun install/macos.ts` with a JSON object containing `machine`, `meshIp` and
+`reason`. The installer calls `fleet.node_init` through a temporary loopback MCP
+server. It refuses existing node configuration, creates a user LaunchAgent and
+leaves the mesh setup unchanged. Load the returned plist with `launchctl bootstrap`.
+The bootstrap explicitly enables agent-origin setup operations. Inbound admin
+access stays disabled.
+
+Use `fleet.pair_code` on the existing node, `fleet.pair_redeem` on the new one,
+and `fleet.repo_add` on each checkout. Each tool needs a reason. Registration
+preserves dirty files, adopts `sync/<machine>`, and defaults to peer-only sync.
+A peer-only repository never pushes its sync branch or derived main to origin.
+Each peer-only repo has an independent serialized sync cycle, so retries in
+unrelated repositories cannot hold it in a shared queue.
+Existing SSH access registration can stay alongside a full peer when both names
+resolve to the same mesh address.
+
+The clock probe runs `/usr/bin/sntp -t 3 time.apple.com` without clock-setting
+flags. It accepts a measurement only when the absolute offset plus reported
+uncertainty is at most one second. An unavailable server holds auto-commit until
+a later successful check. The parser and failure paths have automated tests;
+the command also passed on a real arm64 Mac.
 
 Two specific unknowns:
 

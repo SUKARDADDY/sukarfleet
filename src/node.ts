@@ -49,6 +49,8 @@ import {
   type CrossCheckFlagKind,
 } from './audit';
 import { startMcpServer, type McpDeps, type McpServerHandle } from './mcp';
+import { AccessOnly } from './access';
+import { SyncSetup } from './syncsetup';
 import { readCappedBody, DEFAULT_MAX_BODY_BYTES, BODY_READ_TIMEOUT_MS } from './http';
 
 // --- SSH admin lane wiring ------------------------------------------------
@@ -200,6 +202,18 @@ export function scheduleLoop(name: string, intervalMs: number, fn: () => Promise
       if (timer) clearTimeout(timer);
     },
   };
+}
+
+export function schedulePeerSync(repo: RepoConfig, intervalMs: number, deps: {
+  isAdopted: () => boolean;
+  sync: (repo: RepoConfig) => Promise<unknown>;
+  derive: (path: string, opts: { push: false }) => Promise<unknown>;
+}): LoopHandle {
+  return scheduleLoop(`sync:${repo.name}`, intervalMs, async () => {
+    if (!deps.isAdopted()) return;
+    await deps.sync(repo);
+    await deps.derive(repo.path, { push: false });
+  });
 }
 
 async function checkAdopted(repo: RepoConfig, machine: string): Promise<boolean> {
@@ -548,6 +562,7 @@ async function main(): Promise<void> {
 
   // Startup adopt check: never sync a repo whose HEAD is not sync/<machine>.
   const adopted = new Set<string>();
+  const peerSyncLoops = new Map<string, LoopHandle>();
   for (const repo of cfg.repos) {
     if (await checkAdopted(repo, cfg.machine)) adopted.add(repo.name);
   }
@@ -663,6 +678,19 @@ async function main(): Promise<void> {
   });
 
   const health = new Health(cfg);
+
+  function startPeerSync(repo: RepoConfig): void {
+    if (!repo.peerOnly || peerSyncLoops.has(repo.name)) return;
+    peerSyncLoops.set(repo.name, schedulePeerSync(repo, cfg.intervals.syncSec * 1000, {
+      isAdopted: () => adopted.has(repo.name),
+      sync: (r) => syncer.syncOnce(r),
+      derive: async (path, opts) => {
+        const result = await derive.updateMain(path, opts);
+        syncLoopOkMs = nowMs();
+        return result;
+      },
+    }));
+  }
 
   // Point the fleet-<peer> remotes at each peer's git-over-HTTP endpoint so fetchAll has
   // something to fetch from; without this, cross-machine convergence never happens.
@@ -1333,6 +1361,18 @@ async function main(): Promise<void> {
       tailAudit,
       adminRun: (req) => sshAdmin.runAdmin(req),
       adminStatus: () => sshAdmin.status(),
+      access: new AccessOnly({ cfg, auditAppend: adminAuditAppend }),
+      syncSetup: new SyncSetup({
+        cfg, pairing, syncer, auditAppend,
+        activateRepo: (repo) => {
+          selfRepoStats.set(repo.name, { lastSyncOkMs: null, lastCommit: null, syncError: null });
+          adopted.add(repo.name);
+          cfg.repos.push(repo);
+          startPeerSync(repo);
+        },
+        status: () => ({ machine: cfg.machine, clockVetted: clockSentinel.isClockVetted(),
+          repos: cfg.repos.map((repo) => ({ ...repo, ...selfRepoStats.get(repo.name) })) }),
+      }),
       tokenCheck,
     },
     { port: cfg.mcpPort },
@@ -1625,7 +1665,7 @@ async function main(): Promise<void> {
     const push = shouldPushThisTick(cfg.role, anchorDaemonOnlineNow, anchorDownStreak);
 
     for (const repo of cfg.repos) {
-      if (!adopted.has(repo.name)) continue; // never sync on main
+      if (!adopted.has(repo.name) || repo.peerOnly) continue; // peer-only repos have independent loops
 
       const sync = await syncer.syncOnce(repo);
       // Yield check, roamer-only. The observer is asked on EVERY roamer tick, not only on a tick
@@ -1672,7 +1712,7 @@ async function main(): Promise<void> {
         });
       }
       try {
-        const derived = await derive.updateMain(repo.path, { push: repoPush });
+        const derived = await derive.updateMain(repo.path, { push: repoPush && !repo.peerOnly });
         // A fresh sha existed and this machine sat it out. At info, not debug: who pushed is an
         // operational fact, and this is the line that says the roamer is deferring rather than
         // racing the anchor -- at one line per repo per sync tick, cheap enough to keep in a
@@ -1693,6 +1733,10 @@ async function main(): Promise<void> {
     }
     syncLoopOkMs = nowMs();
   });
+
+  // Peer-only repositories must not wait behind unrelated origin fetch/push retries.
+  // Each loop serializes its own repo and is excluded from the shared audited-repo loop above.
+  for (const repo of cfg.repos) startPeerSync(repo);
 
   // Owns the only clockSentinel.check() call in the process: check() consumes its own
   // "did we just jump" signal (it returns true exactly once per suspend/resume event), so
@@ -1838,6 +1882,7 @@ async function main(): Promise<void> {
     log('info', 'shutting down', { signal });
     gossipLoop.stop();
     syncLoop.stop();
+    for (const loop of peerSyncLoops.values()) loop.stop();
     transportLoop.stop();
     healthLoop.stop();
     watchdogLoop.stop();

@@ -22,9 +22,25 @@ export interface PeerConfig {
   sshPublicKey?: string | null;
 }
 
+// Access-only targets use a pinned SSH account without running a node or syncing repositories.
+// These paths belong to the originating machine. Private keys never leave it.
+export interface AccessTargetConfig {
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  identityFile: string;
+  knownHostsFile: string;
+  platform: 'macos' | 'linux';
+  // Optional native GUI broker command. One argument must be {output}, replaced by a private
+  // temporary PNG path. Each token is shell-quoted independently by the origin.
+  screenshotCommand?: string[];
+}
+
 export interface RepoConfig {
   name: string;
   path: string;
+  peerOnly?: boolean; // Native peer sync without pushing branches or derived main to origin.
   postMerge?: string[][]; // argv arrays run after successful merge
 }
 
@@ -35,6 +51,7 @@ export interface FleetConfig {
   nodePort: number;
   networkName: string;
   peers: PeerConfig[];
+  accessTargets?: AccessTargetConfig[];
   repos: RepoConfig[];
   unionPaths: string[];
   easytier: {

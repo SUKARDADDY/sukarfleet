@@ -32,6 +32,8 @@ import type {
   PeerView,
 } from './types';
 import { log } from './util';
+import type { AccessOnly } from './access';
+import type { SyncSetup } from './syncsetup';
 import { consoleTokenRefusal, type ConsoleTokenCheck } from './uiserve';
 
 export const MCP_LOOPBACK_HOST = '127.0.0.1';
@@ -72,6 +74,9 @@ export interface McpDeps {
   // compile rather than serve an agent surface that silently does nothing.
   adminRun: (req: AdminRunRequest) => Promise<AdminRunResult>;
   adminStatus: () => Promise<AdminStatusEntry[]>;
+  access?: Pick<AccessOnly, 'call'>;
+  syncSetup?: Pick<SyncSetup, 'call'>;
+  initializeNode?: (args: Record<string, unknown>) => Promise<unknown>;
   // Console token gate, shared with the GUI transport (see uiserve.ts's console token section).
   // Absent means no gate, which is every per-user install: loopback stays the whole boundary.
   // Present -- a machine-wide node, where loopback says nothing about which account is calling --
@@ -158,9 +163,52 @@ interface McpToolDef {
 }
 
 const TOOLS: McpToolDef[] = [
+  { name: 'fleet.node_init', description: 'Initialize a fresh macOS sync node through the macOS installer MCP bootstrap. Refuses existing configuration; unavailable on a running node.',
+    inputSchema: { type: 'object', properties: { machine: { type: 'string' }, meshIp: { type: 'string' }, reason: { type: 'string' } }, required: ['machine', 'meshIp', 'reason'], additionalProperties: false } },
+  { name: 'fleet.sync_status', description: 'Read local native Git sync repositories and clock readiness.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'fleet.pair_code', description: 'Mint a short-lived native fleet pairing code. Requires agent-origin access; the code is not audited.',
+    inputSchema: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'], additionalProperties: false } },
+  { name: 'fleet.pair_redeem', description: 'Redeem a native fleet pairing code through the existing authenticated pairing protocol.',
+    inputSchema: { type: 'object', properties: { code: { type: 'string' }, host: { type: 'string' }, port: { type: 'integer' }, reason: { type: 'string' } }, required: ['code', 'host', 'port', 'reason'], additionalProperties: false } },
+  { name: 'fleet.repo_add', description: 'Adopt an existing local Git checkout for native peer-only sync. Preserves the working tree; never pushes to origin. Takes effect without restarting.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string' }, path: { type: 'string' }, reason: { type: 'string' } }, required: ['name', 'path', 'reason'], additionalProperties: false } },
+  {
+    name: 'fleet.access_list',
+    description: 'List access-only SSH machines registered on this origin. These machines do not run a node or sync repositories. Reachability is not implied.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'fleet.access_register',
+    description: 'Register an access-only SSH machine using an existing private key and pinned known_hosts on this origin. Does not install software or enable sync. Requires the admin lane and agent-origin access. Replacing settings requires replace:true.',
+    inputSchema: { type: 'object', properties: {
+      machine: { type: 'string' }, host: { type: 'string', description: 'Target IPv4 mesh address.' },
+      port: { type: 'integer', default: 22 }, user: { type: 'string' },
+      identityFile: { type: 'string', description: 'Existing private key path on this origin. The key is never returned.' },
+      knownHostsFile: { type: 'string', description: 'Existing known_hosts file containing a pin for this address and port.' },
+      platform: { type: 'string', enum: ['macos', 'linux'] },
+      screenshotCommand: { type: 'array', items: { type: 'string' }, description: 'Optional GUI broker argv that writes PNG to an {output} argument. Otherwise uses macOS screencapture.' },
+      reason: { type: 'string' }, replace: { type: 'boolean', default: false },
+    }, required: ['machine', 'host', 'user', 'identityFile', 'knownHostsFile', 'platform', 'reason'], additionalProperties: false },
+  },
+  {
+    name: 'fleet.run',
+    description: 'Run argv on a registered access-only machine as its SSH user. Requires /usr/bin/perl on the target for process-group deadlines. Strict host-key pinning, bounded output and signed auditing apply. asRoot uses sudo -n and requires existing target-local sudo authorization; no password is requested or transmitted. SSH failure leaves completion unknown; never automatically retry.',
+    inputSchema: { type: 'object', properties: {
+      machine: { type: 'string' }, argv: { type: 'array', items: { type: 'string' } },
+      reason: { type: 'string' }, timeoutSec: { type: 'integer' }, asRoot: { type: 'boolean', default: false },
+    }, required: ['machine', 'argv', 'reason'], additionalProperties: false },
+  },
+  {
+    name: 'fleet.screenshot',
+    description: 'Capture a macOS access-only machine and return inline PNG pixels, at most 1600 pixels on the longest edge. Requires a logged-in desktop and macOS Screen Recording permission for the capture process. Check that pixels show the intended applications; a wallpaper-only image does not prove full desktop access.',
+    inputSchema: { type: 'object', properties: {
+      machine: { type: 'string' }, reason: { type: 'string' }, timeoutSec: { type: 'integer' },
+    }, required: ['machine', 'reason'], additionalProperties: false },
+  },
   {
     name: 'fleet.peers',
-    description: 'List the live fleet peer table (gossip presence merged with configured peers).',
+    description: 'List full-node peers with live gossip presence, plus access-only machines when registered. Access-only targets use fleet.run and fleet.screenshot on the stated origin.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
@@ -214,7 +262,7 @@ interface ToolTextContent {
 }
 
 interface ToolCallResult {
-  content: ToolTextContent[];
+  content: Array<ToolTextContent | { type: 'image'; data: string; mimeType: string }>;
   isError?: boolean;
 }
 
@@ -302,8 +350,26 @@ async function runAdminCommand(args: Record<string, unknown>, deps: McpDeps): Pr
 }
 
 async function callTool(name: string, args: Record<string, unknown>, deps: McpDeps): Promise<ToolCallResult> {
+  if (name === 'fleet.node_init') {
+    if (!deps.initializeNode) return errorResult('node initialization is only available through the macOS installer bootstrap');
+    try { return textResult(await deps.initializeNode(args)); }
+    catch (error) { return errorResult(String(error)); }
+  }
+  if (['fleet.sync_status', 'fleet.pair_code', 'fleet.pair_redeem', 'fleet.repo_add'].includes(name)) {
+    if (!deps.syncSetup) return errorResult('sync setup is not configured on this server');
+    try { return textResult(await deps.syncSetup.call(name, args)); }
+    catch (error) { return errorResult(String(error)); }
+  }
+  if (['fleet.access_list', 'fleet.access_register', 'fleet.run', 'fleet.screenshot'].includes(name)) {
+    if (!deps.access) return errorResult('access-only transport is not configured on this server');
+    return deps.access.call(name, args);
+  }
   if (name === 'fleet.peers') {
-    return textResult({ peers: buildPeerTable(deps) });
+    const accessOnly = (deps.cfg.accessTargets ?? []).filter((t) => !deps.cfg.peers.some((p) => p.name === t.name)).map((t) => ({
+      name: t.name, meshIp: t.host, platform: t.platform, origin: deps.cfg.machine,
+      mode: 'access-only', nodeInstalled: false, sync: false,
+    }));
+    return textResult({ peers: buildPeerTable(deps), ...(accessOnly.length ? { accessOnly } : {}) });
   }
 
   if (name === 'fleet.admin_run') {
