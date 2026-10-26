@@ -601,6 +601,39 @@ describe('Health.evaluate', () => {
     expect(state.faults.some((f) => f.message === 'anchor unreachable (connected-without-peer)')).toBe(true);
   });
 
+  test('peer-route-missing: a peer on the mesh with no route here is a named critical alarm', async () => {
+    const cfg = healthyCfg({}, 'anchor');
+    const { calls, notifier } = fakeNotifier();
+    const health = new Health(cfg, notifier);
+    const self = healthySelf();
+    self.unroutedPeers = [
+      { peerId: '300', hostname: 'gamma', evidence: 'direct-connection' },
+      { peerId: '400', hostname: null, evidence: 'peer-center' },
+    ];
+    const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+    await health.evaluate(t0, self, []);
+    const state = await health.getState();
+    const faults = state.faults.filter((f) => f.faultClass === 'peer-route-missing');
+    expect(faults.map((f) => f.key).sort()).toEqual(['peer-route-missing:300', 'peer-route-missing:400']);
+    expect(faults.every((f) => f.urgency === 'critical')).toBe(true);
+    const gamma = faults.find((f) => f.key === 'peer-route-missing:300')!;
+    expect(gamma.message).toContain('gamma (EasyTier peer 300) has a live connection here but no route');
+    expect(faults.find((f) => f.key === 'peer-route-missing:400')!.message).toContain('EasyTier peer 400 is on the mesh');
+    expect(calls.some((c) => c.urgency === 'critical' && c.body.includes('gamma'))).toBe(true);
+
+    // The route comes back: the alarm clears.
+    self.unroutedPeers = [];
+    await health.evaluate(t0 + 30_000, self, []);
+    expect((await health.getState()).faults.some((f) => f.faultClass === 'peer-route-missing')).toBe(false);
+  });
+
+  test('peer-route-missing: an absent route audit raises nothing', async () => {
+    const { notifier } = fakeNotifier();
+    const health = new Health(healthyCfg({}, 'anchor'), notifier);
+    await health.evaluate(Date.UTC(2026, 0, 1, 12, 0, 0), healthySelf(), []);
+    expect((await health.getState()).faults).toEqual([]);
+  });
+
   test('an ok or absent transport fault leaves the plain message untouched', async () => {
     for (const fault of [undefined, null, 'ok']) {
       const cfg = healthyCfg({}, 'roamer');

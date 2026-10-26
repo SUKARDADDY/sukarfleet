@@ -5,10 +5,17 @@ import type { RunOptions, RunResult } from '../src/util';
 import {
   ANCHOR_MISS_POLLS,
   ClockSentinel,
+  REANNOUNCE_MIN_INTERVAL_MS,
+  REANNOUNCE_SUSPECT_POLLS,
+  ROUTE_MISS_POLLS,
+  ReannounceGate,
   Transport,
   diagnoseTransport,
+  findUnroutedPeers,
   generateEasytierToml,
+  oneWayRouteSuspects,
   parseConnectorJson,
+  parsePeerCenterJson,
 } from '../src/transport';
 
 function fakeRunner(handler: (argv: string[], opts?: RunOptions) => RunResult | Promise<RunResult>) {
@@ -117,6 +124,10 @@ function fleetRunner(opts: {
     if (argv.includes('connector')) {
       expect(argv).toEqual([...base, 'connector', 'list']);
       return { code: 0, stdout: opts.connectors?.() ?? '[]', stderr: '' };
+    }
+    if (argv.includes('peer-center')) {
+      expect(argv).toEqual([...base, 'peer-center']);
+      return { code: 0, stdout: '[]', stderr: '' };
     }
     if (argv.includes('peer')) {
       expect(argv).toEqual([...base, 'peer', 'list']);
@@ -697,5 +708,362 @@ describe('Transport diagnosis wiring', () => {
     });
     await t.pollOnce(1000);
     expect(t.diagnosis()).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Route audit (upstream EasyTier #2597): one peer on the mesh, no route here
+// ---------------------------------------------------------------------------
+
+// Shapes copied from `easytier-cli -o json peer list` / `peer-center` on 2.6.4,
+// with synthetic names and ids. The lost peer's row in the peer center has an
+// empty hostname and IPv4: both come from the route that is missing.
+function peerListJson(rows: Array<{ id: string; hostname: string; cost: string }>): string {
+  return JSON.stringify(rows.map((r) => ({ ...r, cidr: '', ipv4: '', rx_bytes: '1 kB', tx_bytes: '1 kB' })));
+}
+
+function centerJson(rows: Array<{ id: string; hostname: string; direct: string[] }>): string {
+  return JSON.stringify(
+    rows.map((r) => ({
+      node_id: r.id,
+      hostname: r.hostname,
+      ipv4: r.hostname === '' ? '' : '192.0.2.1/24',
+      direct_peers: r.direct.map((d) => ({ node_id: d, hostname: '', ipv4: '', latency_ms: 5 })),
+    })),
+  );
+}
+
+const ALL_ROUTED = [
+  { id: '100', hostname: 'alpha', cost: 'Local' },
+  { id: '200', hostname: 'beta', cost: 'p2p' },
+  { id: '300', hostname: 'gamma', cost: 'p2p' },
+];
+const GAMMA_LOST = ALL_ROUTED.slice(0, 2);
+// alpha holds a live connection to gamma (300) while gamma's route is gone.
+const CENTER_GAMMA_LOST = [
+  { id: '100', hostname: 'alpha', direct: ['200', '300'] },
+  { id: '200', hostname: 'beta', direct: ['100', '300'] },
+  { id: '300', hostname: '', direct: ['100', '200'] },
+];
+
+describe('parsePeerCenterJson', () => {
+  test('reads node ids and direct peers from the real 2.6.4 shape', () => {
+    const rows = parsePeerCenterJson(centerJson(CENTER_GAMMA_LOST));
+    expect(rows).toEqual([
+      { nodeId: '100', hostname: 'alpha', directPeerIds: ['200', '300'] },
+      { nodeId: '200', hostname: 'beta', directPeerIds: ['100', '300'] },
+      { nodeId: '300', hostname: '', directPeerIds: ['100', '200'] },
+    ]);
+  });
+
+  test('accepts numeric ids and skips entries without one', () => {
+    const rows = parsePeerCenterJson(
+      JSON.stringify([{ node_id: 7, hostname: 'x', direct_peers: [{ node_id: 8 }, { hostname: 'no id' }, null] }, { hostname: 'no id' }, 3]),
+    );
+    expect(rows).toEqual([{ nodeId: '7', hostname: 'x', directPeerIds: ['8'] }]);
+  });
+
+  test('null on anything it cannot trust', () => {
+    expect(parsePeerCenterJson('not json')).toBeNull();
+    expect(parsePeerCenterJson('{"node_id":"1"}')).toBeNull();
+  });
+});
+
+describe('findUnroutedPeers', () => {
+  const center = parsePeerCenterJson(centerJson(CENTER_GAMMA_LOST))!;
+
+  test('the incident: a peer with a live connection here and no route is reported by id and remembered name', () => {
+    const out = findUnroutedPeers('100', new Set(['100', '200']), center, new Map([['300', 'gamma']]));
+    expect(out).toEqual([{ peerId: '300', hostname: 'gamma', evidence: 'direct-connection' }]);
+  });
+
+  test('a peer only other nodes report is flagged with weaker evidence', () => {
+    const c = parsePeerCenterJson(
+      centerJson([
+        { id: '100', hostname: 'alpha', direct: ['200'] },
+        { id: '200', hostname: 'beta', direct: ['100', '300'] },
+      ]),
+    )!;
+    expect(findUnroutedPeers('100', new Set(['100', '200']), c)).toEqual([
+      { peerId: '300', hostname: null, evidence: 'peer-center' },
+    ]);
+  });
+
+  test('a healthy mesh reports nothing', () => {
+    expect(findUnroutedPeers('100', new Set(['100', '200', '300']), center)).toEqual([]);
+  });
+
+  test("a departed peer's own lingering row is not evidence", () => {
+    // gamma left: the center still holds gamma's own row (up to 180s), but no live node lists it.
+    const c = parsePeerCenterJson(
+      centerJson([
+        { id: '100', hostname: 'alpha', direct: ['200'] },
+        { id: '200', hostname: 'beta', direct: ['100'] },
+        { id: '300', hostname: '', direct: ['100', '200'] },
+      ]),
+    )!;
+    expect(findUnroutedPeers('100', new Set(['100', '200']), c)).toEqual([]);
+  });
+
+  test('a report from a node that is not routed here is not evidence', () => {
+    const c = parsePeerCenterJson(
+      centerJson([
+        { id: '100', hostname: 'alpha', direct: ['200'] },
+        { id: '400', hostname: '', direct: ['300'] },
+      ]),
+    )!;
+    expect(findUnroutedPeers('100', new Set(['100', '200']), c)).toEqual([]);
+  });
+
+  test('with nothing non-local routed, a stale center copy flags nobody', () => {
+    // This node lost every route; its last copy of the center still lists everyone.
+    expect(findUnroutedPeers('100', new Set(['100']), center)).toEqual([]);
+  });
+
+  test('without its own id this node says nothing rather than reporting itself', () => {
+    expect(findUnroutedPeers(null, new Set(['200', '300']), center)).toEqual([]);
+  });
+});
+
+describe('Transport route audit', () => {
+  function auditRunner(state: { peers: string; center: string | null }, seen: string[][] = []) {
+    return fakeRunner((argv) => {
+      seen.push(argv);
+      if (argv.includes('peer-center')) {
+        if (state.center === null) return { code: 1, stdout: '', stderr: 'rpc portal refused' };
+        return { code: 0, stdout: state.center, stderr: '' };
+      }
+      if (argv.includes('peer')) return { code: 0, stdout: state.peers, stderr: '' };
+      return { code: 0, stdout: JSON.stringify([{ name: 'traffic_bytes_rx', value: 1 }]), stderr: '' };
+    });
+  }
+
+  test('asks the peer center with the exact 2.6.4 argv', async () => {
+    const cfg = defaultConfig('alpha');
+    const seen: string[][] = [];
+    const t = new Transport(cfg, { runner: auditRunner({ peers: peerListJson(ALL_ROUTED), center: '[]' }, seen) });
+    await t.pollOnce(1000);
+    expect(seen).toContainEqual([cfg.easytier.cliPath, '-p', cfg.easytier.rpcAddr, '-o', 'json', 'peer-center']);
+  });
+
+  test('confirms a lost route only after ROUTE_MISS_POLLS polls, names it, and clears on the first routed poll', async () => {
+    const state = { peers: peerListJson(ALL_ROUTED), center: centerJson(CENTER_GAMMA_LOST.map((r) => ({ ...r, hostname: r.hostname || 'gamma' }))) };
+    const t = new Transport(defaultConfig('alpha'), { runner: auditRunner(state) });
+    await t.pollOnce(1000); // healthy: learns that 300 is gamma
+    expect(t.unroutedPeers()).toEqual([]);
+
+    state.peers = peerListJson(GAMMA_LOST);
+    state.center = centerJson(CENTER_GAMMA_LOST);
+    for (let i = 1; i < ROUTE_MISS_POLLS; i++) {
+      await t.pollOnce(1000 + i * 1000);
+      expect(t.unroutedPeers()).toEqual([]);
+    }
+    await t.pollOnce(9000);
+    expect(t.unroutedPeers()).toEqual([{ peerId: '300', hostname: 'gamma', evidence: 'direct-connection' }]);
+
+    state.peers = peerListJson(ALL_ROUTED);
+    await t.pollOnce(10000);
+    expect(t.unroutedPeers()).toEqual([]);
+  });
+
+  test('an unreadable peer center neither resets nor advances the streak', async () => {
+    const state: { peers: string; center: string | null } = { peers: peerListJson(GAMMA_LOST), center: centerJson(CENTER_GAMMA_LOST) };
+    const t = new Transport(defaultConfig('alpha'), { runner: auditRunner(state) });
+    await t.pollOnce(1000);
+    await t.pollOnce(2000);
+    state.center = null;
+    await t.pollOnce(3000);
+    expect(t.unroutedPeers()).toEqual([]);
+    state.center = centerJson(CENTER_GAMMA_LOST);
+    await t.pollOnce(4000);
+    expect(t.unroutedPeers().map((u) => u.peerId)).toEqual(['300']);
+    // And once confirmed, an unreadable center does not clear the alarm either.
+    state.center = null;
+    await t.pollOnce(5000);
+    expect(t.unroutedPeers().map((u) => u.peerId)).toEqual(['300']);
+  });
+
+  test('a route that comes back clears the alarm even when the peer center is unreadable', async () => {
+    const state: { peers: string; center: string | null } = { peers: peerListJson(GAMMA_LOST), center: centerJson(CENTER_GAMMA_LOST) };
+    const t = new Transport(defaultConfig('alpha'), { runner: auditRunner(state) });
+    for (let i = 1; i <= ROUTE_MISS_POLLS; i++) await t.pollOnce(i * 1000);
+    expect(t.unroutedPeers().map((u) => u.peerId)).toEqual(['300']);
+    state.peers = peerListJson(ALL_ROUTED);
+    state.center = null;
+    await t.pollOnce(9000);
+    expect(t.unroutedPeers()).toEqual([]);
+    // And the streak is gone too: one later miss starts from zero.
+    state.peers = peerListJson(GAMMA_LOST);
+    state.center = centerJson(CENTER_GAMMA_LOST);
+    await t.pollOnce(10000);
+    expect(t.unroutedPeers()).toEqual([]);
+  });
+
+  test('a peer that comes back between polls breaks the streak', async () => {
+    const state = { peers: peerListJson(GAMMA_LOST), center: centerJson(CENTER_GAMMA_LOST) };
+    const t = new Transport(defaultConfig('alpha'), { runner: auditRunner(state) });
+    await t.pollOnce(1000);
+    await t.pollOnce(2000);
+    state.peers = peerListJson(ALL_ROUTED);
+    await t.pollOnce(3000);
+    state.peers = peerListJson(GAMMA_LOST);
+    await t.pollOnce(4000);
+    await t.pollOnce(5000);
+    expect(t.unroutedPeers()).toEqual([]);
+  });
+
+  test('oneWaySuspects reads the last poll: routed, alive in the peer center, and silent', async () => {
+    const state = { peers: peerListJson(ALL_ROUTED), center: centerJson(CENTER_GAMMA_LOST.map((r) => ({ ...r, hostname: r.hostname || 'gamma' }))) };
+    const t = new Transport(defaultConfig('alpha'), { runner: auditRunner(state) });
+    expect(t.oneWaySuspects(['beta'])).toEqual([]); // no poll yet: no opinion
+    await t.pollOnce(1000);
+    expect(t.oneWaySuspects(['beta', 'delta'])).toEqual(['beta']);
+  });
+});
+
+describe('oneWayRouteSuspects', () => {
+  const center = parsePeerCenterJson(
+    centerJson([
+      { id: '100', hostname: 'alpha', direct: ['200'] },
+      { id: '200', hostname: 'beta', direct: ['100'] },
+      { id: '300', hostname: 'gamma', direct: [] },
+    ]),
+  );
+
+  test('a silent peer that is routed and alive on the mesh is a suspect', () => {
+    expect(oneWayRouteSuspects(['beta'], new Set(['beta', 'gamma']), center)).toEqual(['beta']);
+  });
+
+  test('a silent peer this node cannot route to is not: that is the other side of the fault', () => {
+    expect(oneWayRouteSuspects(['beta'], new Set(['gamma']), center)).toEqual([]);
+  });
+
+  test('a peer with no live links in the peer center is just gone', () => {
+    expect(oneWayRouteSuspects(['gamma'], new Set(['beta', 'gamma']), center)).toEqual([]);
+  });
+
+  test('no peer-center reading means no opinion', () => {
+    expect(oneWayRouteSuspects(['beta'], new Set(['beta']), null)).toEqual([]);
+  });
+});
+
+describe('ReannounceGate', () => {
+  test('fires on the REANNOUNCE_SUSPECT_POLLS-th consecutive sighting, not before', () => {
+    const g = new ReannounceGate();
+    for (let i = 1; i < REANNOUNCE_SUSPECT_POLLS; i++) expect(g.observe(i * 1000, ['beta'])).toEqual([]);
+    expect(g.observe(REANNOUNCE_SUSPECT_POLLS * 1000, ['beta'])).toEqual(['beta']);
+  });
+
+  test('a clean poll resets the streak', () => {
+    const g = new ReannounceGate();
+    for (let i = 1; i < REANNOUNCE_SUSPECT_POLLS; i++) g.observe(i * 1000, ['beta']);
+    g.observe(50_000, []);
+    expect(g.observe(60_000, ['beta'])).toEqual([]);
+  });
+
+  test('rate-limited to one re-announce per REANNOUNCE_MIN_INTERVAL_MS while the suspicion lasts', () => {
+    const g = new ReannounceGate();
+    let t = 0;
+    for (let i = 0; i < REANNOUNCE_SUSPECT_POLLS; i++) g.observe((t += 30_000), ['beta']);
+    const firedAt = t;
+    expect(g.observe((t += 30_000), ['beta'])).toEqual([]);
+    expect(g.observe(firedAt + REANNOUNCE_MIN_INTERVAL_MS - 1, ['beta'])).toEqual([]);
+    expect(g.observe(firedAt + REANNOUNCE_MIN_INTERVAL_MS, ['beta'])).toEqual(['beta']);
+  });
+});
+
+describe('Transport.reannounceSelf', () => {
+  const SECRET = 'credential-secret-that-must-never-be-logged';
+
+  function capture(): { lines: string[]; restore: () => void } {
+    const lines: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => {
+      lines.push(a.map(String).join(' '));
+    };
+    return { lines, restore: () => (console.log = orig) };
+  }
+
+  test('creates a throwaway credential, waits for EasyTier to publish it, then revokes the same id', async () => {
+    const cfg = defaultConfig('alpha');
+    const seen: string[][] = [];
+    const sleeps: number[] = [];
+    const t = new Transport(cfg, {
+      runner: fakeRunner((argv) => {
+        seen.push(argv);
+        return { code: 0, stdout: argv.includes('generate') ? `credential_secret: ${SECRET}` : 'ok', stderr: '' };
+      }),
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    const out = capture();
+    let ok: boolean;
+    try {
+      ok = await t.reannounceSelf(1234);
+    } finally {
+      out.restore();
+    }
+    expect(ok).toBe(true);
+    const base = [cfg.easytier.cliPath, '-p', cfg.easytier.rpcAddr];
+    expect(seen).toEqual([
+      [...base, 'credential', 'generate', '--ttl', '60', '--credential-id', 'sukarfleet-reannounce-1234', '--reusable', 'false'],
+      [...base, 'credential', 'revoke', 'sukarfleet-reannounce-1234'],
+    ]);
+    // Two changes on two different one-second publish ticks.
+    expect(sleeps).toEqual([3000]);
+    expect(out.lines.join('\n')).not.toContain(SECRET);
+  });
+
+  test('a refused generate reports failure and revokes nothing', async () => {
+    const seen: string[][] = [];
+    const t = new Transport(defaultConfig('alpha'), {
+      runner: fakeRunner((argv) => {
+        seen.push(argv);
+        return { code: 1, stdout: '', stderr: 'only admin nodes (with network_secret) can generate credentials' };
+      }),
+      sleep: async () => {},
+    });
+    const out = capture();
+    try {
+      expect(await t.reannounceSelf(1)).toBe(false);
+    } finally {
+      out.restore();
+    }
+    expect(seen.length).toBe(1);
+  });
+
+  test('a failed revoke still counts: the route info was re-published, and the credential expires', async () => {
+    const t = new Transport(defaultConfig('alpha'), {
+      runner: fakeRunner((argv) =>
+        argv.includes('revoke')
+          ? { code: 1, stdout: '', stderr: 'rpc timeout' }
+          : { code: 0, stdout: `credential_secret: ${SECRET}`, stderr: '' },
+      ),
+      sleep: async () => {},
+    });
+    const out = capture();
+    try {
+      expect(await t.reannounceSelf(1)).toBe(true);
+    } finally {
+      out.restore();
+    }
+    expect(out.lines.some((l) => l.includes('could not revoke'))).toBe(true);
+    expect(out.lines.join('\n')).not.toContain(SECRET);
+  });
+
+  test('a missing easytier-cli is a failure, not a throw', async () => {
+    const t = new Transport(defaultConfig('alpha'), {
+      runner: async () => {
+        throw new Error('ENOENT');
+      },
+      sleep: async () => {},
+    });
+    const out = capture();
+    try {
+      expect(await t.reannounceSelf(1)).toBe(false);
+    } finally {
+      out.restore();
+    }
   });
 });
