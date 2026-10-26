@@ -62,12 +62,16 @@
 # the same token.
 0.1.0  x86_64   326fab24863553705fb0752dd01fd29ec11d18fba9b125f4c747c2794303cd4a  sukarfleet-tray-linux-x86_64
 0.1.0  aarch64  TODO-S9                   sukarfleet-tray-linux-aarch64
+0.2.0  x86_64   4f0fb3312733c39eab2b5885b5ae3dbb968bfecc0b9f9778d87fcd5adaf2c3ba  sukarfleet-tray-linux-x86_64
+0.2.0  aarch64  TODO-S9                   sukarfleet-tray-linux-aarch64
 
 # The Windows tray, built by .github/workflows/tray.yml on a Windows runner and
 # read by Install-Sukarfleet.ps1. Same two tokens, same meanings: x86_64 is built
 # and waiting for the tag that hashes it, and there is no arm64 build at all.
 0.1.0  x86_64   SHA256-FILLED-AT-RELEASE  sukarfleet-tray-windows-x86_64.exe
 0.1.0  arm64    TODO-S9                   sukarfleet-tray-windows-arm64.exe
+0.2.0  x86_64   66694b9efd54d41d3d803555075d27c41544f4d3ca42168267919700dcc4f099  sukarfleet-tray-windows-x86_64.exe
+0.2.0  arm64    TODO-S9                   sukarfleet-tray-windows-arm64.exe
 
 # Bun on Windows, fetched by install/windows/Install-MachineNode.ps1 into
 #   C:\Program Files\sukarfleet\bun
