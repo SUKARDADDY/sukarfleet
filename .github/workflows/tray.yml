@@ -52,9 +52,29 @@ jobs:
       # so a build started at the root silently ignores the crt-static setting
       # that lives next to the crate, and produces a binary that needs the Visual
       # C++ Redistributable. The check below is what catches that if it happens.
+      #
+      # --remap-path-prefix rewrites the cargo registry and checkout paths that panic and debug
+      # strings would otherwise carry (C:\Users\runneradmin\.cargo\..., hundreds of them) into a
+      # public release asset. It goes through --config, not RUSTFLAGS: RUSTFLAGS would replace the
+      # crt-static rustflags in .cargo/config.toml, while --config arrays are joined with them.
+      # The static-runtime check below still proves crt-static survived.
       - name: build
         working-directory: clients/tray/src-tauri
-        run: cargo build --release --locked
+        shell: pwsh
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+          $crate = (Get-Location).Path
+          cargo build --release --locked --config "target.x86_64-pc-windows-msvc.rustflags=['--remap-path-prefix=$cargoHome=C:\cargo', '--remap-path-prefix=$crate=C:\build']"
+
+      - name: no build-machine paths in the binary
+        shell: pwsh
+        run: |
+          $bytes = [IO.File]::ReadAllBytes('clients/tray/src-tauri/target/release/sukarfleet-tray.exe')
+          $text = [Text.Encoding]::ASCII.GetString($bytes) + [Text.Encoding]::Unicode.GetString($bytes)
+          foreach ($p in @('C:\Users\', 'runneradmin')) {
+            if ($text.Contains($p)) { throw "the tray binary still contains '$p'; the path remap did not apply" }
+          }
+          Write-Host 'no user or runner paths in the binary'
 
       - name: name and hash the asset
         shell: pwsh

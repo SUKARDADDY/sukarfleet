@@ -12,7 +12,7 @@
 // point inside a source comment in syncer.ts.
 
 import { describe, expect, test } from 'bun:test';
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
 const REPO_ROOT = join(import.meta.dir, '..');
@@ -45,28 +45,6 @@ const FORBIDDEN: { pattern: RegExp; what: string }[] = [
   { pattern: /\b192\.168\.\d{1,3}\.\d{1,3}\b/, what: 'a private 192.168.x address' },
   { pattern: /\/home\/[a-z][a-z0-9_-]*\//, what: "a real user's home directory" },
   { pattern: /\/Users\/[A-Za-z][A-Za-z0-9_-]*\//, what: "a real macOS user's home directory" },
-  { pattern: /\/Dev_Drive\b/, what: "a real machine's mount point" },
-  { pattern: /\bpop-os\b/i, what: 'a real hostname' },
-  { pattern: /\bsukarlaptop\b/i, what: 'a real machine name' },
-  { pattern: /\bGODFATHER\b/i, what: 'a real machine name' },
-  // The one exception is the project's own repository address. `SUKARDADDY` is
-  // the GitHub organisation this repo is published under, so it appears in the
-  // one install command, in `get.sh`'s default clone URL, and in the docs that
-  // quote them. That is the project's address, not a person's -- the same
-  // reasoning that puts ipify.org and icanhazip.com in the hostname allowlist
-  // below. Anywhere else, including a home directory or a config value, it is
-  // still a username and still caught.
-  // The exception is spelled as a WHOLE host, not as a suffix. `\b` before
-  // `github` spared anything ending in it, so `not-github.com/sukardaddy` and
-  // `x-github.com/sukardaddy` -- a host somebody else can register, which is
-  // exactly where the username still has to be caught -- went through the hole
-  // the exception opened. The inner lookbehind refuses a leading word
-  // character, dot or dash, and the two hosts this project actually uses,
-  // `github.com` and `raw.githubusercontent.com`, are named in full.
-  {
-    pattern: /(?<!(?<![\w.-])(?:raw\.)?github(?:usercontent)?\.com\/)\bsukardaddy\b/i,
-    what: 'a real username',
-  },
   // .local and the reserved example domains are synthetic by definition; anything else that looks
   // like an address is assumed to belong to a person. The second lookahead spares exactly one
   // shape and no more: Tauri's bundler mandates icons named `128x128@2x.png`, which reads as an
@@ -139,28 +117,6 @@ const PATTERN_CASES: { what: string; caught: string[]; spared: string[] }[] = [
   { what: 'a private 192.168.x address', caught: ['192.168.1.5'], spared: ['192.0.2.5'] },
   { what: "a real user's home directory", caught: ['/home/jdoe/notes'], spared: ['/home/', '$HOME/.config'] },
   { what: "a real macOS user's home directory", caught: ['/Users/jdoe/Library'], spared: ['/usr/share/doc'] },
-  { what: "a real machine's mount point", caught: ['/Dev_Drive/repos'], spared: ['/Dev_Drive_backup', '/dev/null'] },
-  { what: 'a real hostname', caught: ['host=pop-os'], spared: ['pop-oscillator'] },
-  { what: 'a real machine name', caught: ['built on sukarlaptop'], spared: ['built on a laptop'] },
-  { what: 'a real machine name', caught: ['GODFATHER', 'godfather'], spared: ['godmother'] },
-  {
-    what: 'a real username',
-    caught: [
-      'sukardaddy',
-      '/home/sukardaddy/notes',
-      'user=SUKARDADDY',
-      'gitlab.com/SUKARDADDY/x',
-      // A host that merely ENDS in github.com belongs to whoever registered it.
-      'https://not-github.com/sukardaddy',
-      'https://x-github.com/sukardaddy',
-      'https://evil.github.com.example.org/sukardaddy',
-    ],
-    spared: [
-      'sukarfleet',
-      'https://github.com/SUKARDADDY/sukarfleet.git',
-      'https://raw.githubusercontent.com/SUKARDADDY/sukarfleet/v0.1.0/install/get.sh',
-    ],
-  },
   {
     what: 'a real email address',
     // The icon-filename exception is the reason this row exists. An address hidden as a filename
@@ -198,4 +154,68 @@ describe('the forbidden patterns catch what they claim to', () => {
       expect(spared.filter((s) => pattern.test(s))).toEqual([]);
     });
   }
+});
+
+// --- the maintainers' own names, kept out of the public tree ---------------------------------
+// The patterns above describe SHAPES. The literal names of one person's machines, accounts and
+// mounts cannot be checked by shape, and listing them here would publish exactly what the check
+// exists to keep out. So they live in a private file outside the repository, one entry per line:
+// $SUKARFLEET_PRIVATE_DENYLIST, or ~/.config/sukarfleet/private-denylist.txt. A plain line is a
+// word matched case-insensitively at word boundaries; a line starting `re:` is a regular
+// expression. A word may still appear right after github.com/ or raw.githubusercontent.com/,
+// because the project is published under its maintainer's account and its own address names it.
+// Without the file (CI, a contributor's machine) this part is skipped, and says so.
+
+// The whole-host exception: only `github.com/` and `raw.githubusercontent.com/` themselves, never a
+// host that merely ends in github.com, which belongs to whoever registered it.
+export function privateWordPattern(word: string): RegExp {
+  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<!(?<![\\w.-])(?:raw\\.)?github(?:usercontent)?\\.com\\/)(?<![\\w-])${escaped}(?![\\w-])`, 'i');
+}
+
+export function parsePrivateDenylist(text: string): RegExp[] {
+  const out: RegExp[] = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    out.push(line.startsWith('re:') ? new RegExp(line.slice(3), 'i') : privateWordPattern(line));
+  }
+  return out;
+}
+
+const PRIVATE_DENYLIST_PATH =
+  process.env.SUKARFLEET_PRIVATE_DENYLIST ?? join(process.env.HOME ?? '', '.config', 'sukarfleet', 'private-denylist.txt');
+const privateDenylist = existsSync(PRIVATE_DENYLIST_PATH) ? parsePrivateDenylist(readFileSync(PRIVATE_DENYLIST_PATH, 'utf8')) : null;
+
+describe('the private denylist', () => {
+  test.skipIf(privateDenylist === null)('no entry of the private denylist appears in the tree', () => {
+    const hits: string[] = [];
+    for (const file of files) {
+      const text = readFileSync(file, 'utf8');
+      for (const [i, line] of text.split('\n').entries()) {
+        for (const pattern of privateDenylist ?? []) {
+          // The location only, never the matched text: the entry itself is what must not be printed.
+          if (pattern.test(line)) hits.push(`${relative(REPO_ROOT, file)}:${i + 1}`);
+        }
+      }
+    }
+    expect(hits).toEqual([]);
+  });
+
+  // Invented names only. The loader's rules are what is under test, not anybody's machine.
+  test('a word is caught anywhere except right after the project host', () => {
+    const [p] = parsePrivateDenylist('# a comment\n\njdoe-laptop\n');
+    for (const s of ['built on jdoe-laptop', 'user=JDOE-LAPTOP', '/home/jdoe-laptop/x', 'https://not-github.com/jdoe-laptop', 'https://evil.github.com.example.org/jdoe-laptop']) {
+      expect(p!.test(s)).toBe(true);
+    }
+    for (const s of ['jdoe-laptops', 'my-jdoe-laptop2', 'https://github.com/jdoe-laptop/repo', 'https://raw.githubusercontent.com/jdoe-laptop/r/v1/x']) {
+      expect(p!.test(s)).toBe(false);
+    }
+  });
+
+  test('a re: line is a regular expression', () => {
+    const [p] = parsePrivateDenylist('re:\\/Fake_Mount\\b');
+    expect(p!.test('/Fake_Mount/repos')).toBe(true);
+    expect(p!.test('/Fake_Mount_backup')).toBe(false);
+  });
 });

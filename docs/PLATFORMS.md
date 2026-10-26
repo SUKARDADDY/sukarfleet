@@ -69,10 +69,11 @@ credential-store locations for exactly that reason.
 
 ### macOS — experimental
 
-The native node can run over an existing mesh. With Bun installed and the existing
-transport CLI at `/usr/local/libexec/sukarfleet-lite/easytier-cli`, run
-`bun install/macos.ts` with a JSON object containing `machine`, `meshIp` and
-`reason`. The installer calls `fleet.node_init` through a temporary loopback MCP
+The native node can run over an existing mesh. With Bun installed and EasyTier
+already running, run `bun install/macos.ts` with a JSON object containing `machine`,
+`meshIp` and `reason`. Add `easytierCliPath` and `easytierServiceName` when the mesh is
+not at the defaults, `/usr/local/bin/easytier-cli` and the launchd label
+`org.sukarfleet.easytier`. The node's own LaunchAgent is `org.sukarfleet.node`. The installer calls `fleet.node_init` through a temporary loopback MCP
 server. It refuses existing node configuration, creates a user LaunchAgent and
 leaves the mesh setup unchanged. Load the returned plist with `launchctl bootstrap`.
 The bootstrap explicitly enables agent-origin setup operations. Inbound admin
@@ -182,7 +183,7 @@ does not run is harmless here: the admin lane is off on Windows and nothing dial
 
 The installer folds the Windows account name into something that validator accepts before writing
 `admin.sshUser`, for the same reason. `sanitizeBundle` checks every bundle's `sshUser` against
-`^[a-z_][a-z0-9_-]{0,31}$`, including the local one, so a machine whose user is `Ariel` used to
+`^[a-z_][a-z0-9_-]{0,31}$`, including the local one, so a machine whose user is `Alex` used to
 fail its own validation with that same unhelpful message.
 
 The machine key and the other private files the daemon writes rely on the installer's ACL rather

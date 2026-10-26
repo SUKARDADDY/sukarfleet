@@ -586,10 +586,11 @@ export class Transport {
   // credential keys, so this creates a throwaway credential and revokes it.
   // Nothing else changes: no connection drops and no route moves.
   //
-  // The credential is never usable. Its secret goes to the CLI's stdout, which
-  // this method never reads or logs; it carries no groups and no relay right,
-  // cannot be reused, is revoked after REANNOUNCE_SETTLE_MS, and expires after
-  // REANNOUNCE_CREDENTIAL_TTL_SEC if the revoke fails. Never throws.
+  // The credential is real and valid for a few seconds, but nobody holds it: its
+  // secret goes to the CLI's stdout, which this method never reads or logs. It
+  // carries no groups and no relay right, cannot be reused, is revoked after
+  // REANNOUNCE_SETTLE_MS, and expires after REANNOUNCE_CREDENTIAL_TTL_SEC if the
+  // revoke fails. Never throws.
   async reannounceSelf(nowMs: number): Promise<boolean> {
     const base = [this.cfg.easytier.cliPath, '-p', this.cfg.easytier.rpcAddr];
     const credentialId = `sukarfleet-reannounce-${nowMs}`;

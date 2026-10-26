@@ -19,7 +19,18 @@ export async function initializeMacNode(args: Record<string, unknown>): Promise<
   const configPath = join(configDir(), 'config.json');
   try { await access(configPath); throw new Error('configuration already exists; refusing to replace it'); }
   catch (error: any) { if (error.code !== 'ENOENT') throw error; }
-  const cli = '/usr/local/libexec/sukarfleet-lite/easytier-cli';
+  // The mesh is already running when this bootstrap is used; it only needs to know how to reach
+  // it. Both values describe that existing install, so both can be given, and the defaults are the
+  // project's own names rather than any one deployment's.
+  if (args.easytierCliPath !== undefined && (typeof args.easytierCliPath !== 'string' || !args.easytierCliPath.startsWith('/'))) {
+    throw new Error('easytierCliPath must be an absolute path');
+  }
+  if (args.easytierServiceName !== undefined &&
+      (typeof args.easytierServiceName !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$/.test(args.easytierServiceName))) {
+    throw new Error('easytierServiceName must be a launchd label');
+  }
+  const cli = (args.easytierCliPath as string | undefined) ?? '/usr/local/bin/easytier-cli';
+  const meshService = (args.easytierServiceName as string | undefined) ?? 'org.sukarfleet.easytier';
   await access(cli);
   const cfg = defaultConfig(args.machine);
   cfg.meshIp = args.meshIp;
@@ -31,11 +42,11 @@ export async function initializeMacNode(args: Record<string, unknown>): Promise<
   cfg.admin.uiAssets = false;
   cfg.notifications.os = false;
   cfg.easytier.cliPath = cli;
-  cfg.easytier.serviceName = 'co.il.raceus.sukarfleet-lite';
+  cfg.easytier.serviceName = meshService;
   const app = resolve(import.meta.dir, '..');
   const home = homedir();
   const logs = join(home, 'Library', 'Logs', 'sukarfleet');
-  const plist = join(home, 'Library', 'LaunchAgents', 'co.il.raceus.sukarfleet-node.plist');
+  const plist = join(home, 'Library', 'LaunchAgents', 'org.sukarfleet.node.plist');
   await mkdir(configDir(), { recursive: true, mode: 0o700 });
   await mkdir(join(home, '.ssh'), { recursive: true, mode: 0o700 });
   const key = join(home, '.ssh', 'id_sukarfleet_ed25519');
@@ -50,7 +61,7 @@ export async function initializeMacNode(args: Record<string, unknown>): Promise<
   const plistHandle = await open(plist, 'wx', 0o600);
   try {
     await plistHandle.writeFile(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>
-<key>Label</key><string>co.il.raceus.sukarfleet-node</string>
+<key>Label</key><string>org.sukarfleet.node</string>
 <key>ProgramArguments</key><array><string>${xml(process.execPath)}</string><string>run</string><string>${xml(join(app, 'src', 'node.ts'))}</string></array>
 <key>WorkingDirectory</key><string>${xml(app)}</string>
 <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(join(home, '.bun', 'bin'))}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>

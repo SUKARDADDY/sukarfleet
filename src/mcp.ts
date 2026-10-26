@@ -164,7 +164,7 @@ interface McpToolDef {
 
 const TOOLS: McpToolDef[] = [
   { name: 'fleet.node_init', description: 'Initialize a fresh macOS sync node through the macOS installer MCP bootstrap. Refuses existing configuration; unavailable on a running node.',
-    inputSchema: { type: 'object', properties: { machine: { type: 'string' }, meshIp: { type: 'string' }, reason: { type: 'string' } }, required: ['machine', 'meshIp', 'reason'], additionalProperties: false } },
+    inputSchema: { type: 'object', properties: { machine: { type: 'string' }, meshIp: { type: 'string' }, reason: { type: 'string' }, easytierCliPath: { type: 'string', description: 'Absolute path of the installed easytier-cli. Default /usr/local/bin/easytier-cli.' }, easytierServiceName: { type: 'string', description: 'launchd label of the running EasyTier service. Default org.sukarfleet.easytier.' } }, required: ['machine', 'meshIp', 'reason'], additionalProperties: false } },
   { name: 'fleet.sync_status', description: 'Read local native Git sync repositories and clock readiness.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'fleet.pair_code', description: 'Mint a short-lived native fleet pairing code. Requires agent-origin access; the code is not audited.',
