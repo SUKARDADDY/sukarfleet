@@ -79,6 +79,9 @@ export function defaultConfig(machine: string): FleetConfig {
       peerOfflineAlarmMin: 720,
       clockSkewMaxMs: 5000,
       wedgePolls: 3,
+      // Ten minutes: far longer than any git command the daemon runs holds a lock, short enough
+      // that a lock a crash left behind costs a handful of sync cycles rather than days.
+      staleGitLockMin: 10,
     },
     admin: {
       enabled: false,
@@ -341,7 +344,7 @@ function validate(cfg: FleetConfig): void {
 
   const th = cfg.thresholds as unknown;
   if (!isPlainObject(th)) fail('thresholds must be an object');
-  for (const k of ['syncStaleMin', 'alarmRepeatMin', 'peerOfflineFactor', 'clockSkewMaxMs', 'wedgePolls'] as const) {
+  for (const k of ['syncStaleMin', 'alarmRepeatMin', 'peerOfflineFactor', 'clockSkewMaxMs', 'wedgePolls', 'staleGitLockMin'] as const) {
     const val = (th as Record<string, unknown>)[k];
     if (typeof val !== 'number' || !Number.isFinite(val) || val <= 0) {
       fail(`thresholds.${k} must be a positive number`);

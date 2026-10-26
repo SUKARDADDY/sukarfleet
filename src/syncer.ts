@@ -3,10 +3,11 @@
 // Single writer per machine on sync/<machine>. main is never touched here.
 
 import { join, dirname, isAbsolute } from 'node:path';
-import { mkdir, readdir, rename, stat } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import type { FleetConfig, RepoConfig, PresenceRepoStat, MachineKey } from './types';
-import { run, runBytes, log, atomicWrite, nowMs, sleep as utilSleep, TransitionGate } from './util';
+import { run, runBytes, log, atomicWrite, nowMs, sleep as utilSleep, TransitionGate, SYNC_DEFERRED_PREFIX } from './util';
 import { buildAuthHeader } from './keys';
+import { reapGitLocks, resolveGitDirs, type LockHolderCheck, type LockRepair } from './gitlocks';
 
 // util.run reports its own timeout kill as exit 124, which a command may also exit with
 // legitimately; elapsed time is what actually disambiguates them. Mirrors sshadmin.ts's identical
@@ -31,6 +32,16 @@ export interface SyncerDeps {
   // Optional and additive, for the same reason as onIndexRepaired. `recoveredFrom` names the
   // remote whose refetch made the object store whole again.
   onObjectsRepaired?: (repo: string, quarantinedTo: string, recoveredFrom: string) => void;
+  // Fired after an orphaned git lock was retired (see reapStaleLocks and reapKilledChildLocks).
+  // Optional and additive like the two above. Awaited, so a caller that records the repair (node.ts
+  // writes a signed audit entry) finishes before the cycle moves on or a shutdown exits.
+  onLockRepaired?: (repo: string, repair: LockRepair) => void | Promise<void>;
+  // Fired after origin's copy of sync/<machine> was merged back into the local branch so the push
+  // could go through (see reconcileOwnBranch). Optional and additive, awaited for the same reason.
+  onOwnBranchMerged?: (repo: string, detail: OwnBranchMerge) => void | Promise<void>;
+  // Fired after paths a Windows checkout cannot hold were taken out of the index (see
+  // untrackUnportable). Optional and additive, awaited like the two above.
+  onUnportableUntracked?: (repo: string, paths: string[]) => void | Promise<void>;
   // This machine's signing identity. Required to attach the x-fleet-auth header that
   // gitserve.ts mandates on every peer fetch (see fetchAll below). Contract addition —
   // callers construct this the same way Gossip does, via keys.loadOrCreateMachineKey().
@@ -41,6 +52,23 @@ export interface SyncerDeps {
   // per-repo marking alone starves the watchdog on outages. Every step is individually
   // time-bounded, so a step completing is honest proof the loop is advancing.
   onStep?: () => void;
+}
+
+// What reconcileOwnBranch did, for the audit entry. Commit ids and a count only: no file content and
+// no paths, since the audit log reaches every machine and may be pushed to a remote.
+export interface OwnBranchMerge {
+  branch: string;
+  originTip: string;
+  localTipBefore: string;
+  localTipAfter: string;
+  // Paths that conflicted and were settled by the ordinary peer-merge rules.
+  conflicts: number;
+}
+
+interface MergeTipResult {
+  outcome: 'contained' | 'merged' | 'deferred';
+  unionRegenNeeded: boolean;
+  conflicts: number;
 }
 
 // What one sync cycle observed that a caller outside the Syncer needs. Deliberately narrow: the
@@ -67,6 +95,8 @@ export interface SyncerOptions {
   // gitShowBytes path are untouched, since the timeout-vs-real-error classification this seam
   // exists for only applies to fetchAll/pushOrigin.
   gitRunner?: typeof run;
+  // Test seam for the stale-lock holder check (gitlocks.ts). Defaults to the per-platform check.
+  lockHolderCheck?: LockHolderCheck;
 }
 
 // C-locale/codepoint order (never locale-dependent). Feeds deterministic tie-breaks.
@@ -94,6 +124,28 @@ export class Syncer {
   private readonly postMergeTimeoutMs: number;
   private readonly now: () => number;
   private readonly gitRunner: typeof run;
+  private readonly lockHolderCheck: LockHolderCheck | undefined;
+  private readonly staleLockMs: number;
+  // When each repo last completed a cycle. Only a cycle that is DEFERRED (a git lock somebody else
+  // holds) reads it, to report the last real success instead of a null that reads as "never synced"
+  // -- see runCycle's catch.
+  private readonly lastOkMs = new Map<string, number>();
+  // When this Syncer was built: the stand-in for "last success" on a deferral before any cycle has
+  // succeeded since the daemon started. Null there would read as "never synced" and raise
+  // self-sync-stale (and a notification, and a "recovered" one a cycle later) for nothing more than
+  // a person holding a lock across a restart. node.ts seeds its loop-freshness marks the same way.
+  private readonly bootMs: number;
+  // When each repo's current run of deferred cycles began. A deferral only becomes visible text in
+  // syncError once it has lasted staleGitLockMin -- and even then as a SYNC_DEFERRED_PREFIX note
+  // that health.ts shows and never alarms on.
+  private readonly deferredSince = new Map<string, number>();
+  // stop(): no new cycle starts, sleeps return at once, push retries give up. The git step already
+  // running is never interrupted here; drainChildren in util.ts owns that.
+  private stopping = false;
+  private wakeStopped: () => void = () => {};
+  private readonly stopped = new Promise<void>((resolve) => {
+    this.wakeStopped = resolve;
+  });
   // Keyed `fetch:<repo>:<remote>`. Only a TIMED-OUT fleet-<peer> fetch is fed through this gate;
   // origin fetches and every real (non-timeout) git error stay warn unconditionally, every cycle.
   private readonly fetchGate = new TransitionGate();
@@ -115,6 +167,23 @@ export class Syncer {
     this.postMergeTimeoutMs = opts.postMergeTimeoutMs ?? 120000;
     this.now = opts.now ?? nowMs;
     this.gitRunner = opts.gitRunner ?? run;
+    this.lockHolderCheck = opts.lockHolderCheck;
+    this.staleLockMs = cfg.thresholds.staleGitLockMin * 60000;
+    this.bootMs = this.now();
+  }
+
+  // Shutdown. A cycle in flight keeps going -- it finishes the step it is on and whatever it needs
+  // to leave the repo consistent -- but stops waiting: the write-quiet debounce and push backoff
+  // return immediately and a failed push is not retried, so a cycle parked in a 45 s backoff does
+  // not spend the whole shutdown budget asleep. A cycle that has not started yet never starts.
+  stop(): void {
+    this.stopping = true;
+    this.wakeStopped();
+  }
+
+  private async pause(ms: number): Promise<void> {
+    if (this.stopping) return;
+    await Promise.race([this.sleep(ms), this.stopped]);
   }
 
   // One-time cutover helper: branch sync/<machine> at HEAD and check it out.
@@ -180,9 +249,16 @@ export class Syncer {
   // stays stuck forever without this: `git status` is the first thing autoCommit runs, so the repo
   // never syncs, never pushes, and reports the same fault every alarm interval until a human runs
   // two commands. A cycle that fails on EMPTY LOOSE OBJECTS is retried once too, after
-  // repairEmptyObjects refetches them. Nothing else here self-heals, deliberately -- see
-  // repairIndex and repairEmptyObjects for the line.
+  // repairEmptyObjects refetches them. More repairs run inside the cycle rather than around it: an
+  // orphaned git lock is retired before the first step (reapStaleLocks), a merge this daemon left
+  // half-done is aborted and redone (settleStrandedMerge), a path a Windows peer cannot check out
+  // is taken out of the index (untrackUnportable), and a push that origin rejects because it holds
+  // commits on sync/<machine> the local branch lost is merged and retried (reconcileOwnBranch).
+  // Each clears the same bar -- it cannot lose committed history or decide a conflict the ordinary
+  // merge rules would not -- and nothing else here self-heals, deliberately. See each repair for
+  // its own argument.
   async syncOnce(repo: RepoConfig): Promise<SyncOnceResult> {
+    if (this.stopping) return { originFetchOk: false };
     const first = await this.runCycle(repo);
     if (first.damage === null) return { originFetchOk: first.originFetchOk };
     const repaired =
@@ -198,6 +274,7 @@ export class Syncer {
   private async runCycle(repo: RepoConfig): Promise<{ originFetchOk: boolean | null; damage: RepairableDamage | null }> {
     let originFetchOk: boolean | null = false;
     try {
+      await this.reapStaleLocks(repo);
       const branchR = await this.gitOk(repo.path, ['symbolic-ref', '--short', 'HEAD']);
       const branch = branchR.stdout.trim();
       const want = `sync/${this.cfg.machine}`;
@@ -205,9 +282,11 @@ export class Syncer {
         throw new Error(`refusing sync: HEAD is '${branch}', expected '${want}' (single-writer)`);
       }
 
+      await this.settleStrandedMerge(repo);
+
       const vetted = this.deps.isClockVetted();
       if (vetted) {
-        await this.autoCommit(repo.path);
+        await this.autoCommit(repo);
       } else {
         log('info', 'clock unvetted; skipping auto-commit', { repo: repo.name });
       }
@@ -215,24 +294,195 @@ export class Syncer {
       originFetchOk = await this.fetchAll(repo);
       const { mergedAny, unionRegenNeeded } = await this.mergePeers(repo, vetted);
       await this.runPostMerge(repo, mergedAny, unionRegenNeeded);
-      await this.pushOrigin(repo);
+      await this.pushOrigin(repo, vetted);
 
       const lastCommit = await this.head(repo.path);
-      this.deps.onRepoStat(repo.name, { lastSyncOkMs: this.now(), lastCommit, syncError: null });
+      const okMs = this.now();
+      this.lastOkMs.set(repo.name, okMs);
+      this.deferredSince.delete(repo.name);
+      this.deps.onRepoStat(repo.name, { lastSyncOkMs: okMs, lastCommit, syncError: null });
       return { originFetchOk, damage: null };
     } catch (err) {
-      // Never leave the repo wedged mid-merge.
-      await this.git(repo.path, ['merge', '--abort']).catch(() => {});
+      // Never leave the repo wedged mid-merge -- but only a merge this daemon started. This used to
+      // run `merge --abort` unconditionally, which also threw away a merge a person had open on the
+      // sync branch whenever an unrelated step failed. Allowed while a shutdown is draining: this
+      // is the step that keeps a half-done merge from outliving the process.
+      await this.abortOwnMerge(repo).catch(() => {});
       const lastCommit = await this.head(repo.path).catch(() => null);
-      const msg = err instanceof Error ? err.message : String(err);
+      const raw = err instanceof Error ? err.message : String(err);
+      // Bounded before it goes anywhere: this string reaches /status, the health fault message, a
+      // desktop notification and every peer through gossip. Unbounded, one failed `git add -A --
+      // <every changed path>` was 226,000 characters of argv in all of those places.
+      const msg = boundErrorText(raw);
+      if (this.stopping) {
+        // A shutdown cut this cycle short (drainChildren refuses new children). Not a fault, and
+        // not worth persisting as one into the last gossip snapshot.
+        log('info', 'sync cycle interrupted by shutdown', { repo: repo.name });
+        return { originFetchOk, damage: null };
+      }
+      const deferral = err instanceof SyncDeferred ? err.reason : isGitLockBusyError(raw) ? lockBusyReason(raw) : null;
+      if (deferral !== null) {
+        // Something a person (or another tool) is in the middle of: a git holding a lock this cycle
+        // needed -- a commit with its editor open, an IDE's background refresh, a lock
+        // reapStaleLocks could not yet prove orphaned -- or a merge left unfinished by hand.
+        // Waiting is the fix, so this is not reported as an error: that would raise a critical
+        // fault and a desktop notification every time a person and the daemon touched the same
+        // repo at once. The stat keeps the last real success (or boot), so a deferral that never
+        // ends still surfaces as self-sync-stale once syncStaleMin passes; and once it has lasted
+        // staleGitLockMin, syncError carries the reason as a SYNC_DEFERRED_PREFIX note, so that
+        // stale fault has an explanation next to it in /status. health.ts never alarms on the note.
+        const now = this.now();
+        const since = this.deferredSince.get(repo.name) ?? now;
+        this.deferredSince.set(repo.name, since);
+        const note =
+          now - since >= this.staleLockMs
+            ? boundErrorText(`${SYNC_DEFERRED_PREFIX}${deferral} (since ${new Date(since).toISOString()})`)
+            : null;
+        log('info', 'sync deferred; retrying next cycle', { repo: repo.name, reason: deferral, error: msg });
+        this.deps.onRepoStat(repo.name, {
+          lastSyncOkMs: this.lastOkMs.get(repo.name) ?? this.bootMs,
+          lastCommit,
+          syncError: note,
+        });
+        return { originFetchOk, damage: null };
+      }
+      this.deferredSince.delete(repo.name);
       log('error', 'sync cycle failed', { repo: repo.name, error: msg });
       this.deps.onRepoStat(repo.name, { lastSyncOkMs: null, lastCommit, syncError: msg });
-      const damage: RepairableDamage | null = isCorruptIndexError(msg)
+      const damage: RepairableDamage | null = isCorruptIndexError(raw)
         ? 'index'
-        : isEmptyObjectError(msg)
+        : isEmptyObjectError(raw)
           ? 'empty-objects'
           : null;
       return { originFetchOk, damage };
+    }
+  }
+
+  // A merge the daemon itself started and never finished: the process died, or a shutdown's bound
+  // ran out, between `git merge` and its commit or abort. MERGE_HEAD is still there, conflict markers
+  // may be in the worktree, and the next autoCommit would `git add` those markers and commit them as
+  // the merge's resolution -- and then they propagate to every machine. So before anything else
+  // touches the tree, a merge this daemon owns is aborted (the next mergePeers redoes it under the
+  // ordinary rules), and a merge it does not own is waited on, never committed.
+  //
+  // Ownership is the marker mergeTip writes before `git merge` (MERGE_MARKER, holding the tip it
+  // merged) and removes once the merge has settled. A MERGE_HEAD that matches it is ours. One
+  // without it is a person's merge on the sync branch, and finishing that is theirs to do.
+  private async settleStrandedMerge(repo: RepoConfig): Promise<void> {
+    const state = await this.mergeOwnership(repo);
+    if (state === 'none') return;
+    if (state === 'theirs') {
+      throw new SyncDeferred('an unfinished merge (MERGE_HEAD) is waiting to be completed or aborted by hand');
+    }
+    const complaint = await this.abortOwnMerge(repo);
+    if ((await this.mergeOwnership(repo)) !== 'none') {
+      // Neither `merge --abort` nor `reset --merge` could put the tree back -- conflict markers
+      // staged, the file edited again since. Committing now would record those markers as the
+      // merge's resolution and ship them to every machine, so this repo is not committed at all
+      // until a person sorts it out. Deferred, not failed: no alarm, a note once it has lasted.
+      // The reason says which: a lock somebody holds (that clears by itself) reads differently from
+      // a tree git will not reset (that needs a person).
+      throw new SyncDeferred(
+        isGitLockBusyError(complaint)
+          ? `${lockBusyReason(complaint)} to abort an unfinished merge`
+          : `a merge this daemon started could not be aborted (${firstVerdict(complaint)}); it needs finishing or aborting by hand`,
+      );
+    }
+    log('warn', 'merge repair: aborted a merge this daemon left unfinished; it is redone this cycle', { repo: repo.name });
+  }
+
+  // Whose merge is in progress, if any. 'ours' only when MERGE_MARKER names the very commit
+  // MERGE_HEAD does. Clears a marker left over from a merge that has already ended.
+  private async mergeOwnership(repo: RepoConfig): Promise<'none' | 'ours' | 'theirs'> {
+    const dirs = await resolveGitDirs(repo.path);
+    if (dirs === null) return 'none';
+    const marker = join(dirs.gitDir, MERGE_MARKER);
+    let mergeHead: string;
+    try {
+      mergeHead = (await readFile(join(dirs.gitDir, 'MERGE_HEAD'), 'utf8')).trim();
+    } catch {
+      await rm(marker, { force: true }).catch(() => {});
+      return 'none';
+    }
+    let ours = '';
+    try {
+      ours = (await readFile(marker, 'utf8')).trim();
+    } catch {
+      // no marker: not ours
+    }
+    return ours.length > 0 && ours === mergeHead ? 'ours' : 'theirs';
+  }
+
+  // Abort the merge in progress if, and only if, this daemon started it.
+  // Abort the merge in progress if, and only if, this daemon started it. Returns git's complaint when
+  // neither --abort nor reset --merge would do it (empty when nothing failed).
+  private async abortOwnMerge(repo: RepoConfig): Promise<string> {
+    if ((await this.mergeOwnership(repo)) !== 'ours') return '';
+    let complaint = '';
+    const abort = await this.gitRecover(repo.path, ['merge', '--abort']);
+    if (abort.code !== 0) {
+      // --abort refuses on some half-states (no ORIG_HEAD); reset --merge is what it runs anyway.
+      const reset = await this.gitRecover(repo.path, ['reset', '--merge']);
+      if (reset.code !== 0) complaint = reset.stderr.trim() || abort.stderr.trim();
+    }
+    const dirs = await resolveGitDirs(repo.path);
+    if (dirs !== null && !(await pathExists(join(dirs.gitDir, 'MERGE_HEAD')))) {
+      await rm(join(dirs.gitDir, MERGE_MARKER), { force: true });
+    }
+    return complaint;
+  }
+
+  // Retire this repo's orphaned git locks before the cycle's first step, so a lock left by a crash
+  // costs at most staleGitLockMin and the cycle that clears it also syncs. gitlocks.ts carries the
+  // whole argument: which locks, why age only nominates and a holder check decides, and why that
+  // check fails closed. Never throws -- a lock that cannot be judged stays put, and the cycle runs
+  // into it and defers (see runCycle's catch) exactly as it would have without this pass.
+  private async reapStaleLocks(repo: RepoConfig): Promise<void> {
+    let repairs: LockRepair[];
+    try {
+      repairs = await reapGitLocks(repo.path, {
+        olderThanMs: this.staleLockMs,
+        now: this.now(),
+        reason: 'stale',
+        stamp: this.fsIso(),
+        holderCheck: this.lockHolderCheck,
+      });
+    } catch (err) {
+      log('info', 'git lock: stale-lock check failed; will retry next cycle', { repo: repo.name, error: String(err) });
+      return;
+    }
+    for (const repair of repairs) await this.reportLockRepair(repo.name, repair);
+  }
+
+  // The afterKill hook every git step carries (see git() below): util.runBytes calls it only when
+  // it had to SIGKILL that step, the one signal git cannot clean up after. Any lock in this repo
+  // created since the step started, and that nothing alive may own, is that step's orphan.
+  private async reapKilledChildLocks(repoPath: string, startedAtMs: number): Promise<void> {
+    const repoName = this.cfg.repos.find((r) => r.path === repoPath)?.name ?? repoPath;
+    let repairs: LockRepair[];
+    try {
+      repairs = await reapGitLocks(repoPath, {
+        createdSinceMs: startedAtMs,
+        reason: 'orphaned-by-kill',
+        stamp: this.fsIso(),
+        holderCheck: this.lockHolderCheck,
+      });
+    } catch (err) {
+      log('info', 'git lock: post-kill cleanup failed; the stale-lock pass will catch it', {
+        repo: repoName,
+        error: String(err),
+      });
+      return;
+    }
+    for (const repair of repairs) await this.reportLockRepair(repoName, repair);
+  }
+
+  private async reportLockRepair(repoName: string, repair: LockRepair): Promise<void> {
+    log('warn', 'git lock repair: retired an orphaned lock', { repo: repoName, ...repair });
+    try {
+      await this.deps.onLockRepaired?.(repoName, repair);
+    } catch (err) {
+      log('error', 'git lock repair: recording the repair failed', { repo: repoName, error: String(err) });
     }
   }
 
@@ -469,14 +719,227 @@ export class Syncer {
   }
 
   // (1) auto-commit: write-quiet debounce + per-file (size,mtime) stability re-check.
-  private async autoCommit(repoPath: string): Promise<boolean> {
-    const st = await this.gitOk(repoPath, ['status', '--porcelain', '-z']);
-    const paths = parsePorcelainZ(st.stdout);
-    if (paths.length === 0) return false;
+  //
+  // Only paths every machine can check out are ever staged. The fleet is mixed, and a path Windows
+  // cannot represent (`check:css.log`) commits fine on Linux and then fails every merge on the
+  // Windows peer, every cycle, forever. So untracked files with such names are left on disk and out
+  // of the commit, and any already in the index are taken out of it (untrackUnportable). Untracked
+  // files are listed one by one (-uall): a collapsed `?? dir/` entry would let `git add -- dir/`
+  // stage whatever unportable names sit inside it.
+  //
+  // A tree with unmerged entries is never committed: that would record conflict markers as the
+  // resolution. settleStrandedMerge handles the daemon's own merges; anything else (a person's
+  // cherry-pick or stash pop) is waited on.
+  private async autoCommit(repo: RepoConfig): Promise<boolean> {
+    const repoPath = repo.path;
+    // Unmerged entries are checked BEFORE untrackUnportable: its `git rm --cached -f` drops the
+    // conflict stages of an unportable path, and a person's cherry-pick whose only conflict is
+    // that path would then look resolved and get committed, CHERRY_PICK_HEAD and all.
+    const unmerged = await this.gitOk(repoPath, ['ls-files', '-u', '-z']);
+    if (unmerged.stdout.length > 0) {
+      throw new SyncDeferred('unmerged paths in the index are waiting to be resolved by hand');
+    }
+    await this.untrackUnportable(repo);
+    const st = await this.gitOk(repoPath, ['status', '--porcelain', '-z', '--untracked-files=all']);
+    if (hasUnmergedZ(st.stdout)) {
+      throw new SyncDeferred('unmerged paths in the index are waiting to be resolved by hand');
+    }
+    const all = parsePorcelainZ(st.stdout);
+    const paths = all.filter(isPortablePath);
+    if (paths.length < all.length) {
+      // Every cycle, by design, and at debug: these files are simply not synced.
+      log('debug', 'auto-commit: leaving paths a Windows checkout cannot hold out of the commit', {
+        repo: repo.name,
+        paths: all.filter((p) => !isPortablePath(p)).slice(0, 10),
+      });
+    }
+    // No early return when nothing is left to add: a deletion can already be staged with nothing
+    // left to show for it in `paths` -- an unportable name removed by hand, or the commit of an
+    // earlier untrack that a hook refused. The staged check below commits it either way.
 
+    let addable: string[] = [];
+    if (paths.length > 0) {
+      addable = await this.stablePaths(repoPath, paths);
+      // stop() made the debounce return early, so the (size,mtime) re-check above compared two
+      // instants with no gap between them and proves nothing. Commit nothing rather than a file
+      // caught half-written.
+      if (this.stopping) return false;
+    }
+    if (addable.length > 0) {
+      // --literal-pathspecs: a portable name like `[!a].txt` is otherwise a glob that also matches
+      // the unportable `:.txt` beside it, and stages exactly what the filter above left out.
+      await this.gitOk(repoPath, ['--literal-pathspecs', 'add', '-A', '--', ...addable]);
+    }
+    const staged = await this.git(repoPath, ['diff', '--cached', '--quiet']);
+    if (staged.code === 0) return false;
+    await this.commitOrDefer(repo, ['-m', `sync: ${this.cfg.machine} ${this.isoNow()}`]);
+    return true;
+  }
+
+  // Take every path a Windows checkout cannot hold out of the index, leaving the files on disk.
+  // Returns how many. Runs before EVERY commit the daemon makes -- autoCommit, the postMerge
+  // regenerators' commit, a merge's commit -- because each of them stages broadly (`add -A`, or a
+  // merge bringing in a peer's tree), and a filter on one path would be a filter on none. The resulting staged deletion is committed by autoCommit like any other
+  // change, so the path leaves every machine's tree -- which is the point: a Windows peer cannot
+  // merge a tree that contains it. Recorded in the audit log, because it removes files from
+  // everyone else's checkout without anybody asking.
+  private async untrackUnportable(repo: RepoConfig): Promise<number> {
+    const r = await this.gitOk(repo.path, ['ls-files', '-z']);
+    const bad = [...new Set(r.stdout.split('\0').filter(Boolean))].filter((p) => !isPortablePath(p));
+    if (bad.length === 0) return 0;
+    for (let i = 0; i < bad.length; i += 200) {
+      // --literal-pathspecs: these names are full of `*` and `?`, which git would otherwise glob.
+      // -f: without it git refuses to drop an entry whose staged content differs from both HEAD and
+      // the file on disk (staged, then edited: status AM), and that refusal failed every cycle
+      // before fetch. --cached still means the file on disk is never touched.
+      await this.gitOk(repo.path, [
+        '--literal-pathspecs',
+        'rm',
+        '--cached',
+        '-f',
+        '-q',
+        '--ignore-unmatch',
+        '--',
+        ...bad.slice(i, i + 200),
+      ]);
+    }
+    // Reported only for a path a commit actually carried -- HEAD's tree, or the tree being merged
+    // in. A path that was merely staged (by hand, or by a broad `add` of a file an earlier untrack
+    // left on disk) was never part of the repo, and reporting it would write an audit entry every
+    // cycle for the same file.
+    const committed = new Set<string>();
+    for (const rev of ['HEAD', 'MERGE_HEAD']) {
+      for (let i = 0; i < bad.length; i += 200) {
+        const r = await this.git(repo.path, ['--literal-pathspecs', 'ls-tree', '-r', '-z', '--name-only', rev, '--', ...bad.slice(i, i + 200)]);
+        if (r.code === 0) for (const p of r.stdout.split('\0')) if (p) committed.add(p);
+      }
+    }
+    const reported = bad.filter((p) => committed.has(p));
+    if (reported.length === 0) {
+      log('debug', 'auto-commit: unstaged paths a Windows checkout cannot hold', { repo: repo.name, paths: bad.slice(0, 10) });
+      return bad.length;
+    }
+    log('warn', 'auto-commit: untracked paths a Windows checkout cannot hold; the files stay on disk', {
+      repo: repo.name,
+      count: reported.length,
+      paths: reported.slice(0, 10),
+    });
+    try {
+      await this.deps.onUnportableUntracked?.(repo.name, reported);
+    } catch (err) {
+      log('error', 'auto-commit: recording the untracked paths failed', { repo: repo.name, error: String(err) });
+    }
+    return bad.length;
+  }
+
+  // An unportable file that an earlier merge brought in is untracked and left on disk. If the peer
+  // (an older version, during an upgrade) changes it again, `git merge` refuses outright -- the
+  // untracked file would be overwritten -- and every later merge from that peer fails with it,
+  // portable changes included. So right before a merge, each unportable path the incoming side
+  // writes (added, modified, renamed or copied since the merge base) that sits on disk untracked is
+  // moved into the git dir: local to this machine, never committed or synced, bytes kept. A file no
+  // incoming commit touches stays where it is.
+  private async setAsideObstructingUnportable(repo: RepoConfig, theirsTip: string): Promise<void> {
+    const mb = await this.git(repo.path, ['merge-base', 'HEAD', theirsTip]);
+    if (mb.code !== 0) return;
+    const changed = await this.git(repo.path, ['diff', '--name-only', '-z', '--no-renames', '--diff-filter=AMCT', mb.stdout.trim(), theirsTip]);
+    if (changed.code !== 0) return;
+    const bad = changed.stdout.split('\0').filter((p) => p && !isPortablePath(p));
+    if (bad.length === 0) return;
+    const tracked = await this.gitOk(repo.path, ['--literal-pathspecs', 'ls-files', '-z', '--', ...bad]);
+    const inIndex = new Set(tracked.stdout.split('\0').filter(Boolean));
+    const dirs = await resolveGitDirs(repo.path);
+    if (dirs === null) return;
+    const destDir = join(dirs.gitDir, 'sukarfleet-unportable', this.fsIso());
+    const moved: string[] = [];
+    for (const p of bad) {
+      if (inIndex.has(p)) continue;
+      const src = join(repo.path, p);
+      try {
+        // A symlink is moved as the link itself: an older peer can commit one, and it obstructs a
+        // merge exactly like a file does.
+        const st = await lstat(src);
+        if (!st.isFile() && !st.isSymbolicLink()) continue;
+      } catch {
+        continue;
+      }
+      try {
+        // The repository's own layout under the stamp directory, not one encoded name: each
+        // component already exists on this filesystem, so none can be too long for it.
+        const dest = join(destDir, p);
+        await mkdir(dirname(dest), { recursive: true });
+        await rename(src, dest);
+        moved.push(p);
+      } catch (err) {
+        log('error', 'merge: could not move an unportable file out of the way', { repo: repo.name, path: p, error: String(err) });
+      }
+    }
+    if (moved.length > 0) {
+      log('warn', 'merge: moved unportable files the incoming commit rewrites into the git dir', {
+        repo: repo.name,
+        dir: destDir,
+        paths: moved.slice(0, 10),
+      });
+    }
+  }
+
+  // `git add -A`, minus every path a Windows checkout cannot hold. The broad add that commitAll and a
+  // merge's resolution used to run re-staged files an earlier untrack had deliberately left on disk,
+  // so the untrack ran again, and logged and audited again, every cycle. Paths are named explicitly
+  // and literally, through the same dropVanished/dropIgnored filters autoCommit uses.
+  private async stagePortable(repo: RepoConfig): Promise<void> {
+    const st = await this.gitOk(repo.path, ['status', '--porcelain', '-z', '--untracked-files=all']);
+    const paths = parsePorcelainZ(st.stdout).filter(isPortablePath);
+    if (paths.length === 0) return;
+    const absent: string[] = [];
+    for (const p of paths) if ((await statSig(join(repo.path, p))) === 'MISSING') absent.push(p);
+    const addable = await this.dropIgnored(repo.path, await this.dropVanished(repo.path, paths, absent));
+    if (addable.length > 0) await this.gitOk(repo.path, ['--literal-pathspecs', 'add', '-A', '--', ...addable]);
+  }
+
+  // Every commit the daemon makes goes through here. A commit a hook refuses (a transcrypt pre-commit
+  // is the live case) is something a person has to look at, and not something retrying every two
+  // minutes will change, so it defers, with the hook's own words as the reason, instead of failing
+  // every cycle. Everything else stays an ordinary syncError, exactly as before.
+  //
+  // "A hook refused it" has to be established, not assumed from a hook being installed: an empty
+  // author name with a perfectly happy pre-commit hook is git's own failure and must stay visible.
+  // git reports its own failures through die(), exit 128; a refusing pre-commit or commit-msg hook
+  // makes `git commit` exit 1. Exit 1 also covers "nothing to commit" and an empty message, which
+  // git says in so many words, so those are excluded by name.
+  private async commitOrDefer(repo: RepoConfig, args: string[]): Promise<void> {
+    const r = await this.git(repo.path, ['commit', ...args]);
+    if (r.code === 0) return;
+    const why = r.stderr.trim() || r.stdout.trim();
+    const gitSaidWhy = /nothing (added )?to commit|empty commit message/i.test(`${r.stdout}\n${r.stderr}`);
+    if (r.code === 1 && !gitSaidWhy && (await this.hasCommitHooks(repo))) {
+      throw new SyncDeferred(`a commit hook refused the daemon's commit: ${firstVerdict(why)}`);
+    }
+    throw new Error(`git commit ${describeArgs(args)} failed (code ${r.code}): ${why}`);
+  }
+
+  private async hasCommitHooks(repo: RepoConfig): Promise<boolean> {
+    // --git-path hooks honours core.hooksPath.
+    const r = await this.git(repo.path, ['rev-parse', '--git-path', 'hooks']);
+    if (r.code !== 0) return false;
+    const rel = r.stdout.trim();
+    const dir = isAbsolute(rel) ? rel : join(repo.path, rel);
+    for (const hook of ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'pre-merge-commit']) {
+      try {
+        if ((await stat(join(dir, hook))).mode & 0o111) return true;
+      } catch {
+        // not installed
+      }
+    }
+    return false;
+  }
+
+  // The write-quiet debounce: the subset of `paths` whose (size, mtime) did not move across it,
+  // minus what `git add` would refuse (see dropIgnored and dropVanished).
+  private async stablePaths(repoPath: string, paths: string[]): Promise<string[]> {
     const before = new Map<string, string>();
     for (const p of paths) before.set(p, await statSig(join(repoPath, p)));
-    await this.sleep(this.debounceMs);
+    await this.pause(this.debounceMs);
 
     const stable: string[] = [];
     const absent: string[] = [];
@@ -488,7 +951,7 @@ export class Syncer {
       // it is the precondition for the unmatchable-pathspec case dropVanished handles.
       if (after === 'MISSING') absent.push(p);
     }
-    if (stable.length === 0) return false;
+    if (stable.length === 0) return [];
 
     // `git add -A -- <paths>` exits 1 if ANY explicitly-named path is ignored-and-untracked,
     // so a single gitignored file in the changed set aborted the whole repo's sync cycle.
@@ -497,14 +960,7 @@ export class Syncer {
     // rather than -f them: -f would commit exactly the secret the ignore rule exists to keep
     // out. Anything already staged for a dropped path stays in the index and is still
     // committed below, since the commit takes no pathspec.
-    const addable = await this.dropIgnored(repoPath, await this.dropVanished(repoPath, stable, absent));
-    if (addable.length > 0) {
-      await this.gitOk(repoPath, ['add', '-A', '--', ...addable]);
-    }
-    const staged = await this.git(repoPath, ['diff', '--cached', '--quiet']);
-    if (staged.code === 0) return false;
-    await this.gitOk(repoPath, ['commit', '-m', `sync: ${this.cfg.machine} ${this.isoNow()}`]);
-    return true;
+    return await this.dropIgnored(repoPath, await this.dropVanished(repoPath, stable, absent));
   }
 
   // (2) fetch origin + every fleet-<peer>, tolerating unreachable remotes.
@@ -597,99 +1053,162 @@ export class Syncer {
       candidates.sort((a, b) => b.ct - a.ct || codepointCompare(a.remote, b.remote));
       const bestRef = `refs/remotes/${candidates[0]!.remote}/sync/${peerName}`;
       const theirsTip = (await this.gitOk(repo.path, ['rev-parse', bestRef])).stdout.trim();
-      const oursTip = await this.head(repo.path);
-      if (oursTip === null) continue;
-
-      const anc = await this.git(repo.path, ['merge-base', '--is-ancestor', theirsTip, 'HEAD']);
-      if (anc.code === 0) continue; // already contained
-
-      const merge = await this.git(repo.path, ['merge', '--no-ff', '--no-edit', theirsTip]);
-      if (merge.code === 0) {
-        const newHead = await this.head(repo.path);
-        if (newHead !== oursTip) mergedAny = true;
-        continue;
-      }
-
-      const conflicted = await this.conflictedPaths(repo.path);
-      if (conflicted.length === 0) {
-        await this.git(repo.path, ['merge', '--abort']);
-        throw new Error(`merge of ${peerName} (${candidates[0]!.remote}) failed without conflicts: ${merge.stderr.trim()}`);
-      }
-
-      // Union paths are resolved by taking the merge and re-running the postMerge
-      // regenerator (must-keep #3) — never by newest-wins. That only produces a correct
-      // file if a regenerator is actually configured to reconcile it; commit nothing and
-      // fail loudly rather than silently leaving unreconciled merge content in place.
-      const hasUnionConflict = conflicted.some((p) => this.cfg.unionPaths.includes(p));
-      if (hasUnionConflict && (!repo.postMerge || repo.postMerge.length === 0)) {
-        await this.git(repo.path, ['merge', '--abort']);
-        throw new Error(
-          `sync cycle: union-path conflict with ${peerName} in ${repo.name} has no postMerge regenerator configured — refusing to commit unreconciled content`,
-        );
-      }
-
-      // Newest-wins resolution depends on this machine's clock; hold it until vetted.
-      const hasNewestWins = conflicted.some((p) => !this.cfg.unionPaths.includes(p));
-      if (hasNewestWins && !vetted) {
-        await this.git(repo.path, ['merge', '--abort']);
-        log('warn', 'conflict needs newest-wins but clock unvetted; deferring peer merge', {
-          repo: repo.name,
-          peer: peerName,
-        });
-        continue;
-      }
-
-      const fsIso = this.fsIso();
-      for (const path of conflicted) {
-        if (this.cfg.unionPaths.includes(path)) {
-          // Take the merge, not a side: git's failed `merge --no-ff` already left its own
-          // 3-way merge attempt in the worktree (conflict markers around the overlapping
-          // hunks, but BOTH sides' content present). Discarding that in favor of
-          // --theirs/--ours (the old behavior) silently drops whichever side lost — fatal
-          // for a grow-only union file with no other source of truth. Leave it as-is and
-          // let the postMerge regenerator (asserted present above) reconcile it. Only pick
-          // a single side when the path is genuinely absent from the tree (e.g. a
-          // delete/modify conflict), so a union path is never deleted outright.
-          const presentInTree = await pathExists(join(repo.path, path));
-          if (!presentInTree) {
-            const co = await this.git(repo.path, ['checkout', '--theirs', '--', path]);
-            if (co.code !== 0) await this.git(repo.path, ['checkout', '--ours', '--', path]);
-          }
-          await this.git(repo.path, ['add', '--', path]);
-          unionRegenNeeded = true;
-          continue;
-        }
-        // Newest-wins by last author timestamp touching the path; tie -> machine name ascending.
-        const oursAt = await this.lastAuthorAt(repo.path, oursTip, path);
-        const theirsAt = await this.lastAuthorAt(repo.path, theirsTip, path);
-        let winnerOurs: boolean;
-        if (oursAt > theirsAt) winnerOurs = true;
-        else if (theirsAt > oursAt) winnerOurs = false;
-        else winnerOurs = codepointCompare(this.cfg.machine, peerName) < 0;
-
-        const loserMachine = winnerOurs ? peerName : this.cfg.machine;
-        const losingTip = winnerOurs ? theirsTip : oursTip;
-        await this.git(repo.path, ['checkout', winnerOurs ? '--ours' : '--theirs', '--', path]);
-        await this.git(repo.path, ['add', '--', path]);
-
-        // Raw bytes, not util.run's UTF-8-decoding text() — the losing version may be
-        // binary; a lossy decode would corrupt the preserved conflict artifact (mirrors
-        // gitserve.ts's runGitBinary, which exists for the identical reason).
-        const show = await this.gitShowBytes(repo.path, `${losingTip}:${path}`);
-        if (show.code === 0) {
-          const rel = join('.sync-conflicts', `${fsIso}-${loserMachine}`, path);
-          await atomicWrite(join(repo.path, rel), show.stdout);
-          await this.git(repo.path, ['add', '--', rel]);
-          this.deps.onConflictArtifact(repo.name, rel);
-        }
-      }
-
-      await this.gitOk(repo.path, ['add', '-A']);
-      await this.gitOk(repo.path, ['commit', '--no-edit']);
-      mergedAny = true;
+      const r = await this.mergeTip(repo, {
+        theirsTip,
+        peer: peerName,
+        source: `${peerName} (${candidates[0]!.remote})`,
+        vetted,
+      });
+      if (r.outcome === 'merged') mergedAny = true;
+      if (r.unionRegenNeeded) unionRegenNeeded = true;
     }
 
     return { mergedAny, unionRegenNeeded };
+  }
+
+  // Merge one tip into sync/<machine> under the conflict rules. Shared by mergePeers (a peer's
+  // sync branch) and reconcileOwnBranch (origin's copy of our own), so the two can never drift:
+  // union paths take the merge and leave reconciliation to the postMerge regenerator, every other
+  // path is newest-wins by author time -- held while the clock is unvetted -- with the loser kept
+  // under .sync-conflicts/. `peer` names the other side for the tie-break (codepoint order against
+  // this machine's name) and the conflict-artifact directory; `source` is for error messages.
+  //
+  // 'contained': nothing to do, or the merge left HEAD where it was. 'deferred': not merged this
+  // cycle, the repo untouched. A merge that would commit unreconciled content throws, after aborting.
+  private async mergeTip(
+    repo: RepoConfig,
+    m: { theirsTip: string; peer: string; source: string; vetted: boolean },
+  ): Promise<MergeTipResult> {
+    const { theirsTip, peer: peerName } = m;
+    let unionRegenNeeded = false;
+    const oursTip = await this.head(repo.path);
+    if (oursTip === null) return { outcome: 'deferred', unionRegenNeeded, conflicts: 0 };
+
+    const anc = await this.git(repo.path, ['merge-base', '--is-ancestor', theirsTip, 'HEAD']);
+    if (anc.code === 0) return { outcome: 'contained', unionRegenNeeded, conflicts: 0 };
+
+    // Ownership marker for settleStrandedMerge, written before the merge starts and removed only
+    // once MERGE_HEAD is gone again -- so a process that dies in between leaves both behind, and the
+    // next cycle knows the half-done merge is its own to abort.
+    const dirs = await resolveGitDirs(repo.path);
+    const marker = dirs === null ? null : join(dirs.gitDir, MERGE_MARKER);
+    if (marker !== null) await writeFile(marker, `${theirsTip}\n`);
+    try {
+      return await this.mergeAndResolve(repo, m, oursTip);
+    } finally {
+      if (marker !== null && dirs !== null && !(await pathExists(join(dirs.gitDir, 'MERGE_HEAD')))) {
+        await rm(marker, { force: true }).catch(() => {});
+      }
+    }
+  }
+
+  private async mergeAndResolve(
+    repo: RepoConfig,
+    m: { theirsTip: string; peer: string; source: string; vetted: boolean },
+    oursTip: string,
+  ): Promise<MergeTipResult> {
+    const { theirsTip, peer: peerName } = m;
+    let unionRegenNeeded = false;
+    await this.setAsideObstructingUnportable(repo, theirsTip);
+    // A plain `git merge`, so hooks run exactly as they always have: pre-merge-commit and
+    // commit-msg, then post-merge -- not pre-commit, which a `--no-commit` + `commit` pair would run
+    // instead. A peer on an older version may have committed a path Windows cannot hold; the merge
+    // records the peer's tree as it is, and a follow-up commit in the same step takes the path out
+    // again, so the tip this cycle pushes is portable either way.
+    const merge = await this.git(repo.path, ['merge', '--no-ff', '--no-edit', theirsTip]);
+    if (merge.code === 0) {
+      if ((await this.untrackUnportable(repo)) > 0) {
+        const staged = await this.git(repo.path, ['diff', '--cached', '--quiet']);
+        if (staged.code !== 0) await this.commitOrDefer(repo, ['-m', `sync: ${this.cfg.machine} ${this.isoNow()}`]);
+      }
+      const newHead = await this.head(repo.path);
+      return { outcome: newHead !== oursTip ? 'merged' : 'contained', unionRegenNeeded, conflicts: 0 };
+    }
+    if (/Not committing merge/.test(merge.stderr)) {
+      // A pre-merge-commit or commit-msg hook said no. The merge is ours and still open: close it,
+      // and wait for a person rather than retry into the same refusal every cycle.
+      await this.gitRecover(repo.path, ['merge', '--abort']);
+      throw new SyncDeferred(`a merge hook refused the merge of ${m.source}: ${firstVerdict(merge.stderr)}`);
+    }
+
+    const conflicted = await this.conflictedPaths(repo.path);
+    if (conflicted.length === 0) {
+      await this.gitRecover(repo.path, ['merge', '--abort']);
+      throw new Error(`merge of ${m.source} failed without conflicts: ${merge.stderr.trim()}`);
+    }
+
+    // Union paths are resolved by taking the merge and re-running the postMerge
+    // regenerator (must-keep #3) — never by newest-wins. That only produces a correct
+    // file if a regenerator is actually configured to reconcile it; commit nothing and
+    // fail loudly rather than silently leaving unreconciled merge content in place.
+    const hasUnionConflict = conflicted.some((p) => this.cfg.unionPaths.includes(p));
+    if (hasUnionConflict && (!repo.postMerge || repo.postMerge.length === 0)) {
+      await this.gitRecover(repo.path, ['merge', '--abort']);
+      throw new Error(
+        `sync cycle: union-path conflict with ${peerName} in ${repo.name} has no postMerge regenerator configured — refusing to commit unreconciled content`,
+      );
+    }
+
+    // Newest-wins resolution depends on this machine's clock; hold it until vetted.
+    const hasNewestWins = conflicted.some((p) => !this.cfg.unionPaths.includes(p));
+    if (hasNewestWins && !m.vetted) {
+      await this.gitRecover(repo.path, ['merge', '--abort']);
+      log('warn', 'conflict needs newest-wins but clock unvetted; deferring peer merge', {
+        repo: repo.name,
+        peer: peerName,
+      });
+      return { outcome: 'deferred', unionRegenNeeded, conflicts: 0 };
+    }
+
+    const fsIso = this.fsIso();
+    for (const path of conflicted) {
+      if (this.cfg.unionPaths.includes(path)) {
+        // Take the merge, not a side: git's failed `merge --no-ff` already left its own
+        // 3-way merge attempt in the worktree (conflict markers around the overlapping
+        // hunks, but BOTH sides' content present). Discarding that in favor of
+        // --theirs/--ours (the old behavior) silently drops whichever side lost — fatal
+        // for a grow-only union file with no other source of truth. Leave it as-is and
+        // let the postMerge regenerator (asserted present above) reconcile it. Only pick
+        // a single side when the path is genuinely absent from the tree (e.g. a
+        // delete/modify conflict), so a union path is never deleted outright.
+        const presentInTree = await pathExists(join(repo.path, path));
+        if (!presentInTree) {
+          const co = await this.git(repo.path, ['checkout', '--theirs', '--', path]);
+          if (co.code !== 0) await this.git(repo.path, ['checkout', '--ours', '--', path]);
+        }
+        await this.git(repo.path, ['add', '--', path]);
+        unionRegenNeeded = true;
+        continue;
+      }
+      // Newest-wins by last author timestamp touching the path; tie -> machine name ascending.
+      const oursAt = await this.lastAuthorAt(repo.path, oursTip, path);
+      const theirsAt = await this.lastAuthorAt(repo.path, theirsTip, path);
+      let winnerOurs: boolean;
+      if (oursAt > theirsAt) winnerOurs = true;
+      else if (theirsAt > oursAt) winnerOurs = false;
+      else winnerOurs = codepointCompare(this.cfg.machine, peerName) < 0;
+
+      const loserMachine = winnerOurs ? peerName : this.cfg.machine;
+      const losingTip = winnerOurs ? theirsTip : oursTip;
+      await this.git(repo.path, ['checkout', winnerOurs ? '--ours' : '--theirs', '--', path]);
+      await this.git(repo.path, ['add', '--', path]);
+
+      // Raw bytes, not util.run's UTF-8-decoding text() — the losing version may be
+      // binary; a lossy decode would corrupt the preserved conflict artifact (mirrors
+      // gitserve.ts's runGitBinary, which exists for the identical reason).
+      const show = await this.gitShowBytes(repo.path, `${losingTip}:${path}`);
+      if (show.code === 0) {
+        const rel = join('.sync-conflicts', `${fsIso}-${loserMachine}`, path);
+        await atomicWrite(join(repo.path, rel), show.stdout);
+        await this.git(repo.path, ['add', '--', rel]);
+        this.deps.onConflictArtifact(repo.name, rel);
+      }
+    }
+
+    await this.stagePortable(repo);
+    await this.untrackUnportable(repo);
+    await this.commitOrDefer(repo, ['--no-edit']);
+    return { outcome: 'merged', unionRegenNeeded, conflicts: conflicted.length };
   }
 
   // (4) postMerge regenerators (union authority), then commit any regenerated changes.
@@ -711,11 +1230,13 @@ export class Syncer {
         throw new Error(`postMerge [${argv.join(' ')}] failed (code ${r.code}): ${r.stderr.trim().slice(0, 300)}`);
       }
     }
-    await this.commitAll(repo.path, `postmerge: ${this.cfg.machine} ${this.isoNow()}`);
+    await this.commitAll(repo, `postmerge: ${this.cfg.machine} ${this.isoNow()}`);
   }
 
   // (5) push sync/<machine> to origin with retries+backoff; skip cleanly when origin is absent.
-  private async pushOrigin(repo: RepoConfig): Promise<void> {
+  // A non-fast-forward rejection is not retried as-is (waiting cannot change the answer): it gets
+  // one reconcileOwnBranch per cycle, and an immediate retry if that merged origin's copy in.
+  private async pushOrigin(repo: RepoConfig, vetted: boolean): Promise<void> {
     if (repo.peerOnly) {
       this.deps.onGithubPushNotApplicable?.(repo.name);
       return;
@@ -731,8 +1252,14 @@ export class Syncer {
     }
     const branch = `sync/${this.cfg.machine}`;
     const attempts = this.pushBackoffMs.length + 1;
+    let reconciled = false;
+    let retryNow = false;
     for (let i = 0; i < attempts; i++) {
-      if (i > 0) await this.sleep(this.pushBackoffMs[i - 1]!);
+      if (i > 0 && !retryNow) {
+        if (this.stopping) break;
+        await this.pause(this.pushBackoffMs[i - 1]!);
+      }
+      retryNow = false;
       const startedMs = this.now();
       const r = await this.git(repo.path, ['push', 'origin', branch]);
       const durationMs = this.now() - startedMs;
@@ -740,6 +1267,20 @@ export class Syncer {
         this.pushGate.observe(`push:${repo.name}`, false);
         this.deps.onGithubPush(repo.name, this.now());
         return;
+      }
+      if (!reconciled && isNonFastForwardRejection(r.stderr)) {
+        reconciled = true;
+        if (await this.reconcileOwnBranch(repo, vetted)) {
+          // Retry straight away and without spending an attempt: this is a new push, not a repeat
+          // of the rejected one.
+          retryNow = true;
+          i--;
+          continue;
+        }
+        log('info', 'push to origin rejected as non-fast-forward; merging origin is deferred to the next cycle', {
+          repo: repo.name,
+        });
+        break;
       }
       const isFinal = i === attempts - 1;
       const detail = { repo: repo.name, attempt: i + 1, code: r.code, stderr: r.stderr.trim().slice(0, 300) };
@@ -768,20 +1309,88 @@ export class Syncer {
     this.deps.onGithubPush(repo.name, null);
   }
 
+  // origin rejected sync/<machine> as non-fast-forward: origin holds commits on this machine's own
+  // branch that the local branch does not. This machine is the branch's only writer, so those are
+  // its own commits that the local repo lost -- seen live after a crash, where origin kept a merge
+  // commit the re-converged local branch no longer had, and every push for five days was rejected
+  // until a human merged origin's copy back by hand. That merge is the repair, done here.
+  //
+  // Merged, never forced and never rebased: a force-push would destroy whatever origin holds that
+  // nowhere else does, and a rebase would rewrite commits peers have already merged. The merge goes
+  // through mergeTip, so it is held to exactly the peer-merge rules -- union paths through the
+  // postMerge regenerator, newest-wins only on a vetted clock, the loser preserved. Origin's copy is
+  // labelled `<machine>-origin` for the conflict-artifact directory, and on a tied author time the
+  // local side wins (its name sorts first). Anything mergeTip will not do safely leaves the repo as
+  // it was and returns false, and the next cycle tries again; that is not a fault.
+  //
+  // Returns whether the push is worth retrying now.
+  private async reconcileOwnBranch(repo: RepoConfig, vetted: boolean): Promise<boolean> {
+    const branch = `sync/${this.cfg.machine}`;
+    const trackingRef = `refs/remotes/origin/${branch}`;
+    const fetched = await this.git(repo.path, ['fetch', 'origin', `+refs/heads/${branch}:${trackingRef}`], this.fetchTimeoutMs);
+    if (fetched.code !== 0) {
+      log('info', 'own-branch merge: could not fetch origin\'s copy; will retry next cycle', {
+        repo: repo.name,
+        stderr: fetched.stderr.trim().slice(0, 300),
+      });
+      return false;
+    }
+    const originTipR = await this.git(repo.path, ['rev-parse', '--verify', '--quiet', `${trackingRef}^{commit}`]);
+    const localTipBefore = await this.head(repo.path);
+    if (originTipR.code !== 0 || localTipBefore === null) return false;
+    const originTip = originTipR.stdout.trim();
+
+    let r: MergeTipResult;
+    try {
+      r = await this.mergeTip(repo, {
+        theirsTip: originTip,
+        peer: `${this.cfg.machine}-origin`,
+        source: `origin's ${branch}`,
+        vetted,
+      });
+    } catch (err) {
+      // mergeTip aborts before it throws; this is belt and braces for a throw from a git step.
+      await this.abortOwnMerge(repo).catch(() => {});
+      log('info', 'own-branch merge: not safe to merge origin\'s copy this cycle', {
+        repo: repo.name,
+        error: boundErrorText(err instanceof Error ? err.message : String(err)),
+      });
+      return false;
+    }
+    if (r.outcome === 'deferred') return false;
+    // Already contained: origin moved between our push and this fetch, or rejected for a reason the
+    // fetch has since resolved. One more push answers which.
+    if (r.outcome === 'contained') return true;
+
+    // The same regenerators a peer merge would run; a failure here is the same fault it would be.
+    await this.runPostMerge(repo, true, r.unionRegenNeeded);
+    const localTipAfter = (await this.head(repo.path)) ?? localTipBefore;
+    const detail: OwnBranchMerge = { branch, originTip, localTipBefore, localTipAfter, conflicts: r.conflicts };
+    log('warn', 'own-branch merge: merged origin\'s copy of the sync branch back in', { repo: repo.name, ...detail });
+    try {
+      await this.deps.onOwnBranchMerged?.(repo.name, detail);
+    } catch (err) {
+      log('error', 'own-branch merge: recording the repair failed', { repo: repo.name, error: String(err) });
+    }
+    return true;
+  }
+
   private remoteNames(): string[] {
     return ['origin', ...this.cfg.peers.filter((p) => p.name !== this.cfg.machine).map((p) => `fleet-${p.name}`)];
   }
 
-  private async commitAll(repoPath: string, msg: string): Promise<boolean> {
-    await this.gitOk(repoPath, ['add', '-A']);
-    const staged = await this.git(repoPath, ['diff', '--cached', '--quiet']);
+  private async commitAll(repo: RepoConfig, msg: string): Promise<boolean> {
+    await this.stagePortable(repo);
+    await this.untrackUnportable(repo);
+    const staged = await this.git(repo.path, ['diff', '--cached', '--quiet']);
     if (staged.code === 0) return false;
-    await this.gitOk(repoPath, ['commit', '-m', msg]);
+    await this.commitOrDefer(repo, ['-m', msg]);
     return true;
   }
 
   private async conflictedPaths(repoPath: string): Promise<string[]> {
     const r = await this.git(repoPath, ['diff', '--name-only', '--diff-filter=U', '-z']);
+    if (r.code !== 0) throw new Error(`could not list conflicted paths (code ${r.code}): ${r.stderr.trim()}`);
     return r.stdout.split('\0').filter(Boolean);
   }
 
@@ -796,10 +1405,22 @@ export class Syncer {
     return r.code === 0 ? r.stdout.trim() : null;
   }
 
-  private async git(cwd: string, args: string[], timeoutMs?: number) {
-    const r = await this.gitRunner(['git', ...args], { cwd, timeoutMs: timeoutMs ?? this.gitTimeoutMs });
+  private async git(cwd: string, args: string[], timeoutMs?: number, evenWhileDraining = false) {
+    const r = await this.gitRunner(['git', ...args], {
+      cwd,
+      timeoutMs: timeoutMs ?? this.gitTimeoutMs,
+      afterKill: ({ startedAtMs }) => this.reapKilledChildLocks(cwd, startedAtMs),
+      ...(evenWhileDraining ? { evenWhileDraining: true } : {}),
+    });
     this.deps.onStep?.();
     return r;
+  }
+
+  // A git step that puts the repo BACK into a consistent state (`merge --abort`). It runs even
+  // after a shutdown's drain has started refusing new children: refusing it is what used to strand
+  // MERGE_HEAD and conflict markers for the next boot to commit.
+  private async gitRecover(cwd: string, args: string[]) {
+    return await this.git(cwd, args, undefined, true);
   }
 
   // util.runBytes keeps stdout as raw bytes instead of decoding UTF-8 text — required for
@@ -816,7 +1437,7 @@ export class Syncer {
   private async gitOk(cwd: string, args: string[], timeoutMs?: number) {
     const r = await this.git(cwd, args, timeoutMs);
     if (r.code !== 0) {
-      throw new Error(`git ${args.join(' ')} failed (code ${r.code}): ${r.stderr.trim() || r.stdout.trim()}`);
+      throw new Error(`git ${describeArgs(args)} failed (code ${r.code}): ${r.stderr.trim() || r.stdout.trim()}`);
     }
     return r;
   }
@@ -915,6 +1536,99 @@ export function isCorruptIndexError(message: string): boolean {
 
 type RepairableDamage = 'index' | 'empty-objects';
 
+// Written into the git dir by mergeTip for the length of a merge; see settleStrandedMerge.
+const MERGE_MARKER = 'sukarfleet-merge';
+
+// A cycle that stopped because something somebody else is in the middle of has to finish first.
+// Not a fault: runCycle reports it as a deferral (see its catch).
+class SyncDeferred extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+  }
+}
+
+// git's own one-line verdict out of a complaint: the first `fatal:` or `error:` line, else the first
+// line, kept short enough for a status note.
+function firstVerdict(text: string): string {
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+  const v = lines.find((l) => /^(fatal|error):/i.test(l)) ?? lines[0] ?? 'no reason given';
+  return v.length <= 300 ? v : `${v.slice(0, 300)}…`;
+}
+
+// The lock git named, for the deferral note. Falls back to a generic phrase.
+function lockBusyReason(message: string): string {
+  const m = /'([^'\n]*\.lock)'/.exec(message);
+  return m ? `waiting for another git to release ${m[1]}` : 'waiting for another git to release a lock';
+}
+
+// Characters, names and endings a Windows filesystem refuses in a path component. git for Windows
+// enforces the same list (core.protectNTFS), which is how an unportable name from a Linux machine
+// turns into "invalid path ... Merge with strategy ort failed" on the Windows peer.
+const WINDOWS_BAD_CHARS = /[<>:"|?*\\\x00-\x1f]/;
+const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9]|conin\$|conout\$) *(?:\..*)?$/i;
+
+// Can every machine in a mixed fleet check this repo-relative path out? Applied on every platform:
+// what matters is where the commit goes, not where it was made.
+export function isPortablePath(path: string): boolean {
+  for (const c of path.split('/')) {
+    if (c.length === 0) continue;
+    if (WINDOWS_BAD_CHARS.test(c)) return false;
+    if (c.endsWith('.') || c.endsWith(' ')) return false;
+    if (WINDOWS_RESERVED_NAME.test(c)) return false;
+  }
+  return true;
+}
+
+// git's words when a lock it needs already exists: `Unable to create '.../index.lock': File exists`,
+// `cannot lock ref 'refs/heads/x': Unable to create '.../x.lock': File exists`, `could not lock
+// config file .git/config: File exists`. Every one of them is "somebody else holds this", which a
+// later cycle resolves by itself -- or reapStaleLocks does, once the holder is provably gone.
+export function isGitLockBusyError(message: string): boolean {
+  return /\block\b[^\n]*file exists|\.lock'?[^\n]*file exists/i.test(message);
+}
+
+// git push's verdict when the remote branch holds commits the local one does not. Not translated by
+// git, unlike the hint text around it.
+export function isNonFastForwardRejection(stderr: string): boolean {
+  return /\[rejected\][^\n]*\((?:non-fast-forward|fetch first)\)/.test(stderr);
+}
+
+// The ceiling on any sync error this daemon reports. It travels further than a log line: /status,
+// the health fault message, the desktop notification, every peer's gossip and every MCP answer
+// built from those.
+export const SYNC_ERROR_MAX_CHARS = 2000;
+const ERROR_HEAD_CHARS = 400;
+const ERROR_LINE_CHARS = 400;
+
+// Fit an error into SYNC_ERROR_MAX_CHARS without losing the part that says what went wrong. Short
+// text passes through untouched. Long text keeps its opening (which step failed) and then every
+// line git marks `fatal:` or `error:` (why), wherever in the text it sits; what goes is the bulk in
+// between -- in practice a `git add -A -- <path> <path> ...` argv, which once made a single sync
+// error 226,000 characters long.
+export function boundErrorText(text: string, max: number = SYNC_ERROR_MAX_CHARS): string {
+  if (text.length <= max) return text;
+  const clip = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, n)}…`);
+  let out = `${clip(text, ERROR_HEAD_CHARS)} [${text.length} chars, shortened]`;
+  const verdicts = new Set((text.match(/\b(?:fatal|error): [^\n]*/gi) ?? []).map((v) => clip(v.trim(), ERROR_LINE_CHARS)));
+  for (const v of verdicts) {
+    if (out.length + 1 + v.length > max) break;
+    out += `\n${v}`;
+  }
+  return out.length <= max ? out : out.slice(0, max);
+}
+
+// argv for an error message. Short argv verbatim; a long one keeps its options and names how many
+// pathspecs followed `--` instead of listing them (that list is what made incident errors enormous).
+function describeArgs(args: readonly string[]): string {
+  const joined = args.join(' ');
+  if (joined.length <= 200) return joined;
+  const dashes = args.indexOf('--');
+  if (dashes >= 0 && dashes < 12) {
+    return `${args.slice(0, dashes + 1).join(' ')} <${args.length - dashes - 1} paths>`;
+  }
+  return `${args.slice(0, 8).join(' ')} … (${args.length} args)`;
+}
+
 // git's words for a zero-byte loose object: `error: object file .git/objects/f7/bbed... is empty`.
 // Deliberately NOT `bad object` or `missing object` on their own: those also describe a ref that
 // names something never fetched, which a refetch-everything repair has no business treating as
@@ -963,13 +1677,30 @@ async function pathExists(p: string): Promise<boolean> {
   }
 }
 
+// lstat, not stat: these are directory entries, and git commits a symlink as the link itself. A stat
+// followed the link, so a symlink pointing at something that does not exist (yet) read as MISSING,
+// dropVanished then dropped it as vanished, and it was never committed -- while the cycle reported
+// success with `?? the-link` still sitting in the tree.
 async function statSig(abs: string): Promise<string> {
   try {
-    const s = await stat(abs);
+    const s = await lstat(abs);
     return `${s.size}:${s.mtimeMs}`;
   } catch {
     return 'MISSING';
   }
+}
+
+// Does `git status --porcelain -z` report any unmerged entry (DD, AU, UD, UA, DU, AA, UU)?
+function hasUnmergedZ(out: string): boolean {
+  const fields = out.split('\0');
+  for (let i = 0; i < fields.length; i++) {
+    const e = fields[i]!;
+    if (e.length < 3) continue;
+    const xy = e.slice(0, 2);
+    if (xy.includes('U') || xy === 'AA' || xy === 'DD') return true;
+    if (e[0] === 'R' || e[0] === 'C') i++;
+  }
+  return false;
 }
 
 // Parse `git status --porcelain -z` into the set of worktree paths (both ends of renames).
