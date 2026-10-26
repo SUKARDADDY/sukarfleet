@@ -10,8 +10,8 @@
 set -eu
 # -P: the physical directory. Cargo and Tauri embed the real path, so a symlink from a neutral
 # place to a checkout under $HOME must not get past the check below.
-here=$(CDPATH= cd -P -- "$(dirname -- "$0")/../src-tauri" && pwd -P)
-home=$(CDPATH= cd -P -- "$HOME" 2>/dev/null && pwd -P || printf '%s' "$HOME")
+here=$(CDPATH='' cd -P -- "$(dirname -- "$0")/../src-tauri" && pwd -P)
+home=$(CDPATH='' cd -P -- "$HOME" 2>/dev/null && pwd -P || printf '%s' "$HOME")
 # RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS outrank every config file and every --config value, so
 # either one, however harmless it looks, would silently drop the remap below. Set counts, not
 # just non-empty: cargo takes an empty value as an override too.
@@ -28,7 +28,12 @@ case "$here/" in
 esac
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
 triple=$(rustc -vV | sed -n 's/^host: //p')
+# A TOML basic string: backslash and double quote escaped, so any path, apostrophes included,
+# arrives as itself.
+toml_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+remap_home=$(toml_str "--remap-path-prefix=$cargo_home=/cargo")
+remap_here=$(toml_str "--remap-path-prefix=$here=/build")
 cd "$here"
 exec cargo build --release --locked \
-  --config "target.$triple.rustflags=['--remap-path-prefix=$cargo_home=/cargo', '--remap-path-prefix=$here=/build']" \
+  --config "target.$triple.rustflags=[$remap_home, $remap_here]" \
   "$@"
