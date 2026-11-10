@@ -7,7 +7,8 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, sukarfleet]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -23,7 +24,8 @@ jobs:
   # name or a mesh address fails a check called "guard" instead of one line in
   # the middle of the full test output.
   guard:
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, sukarfleet]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -33,7 +35,8 @@ jobs:
       - run: bun test tests/no-personal-data.test.ts
 
   shellcheck:
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, sukarfleet]
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
@@ -62,7 +65,8 @@ jobs:
   # runner. This job is what catches a broken script on a pull request that
   # touches nothing else the Windows workflow watches.
   pwsh-parse:
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, sukarfleet]
     steps:
       - uses: actions/checkout@v4
       - name: parse install/windows/*.ps1
