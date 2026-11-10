@@ -21,6 +21,7 @@ name: installer-windows
 
 on:
   push:
+    branches: [main, 'release/**']
     paths:
       - 'install/windows/**'
       - 'install/easytier-pins.txt'
@@ -46,7 +47,8 @@ concurrency:
 
 jobs:
   windows:
-    runs-on: windows-2022
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Windows, X64, laptop-win]
     # A hung installer is the failure this job exists to find; it must not cost
     # the six hours a job gets by default.
     timeout-minutes: 75
