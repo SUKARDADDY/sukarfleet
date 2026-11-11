@@ -15,6 +15,7 @@ name: tray
 
 on:
   push:
+    branches: [main, 'release/**']
     paths:
       - 'clients/tray/**'
       - '.github/workflows/tray.yml'
@@ -26,9 +27,40 @@ on:
 
 jobs:
   windows:
-    runs-on: windows-2022
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Windows, X64, laptop-win]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      # The VM mounts a per-repo cache volume labeled ci-cache as D:. The Rust target folder and
+      # cargo's registry and git caches become junctions into it, so every path the later steps
+      # use stays the same. Only CARGO_HOME's registry and git folders move: its bin folder holds
+      # the rustup proxies on PATH. With no such volume the step does nothing and the build is cold.
+      - name: local Rust build cache
+        shell: pwsh
+        run: |
+          $vol = Get-Volume -DriveLetter D -ErrorAction SilentlyContinue
+          if ($vol -and $vol.FileSystemLabel -eq 'ci-cache') {
+            function Use-Junction([string]$Link, [string]$Target) {
+              New-Item -ItemType Directory -Force -Path $Target | Out-Null
+              New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Link) | Out-Null
+              $item = Get-Item -LiteralPath $Link -Force -ErrorAction SilentlyContinue
+              if ($item) {
+                # Deleting a junction removes the link only. A real folder is removed with its contents.
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $item.Delete() }
+                else { Remove-Item -LiteralPath $Link -Recurse -Force }
+              }
+              New-Item -ItemType Junction -Path $Link -Target $Target | Out-Null
+              "$Link -> $Target"
+            }
+            $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+            Use-Junction (Join-Path $PWD 'clients/tray/src-tauri/target') 'D:\sukarfleet\tray-target'
+            Use-Junction (Join-Path $cargoHome 'registry') 'D:\cargo\registry'
+            Use-Junction (Join-Path $cargoHome 'git') 'D:\cargo\git'
+          } else {
+            'No ci-cache volume on D:, so the Rust build starts cold.'
+          }
 
       # The runner image ships a rustup stable toolchain, so nothing installs a
       # toolchain here. Printed because a binary is only as reproducible as the

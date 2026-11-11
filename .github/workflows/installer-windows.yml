@@ -21,6 +21,7 @@ name: installer-windows
 
 on:
   push:
+    branches: [main, 'release/**']
     paths:
       - 'install/windows/**'
       - 'install/easytier-pins.txt'
@@ -46,7 +47,8 @@ concurrency:
 
 jobs:
   windows:
-    runs-on: windows-2022
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Windows, X64, laptop-win]
     # A hung installer is the failure this job exists to find; it must not cost
     # the six hours a job gets by default.
     timeout-minutes: 75
@@ -248,6 +250,12 @@ jobs:
       - name: smoke - per-user silent install
         shell: pwsh
         run: |
+          # This pwsh puts its own module folders first in PSModulePath, and a
+          # process started from here inherits them. The installer's Windows
+          # PowerShell stages would then load pwsh 7.7's Archive module, which
+          # needs .NET 8, and Expand-Archive fails. Hand them Windows
+          # PowerShell's own path, as when someone double-clicks the installer.
+          $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
           $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
           $log = Join-Path $env:RUNNER_TEMP 'setup-currentuser.log'
           $scriptLogs = @((Join-Path $env:LOCALAPPDATA 'sukarfleet\install-user.log'))
@@ -337,6 +345,12 @@ jobs:
       - name: smoke - uninstall the per-user install
         shell: pwsh
         run: |
+          # This pwsh puts its own module folders first in PSModulePath, and a
+          # process started from here inherits them. The installer's Windows
+          # PowerShell stages would then load pwsh 7.7's Archive module, which
+          # needs .NET 8, and Expand-Archive fails. Hand them Windows
+          # PowerShell's own path, as when someone double-clicks the installer.
+          $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
           $roots = @(
             'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
@@ -404,6 +418,12 @@ jobs:
       - name: smoke - machine-wide silent install
         shell: pwsh
         run: |
+          # This pwsh puts its own module folders first in PSModulePath, and a
+          # process started from here inherits them. The installer's Windows
+          # PowerShell stages would then load pwsh 7.7's Archive module, which
+          # needs .NET 8, and Expand-Archive fails. Hand them Windows
+          # PowerShell's own path, as when someone double-clicks the installer.
+          $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
           $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
           $log = Join-Path $env:RUNNER_TEMP 'setup-allusers.log'
           $scriptLogs = @((Join-Path $env:ProgramData 'sukarfleet\install-machine.log'), (Join-Path $env:ProgramData 'sukarfleet\node\logs\install.log'))
@@ -574,6 +594,12 @@ jobs:
       - name: smoke - uninstall the machine-wide install
         shell: pwsh
         run: |
+          # This pwsh puts its own module folders first in PSModulePath, and a
+          # process started from here inherits them. The installer's Windows
+          # PowerShell stages would then load pwsh 7.7's Archive module, which
+          # needs .NET 8, and Expand-Archive fails. Hand them Windows
+          # PowerShell's own path, as when someone double-clicks the installer.
+          $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
           $roots = @(
             'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
@@ -722,6 +748,12 @@ jobs:
       - name: smoke - a refused machine-wide install exits 7 and installs nothing
         shell: pwsh
         run: |
+          # This pwsh puts its own module folders first in PSModulePath, and a
+          # process started from here inherits them. The installer's Windows
+          # PowerShell stages would then load pwsh 7.7's Archive module, which
+          # needs .NET 8, and Expand-Archive fails. Hand them Windows
+          # PowerShell's own path, as when someone double-clicks the installer.
+          $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
           $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
           $log = Join-Path $env:RUNNER_TEMP 'setup-refused.log'
           $scriptLog = Join-Path $env:ProgramData 'sukarfleet\install-machine.log'
@@ -844,6 +876,12 @@ jobs:
       - name: smoke - a machine name full of shell syntax is refused as data
         shell: pwsh
         run: |
+          # This pwsh puts its own module folders first in PSModulePath, and a
+          # process started from here inherits them. The installer's Windows
+          # PowerShell stages would then load pwsh 7.7's Archive module, which
+          # needs .NET 8, and Expand-Archive fails. Hand them Windows
+          # PowerShell's own path, as when someone double-clicks the installer.
+          $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
           $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
           $log = Join-Path $env:RUNNER_TEMP 'setup-hostile.log'
           $nodeDir = Join-Path $env:ProgramData 'sukarfleet\node'
@@ -904,6 +942,12 @@ jobs:
       - name: smoke - a machine-wide install adopts a per-user node
         shell: pwsh
         run: |
+          # This pwsh puts its own module folders first in PSModulePath, and a
+          # process started from here inherits them. The installer's Windows
+          # PowerShell stages would then load pwsh 7.7's Archive module, which
+          # needs .NET 8, and Expand-Archive fails. Hand them Windows
+          # PowerShell's own path, as when someone double-clicks the installer.
+          $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
           $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
           $userLog = Join-Path $env:RUNNER_TEMP 'setup-adopt-user.log'
           $machineLog = Join-Path $env:RUNNER_TEMP 'setup-adopt-machine.log'
