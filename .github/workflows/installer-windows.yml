@@ -253,6 +253,11 @@ jobs:
           $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
           $log = Join-Path $env:RUNNER_TEMP 'setup-currentuser.log'
           $scriptLogs = @((Join-Path $env:LOCALAPPDATA 'sukarfleet\install-user.log'))
+          # Start-Process hands this pwsh's module path to the installer's
+          # Windows PowerShell stages. From pwsh 7.7 that path brings in an
+          # Archive module that needs .NET 8, so Bun's installer cannot unzip.
+          # Someone who double-clicks the installer never has that path.
+          $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
           $p = Start-Process -FilePath $exe -PassThru -ArgumentList @(
             '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER',
             '/MACHINE=ci-runner', '/SKIPMESH', '/SKIPTRAY', '/NOOPEN',
@@ -409,6 +414,11 @@ jobs:
           $exe = Join-Path $PWD 'dist\sukarfleet-setup-windows-x86_64.exe'
           $log = Join-Path $env:RUNNER_TEMP 'setup-allusers.log'
           $scriptLogs = @((Join-Path $env:ProgramData 'sukarfleet\install-machine.log'), (Join-Path $env:ProgramData 'sukarfleet\node\logs\install.log'))
+          # Start-Process hands this pwsh's module path to the installer's
+          # Windows PowerShell stages. From pwsh 7.7 that path brings in an
+          # Archive module that needs .NET 8, so Bun's installer cannot unzip.
+          # Someone who double-clicks the installer never has that path.
+          $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
           $p = Start-Process -FilePath $exe -PassThru -ArgumentList @(
             '/VERYSILENT', '/SUPPRESSMSGBOXES', '/ALLUSERS',
             '/MACHINE=ci-runner', '/SKIPMESH', '/SKIPTRAY', '/NOOPEN',
