@@ -19,16 +19,16 @@
 # that fills the SHA256 this job prints into install/easytier-pins.txt.
 name: installer-windows
 
+# Where this runs, and why so rarely. The smoke installs a machine-wide service and changes the
+# machine it runs on, so it needs a Windows machine that is thrown away after each run. Our only
+# Windows runner pool is a long-lived host that other jobs share, which must not be changed like
+# that. Until a throwaway Windows machine exists, this job asks for its own label,
+# `windows-installer-vm`, which no runner carries yet: a run waits in the queue instead of landing
+# on a shared host. It starts only when someone runs it by hand or a release branch is pushed. Pull
+# requests and pushes to main do not start it, so they never leave a queued run behind.
 on:
   push:
-    branches: [main, 'release/**']
-    paths:
-      - 'install/windows/**'
-      - 'install/easytier-pins.txt'
-      - 'src/**'
-      - 'ui/**'
-      - '.github/workflows/installer-windows.yml'
-  pull_request:
+    branches: ['release/**']
     paths:
       - 'install/windows/**'
       - 'install/easytier-pins.txt'
@@ -47,8 +47,7 @@ concurrency:
 
 jobs:
   windows:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Windows, X64, laptop-win]
+    runs-on: [self-hosted, Windows, X64, windows-installer-vm]
     # A hung installer is the failure this job exists to find; it must not cost
     # the six hours a job gets by default.
     timeout-minutes: 75
